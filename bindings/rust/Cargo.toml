@@ -1,0 +1,12 @@
+[package]
+name = "netlink-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust bindings for the NetLink secure UDP networking library"
+license = "MIT"
+
+[lib]
+name = "netlink"
+path = "src/lib.rs"
+
+[build-dependencies]

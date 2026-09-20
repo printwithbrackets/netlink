@@ -1,0 +1,11 @@
+build/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+__pycache__/
+*.pyc
+target/
+Cargo.lock
+.DS_Store
