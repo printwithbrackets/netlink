@@ -56,7 +56,7 @@ TEST_BIN_DIR := $(BUILD_DIR)/tests
 TEST_CFLAGS := $(CFLAGS) -g -fsanitize=address,undefined $(INCLUDES)
 
 .PHONY: test test-unit test-integration
-test: test-unit test-integration
+test: all test-unit test-integration
 
 test-unit: | $(BUILD_DIR)
 	mkdir -p $(TEST_BIN_DIR)
@@ -80,7 +80,7 @@ test-integration: | $(BUILD_DIR)
 	$(TEST_BIN_DIR)/test_integration
 
 # --- examples ---
-examples: $(STATIC_LIB) | $(BUILD_DIR)
+examples: all | $(BUILD_DIR)
 	mkdir -p $(BUILD_DIR)/examples
 	$(CC) $(CFLAGS) $(INCLUDES) examples/echo_server.c $(STATIC_LIB) $(LIBS) -o $(BUILD_DIR)/examples/echo_server
 	$(CC) $(CFLAGS) $(INCLUDES) examples/echo_client.c $(STATIC_LIB) $(LIBS) -o $(BUILD_DIR)/examples/echo_client

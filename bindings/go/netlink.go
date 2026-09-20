@@ -156,7 +156,7 @@ type Event struct {
 
 func eventFromC(raw *C.nl_event_t) Event {
 	ev := Event{
-		Type:              EventType(raw._type),
+		Type:              EventType(raw.event_type),
 		Peer:              PeerID(raw.peer),
 		Channel:           uint8(raw.channel),
 		FromHost:          C.GoString((*C.char)(unsafe.Pointer(&raw.from_address.host[0]))),

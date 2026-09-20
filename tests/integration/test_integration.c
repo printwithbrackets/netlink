@@ -12,7 +12,7 @@ static bool wait_for_event(nl_endpoint_t *ep, nl_event_type_t type, nl_event_t *
     uint64_t deadline_iterations = (uint64_t)timeout_ms / 50 + 1;
     for (uint64_t i = 0; i < deadline_iterations; i++) {
         if (nl_poll_event(ep, out, 50)) {
-            if (out->type == type) return true;
+            if (out->event_type == type) return true;
             /* not the event we wanted yet; keep waiting for the remaining budget */
         }
     }

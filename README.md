@@ -116,6 +116,12 @@ See `bindings/python/README.md`.
 See `bindings/go/README.md` and `bindings/rust/README.md` -- note the
 testing-status caveat in each (summarized in [Testing](#testing) below).
 
+### All four client/server combinations
+
+For step-by-step instructions on running C/C++ or Python clients against
+Go or Rust servers (and vice versa), see
+[CROSS_LANGUAGE_TESTING.md](CROSS_LANGUAGE_TESTING.md).
+
 ## Building
 
 Requires a C11 compiler, pthreads, and OpenSSL's `libcrypto` (the only

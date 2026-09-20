@@ -42,7 +42,7 @@ int main(int argc, char **argv) {
         nl_event_t ev;
         if (!nl_poll_event(server, &ev, 200)) continue;
 
-        switch (ev.type) {
+        switch (ev.event_type) {
             case NL_EVENT_CONNECTED:
                 printf("[+] peer %llu connected from %s:%u\n",
                        (unsigned long long)ev.peer, ev.from_address.host, ev.from_address.port);

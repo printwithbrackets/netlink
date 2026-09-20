@@ -181,7 +181,9 @@ typedef enum {
 } nl_event_type_t;
 
 typedef struct {
-    nl_event_type_t type;
+    nl_event_type_t event_type; /* named event_type, not type, to avoid colliding
+                                    with the "type"/"type_" reserved keyword in
+                                    several language bindings (Go, Rust, etc.) */
     nl_peer_id_t    peer;
     uint8_t         channel;
     const uint8_t  *data;      /* borrowed pointer, valid until next poll call */

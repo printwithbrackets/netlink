@@ -257,7 +257,7 @@ static void ep_on_data(void *ctx, nl_peer_id_t peer, uint8_t channel, nl_deliver
     (void)delivery;
     conn_ctx_t *c = (conn_ctx_t *)ctx;
     nl_event_t ev; memset(&ev, 0, sizeof(ev));
-    ev.type = NL_EVENT_DATA;
+    ev.event_type = NL_EVENT_DATA;
     ev.peer = peer;
     ev.channel = channel;
     push_event(c->ep, ev, data, len);
@@ -274,7 +274,7 @@ static void ep_on_disconnected(void *ctx, nl_peer_id_t peer, nl_result_t reason)
     nl_connection_destroy(c->conn);
 
     nl_event_t ev; memset(&ev, 0, sizeof(ev));
-    ev.type = never_confirmed ? NL_EVENT_CONNECT_FAILED : NL_EVENT_DISCONNECTED;
+    ev.event_type = never_confirmed ? NL_EVENT_CONNECT_FAILED : NL_EVENT_DISCONNECTED;
     ev.peer = peer;
     ev.disconnect_reason = reason;
     push_event(c->ep, ev, NULL, 0);
@@ -283,7 +283,7 @@ static void ep_on_disconnected(void *ctx, nl_peer_id_t peer, nl_result_t reason)
 static void ep_on_connected(void *ctx, nl_peer_id_t peer) {
     conn_ctx_t *c = (conn_ctx_t *)ctx;
     nl_event_t ev; memset(&ev, 0, sizeof(ev));
-    ev.type = NL_EVENT_CONNECTED;
+    ev.event_type = NL_EVENT_CONNECTED;
     ev.peer = peer;
     sockaddr_to_nl_address(&c->conn->addr, c->conn->addr_len, &ev.from_address);
     push_event(c->ep, ev, NULL, 0);
@@ -340,7 +340,7 @@ static void expire_pending(nl_endpoint_t *ep, uint64_t now) {
             release_pending_locked(&ep->pending[i]);
             if (role == PENDING_CLIENT_AWAIT_CHALLENGE || role == PENDING_CLIENT_AWAIT_ACCEPTED) {
                 nl_event_t ev; memset(&ev, 0, sizeof(ev));
-                ev.type = NL_EVENT_CONNECT_FAILED;
+                ev.event_type = NL_EVENT_CONNECT_FAILED;
                 ev.peer = connid;
                 ev.disconnect_reason = NL_ERR_TIMEOUT;
                 push_event(ep, ev, NULL, 0);
@@ -523,7 +523,7 @@ static void handle_connect_response(nl_endpoint_t *ep, const uint8_t *buf, size_
     nl_connection_send_handshake_complete(conn, &cb);
 
     nl_event_t ev; memset(&ev, 0, sizeof(ev));
-    ev.type = NL_EVENT_CONNECTED;
+    ev.event_type = NL_EVENT_CONNECTED;
     ev.peer = connid;
     sockaddr_to_nl_address(&paddr, paddr_len, &ev.from_address);
     push_event(ep, ev, NULL, 0);
@@ -595,7 +595,7 @@ static void handle_connect_denied(nl_endpoint_t *ep, const uint8_t *buf, size_t 
     pthread_mutex_unlock(&ep->pending_lock);
 
     nl_event_t ev; memset(&ev, 0, sizeof(ev));
-    ev.type = NL_EVENT_CONNECT_FAILED;
+    ev.event_type = NL_EVENT_CONNECT_FAILED;
     ev.peer = connid;
     ev.disconnect_reason = deny_reason_to_result(reason);
     push_event(ep, ev, NULL, 0);
@@ -650,7 +650,7 @@ static void process_discovery_packet(nl_endpoint_t *ep, const uint8_t *buf, size
         if (off + name_len > len) return;
 
         nl_event_t ev; memset(&ev, 0, sizeof(ev));
-        ev.type = NL_EVENT_DISCOVERY_REPLY;
+        ev.event_type = NL_EVENT_DISCOVERY_REPLY;
         sockaddr_to_nl_address(from, from_len, &ev.from_address);
         ev.from_address.port = server_port;
         ev.server_player_count = player_count;

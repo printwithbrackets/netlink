@@ -49,7 +49,7 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        switch (ev.type) {
+        switch (ev.event_type) {
             case NL_EVENT_CONNECTED:
                 printf("Connected! (peer id %llu)\n", (unsigned long long)ev.peer);
                 connected = true;

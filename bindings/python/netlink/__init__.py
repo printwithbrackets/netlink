@@ -145,7 +145,7 @@ class _Config(ctypes.Structure):
 
 class _Event(ctypes.Structure):
     _fields_ = [
-        ("type", ctypes.c_int),
+        ("event_type", ctypes.c_int),
         ("peer", ctypes.c_uint64),
         ("channel", ctypes.c_uint8),
         ("data", ctypes.POINTER(ctypes.c_uint8)),
@@ -227,13 +227,13 @@ class Event:
     @staticmethod
     def _from_raw(raw: _Event) -> "Event":
         data = b""
-        if raw.type == EventType.DATA.value and raw.data_len > 0:
+        if raw.event_type == EventType.DATA.value and raw.data_len > 0:
             data = bytes(ctypes.cast(raw.data, ctypes.POINTER(ctypes.c_uint8 * raw.data_len)).contents)
         address = None
         if raw.from_address.host:
             address = (raw.from_address.host.decode("utf-8", "replace"), raw.from_address.port)
         return Event(
-            type=EventType(raw.type),
+            type=EventType(raw.event_type),
             peer=raw.peer,
             channel=raw.channel,
             data=data,
