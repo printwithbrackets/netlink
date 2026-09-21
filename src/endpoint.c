@@ -1092,3 +1092,25 @@ uint32_t nl_peer_count(nl_endpoint_t *ep) {
     pthread_mutex_unlock(&ep->connections_lock);
     return n;
 }
+
+bool nl_peer_stats(nl_endpoint_t *ep, nl_peer_id_t peer, nl_peer_stats_t *out) {
+    if (!ep || !out) return false;
+    pthread_mutex_lock(&ep->connections_lock);
+    nl_connection_t *conn = find_connection_locked(ep, peer);
+    bool found = conn != NULL;
+    if (found) {
+        nl_connection_stats_t cstats;
+        nl_connection_get_stats(conn, &cstats);
+        out->packets_sent = cstats.packets_sent;
+        out->packets_received = cstats.packets_received;
+        out->bytes_sent = cstats.bytes_sent;
+        out->bytes_received = cstats.bytes_received;
+        out->retransmits = cstats.retransmits;
+        out->duplicates_received = cstats.duplicates_received;
+        out->rtt_ms = cstats.rtt_ms;
+        out->rtt_var_ms = cstats.rtt_var_ms;
+        out->rto_ms = cstats.rto_ms;
+    }
+    pthread_mutex_unlock(&ep->connections_lock);
+    return found;
+}

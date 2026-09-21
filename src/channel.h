@@ -75,13 +75,28 @@ nl_result_t nl_channel_send(nl_channel_t *chan, uint64_t now_ms, uint8_t channel
 
 /* Feed one received (already-decrypted) wire DATA payload in. Any
  * piggybacked ack/ack_bits are applied to this lane's send ring
- * immediately. Any fully-formed application message(s) that become
- * deliverable as a result (immediately, or released from the reorder
- * buffer) are handed to `deliver`, in delivery order. */
+ * immediately, and (for reliable lanes) checked for a fast-retransmit
+ * condition -- an unacked sequence with NL_FAST_RETRANSMIT_THRESHOLD or
+ * more strictly-newer sequences already confirmed acked is retransmitted
+ * immediately via `retransmit`/`retransmit_ctx` rather than waiting for
+ * the RTO timer, since the loss is already evident (the same signal
+ * behind TCP's "three duplicate acks" fast retransmit). `retransmit` may
+ * be NULL to skip this (e.g. from a test that doesn't care).
+ *
+ * If the ack corresponds to a clean RTT sample (see nl_send_ring_ack's
+ * doc comment on Karn's algorithm), *out_has_rtt_sample is set true and
+ * *out_rtt_sample_ms holds it; both may be NULL if the caller doesn't need this.
+ *
+ * Any fully-formed application message(s) that become deliverable as a
+ * result (immediately, or released from the reorder buffer) are handed
+ * to `deliver`, in delivery order. */
 typedef void (*nl_channel_deliver_fn)(void *ctx, uint8_t channel_id, nl_delivery_t delivery,
                                        const uint8_t *data, uint32_t len);
+#define NL_FAST_RETRANSMIT_THRESHOLD 3 /* matches TCP's conventional "3 duplicate acks" */
 void nl_channel_on_receive(nl_channel_t *chan, uint64_t now_ms,
                             const uint8_t *wire_payload, uint16_t wire_len,
-                            nl_channel_deliver_fn deliver, void *ctx);
+                            nl_channel_deliver_fn deliver, void *deliver_ctx,
+                            nl_channel_retransmit_fn retransmit, void *retransmit_ctx,
+                            bool *out_has_rtt_sample, uint32_t *out_rtt_sample_ms);
 
 #endif /* NETLINK_CHANNEL_H */

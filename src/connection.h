@@ -26,6 +26,20 @@ typedef enum {
     NL_CONN_DISCONNECTED,
 } nl_conn_state_t;
 
+/* Per-connection counters and timing estimates, exposed via
+ * nl_connection_get_stats() / the public nl_peer_stats() API. */
+typedef struct {
+    uint64_t packets_sent;
+    uint64_t packets_received;
+    uint64_t bytes_sent;
+    uint64_t bytes_received;
+    uint64_t retransmits;         /* RTO-triggered + fast-retransmit-triggered, combined */
+    uint64_t duplicates_received; /* wire-level replays rejected (see recv_replay in nl_connection_t) */
+    uint32_t rtt_ms;              /* smoothed RTT (SRTT), Jacobson/Karels */
+    uint32_t rtt_var_ms;          /* smoothed RTT variance (RTTVAR) */
+    uint32_t rto_ms;              /* current retransmission timeout, derived from the above */
+} nl_connection_stats_t;
+
 /* A generic sink for events/packets a connection needs to hand back up to
  * the endpoint (queueing an event, or sending bytes on the wire). Kept as
  * function pointers + a context so connection.c has zero dependency on
@@ -71,6 +85,11 @@ typedef struct nl_connection {
     uint64_t last_send_time_ms;
     uint32_t rtt_ms;           /* smoothed estimate (EWMA), starts at a safe default */
     uint32_t rto_ms;           /* derived retransmit timeout, >= rtt_ms with margin */
+    double   srtt_ms;          /* Jacobson/Karels smoothed RTT, higher precision than rtt_ms */
+    double   rttvar_ms;        /* Jacobson/Karels smoothed RTT variance */
+    bool     rtt_initialized;
+
+    nl_connection_stats_t stats;
 
     uint32_t connection_timeout_ms;
     uint32_t keepalive_interval_ms;
@@ -119,5 +138,9 @@ void nl_connection_send_disconnect(nl_connection_t *conn, uint64_t now_ms, const
 void nl_connection_send_handshake_complete(nl_connection_t *conn, const nl_conn_callbacks_t *cb);
 
 uint32_t nl_connection_rtt_ms(nl_connection_t *conn);
+
+/* Copy out a snapshot of this connection's counters and RTT estimates.
+ * Thread-safe. */
+void nl_connection_get_stats(nl_connection_t *conn, nl_connection_stats_t *out);
 
 #endif /* NETLINK_CONNECTION_H */

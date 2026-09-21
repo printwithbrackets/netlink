@@ -5,8 +5,33 @@
 
 #define NL_DEFAULT_RTT_MS 200
 #define NL_MIN_RTO_MS 100
+#define NL_MAX_RTO_MS 10000
 #define NL_MAX_RETRIES 15
 #define NL_ENCRYPTED_PACKET_SCRATCH (NL_MAX_PACKET_SIZE + NL_ENC_HEADER_SIZE + NL_GCM_TAG_SIZE + 64)
+
+/* Jacobson/Karels smoothed RTT + RTTVAR update (the same algorithm TCP's
+ * RTO estimation uses, RFC 6298), fed only by clean samples -- see
+ * seqbuf.h's nl_send_ring_ack() doc comment on why retransmitted and
+ * bitfield-only-acked packets are never used as samples (Karn's
+ * algorithm). alpha=1/8, beta=1/4 are the RFC's standard gains. */
+static void update_rtt(nl_connection_t *conn, uint32_t sample_ms) {
+    double sample = (double)sample_ms;
+    if (!conn->rtt_initialized) {
+        conn->srtt_ms = sample;
+        conn->rttvar_ms = sample / 2.0;
+        conn->rtt_initialized = true;
+    } else {
+        double diff = sample - conn->srtt_ms;
+        double abs_diff = diff < 0 ? -diff : diff;
+        conn->rttvar_ms += 0.25 * (abs_diff - conn->rttvar_ms);
+        conn->srtt_ms += 0.125 * diff;
+    }
+    double rto = conn->srtt_ms + 4.0 * conn->rttvar_ms;
+    if (rto < NL_MIN_RTO_MS) rto = NL_MIN_RTO_MS;
+    if (rto > NL_MAX_RTO_MS) rto = NL_MAX_RTO_MS;
+    conn->rto_ms = (uint32_t)rto;
+    conn->rtt_ms = (uint32_t)conn->srtt_ms;
+}
 
 nl_connection_t *nl_connection_create(nl_peer_id_t id, const struct sockaddr_storage *addr, socklen_t addr_len,
                                        bool is_client_side, uint8_t channel_count,
@@ -67,7 +92,7 @@ void nl_connection_destroy(nl_connection_t *conn) {
 /* ---- encryption plumbing (caller must hold conn->lock) ---- */
 
 static void encrypt_and_emit(nl_connection_t *conn, uint8_t type, const uint8_t *plaintext, size_t pt_len,
-                              const nl_conn_callbacks_t *cb) {
+                              bool is_retransmit, const nl_conn_callbacks_t *cb) {
     uint8_t packet[NL_ENCRYPTED_PACKET_SCRATCH];
     size_t off = 0;
     packet[off++] = type;
@@ -87,6 +112,10 @@ static void encrypt_and_emit(nl_connection_t *conn, uint8_t type, const uint8_t 
     memcpy(packet + off, tag, 16);
     off += 16;
 
+    conn->stats.packets_sent++;
+    conn->stats.bytes_sent += off;
+    if (is_retransmit) conn->stats.retransmits++;
+
     cb->send_wire(cb->ctx, conn->id, packet, off);
 }
 
@@ -97,7 +126,21 @@ typedef struct {
 
 static void on_channel_emit(void *ctx, const uint8_t *wire_payload, uint16_t len) {
     emit_ctx_t *e = (emit_ctx_t *)ctx;
-    encrypt_and_emit(e->conn, NL_PKT_DATA, wire_payload, len, e->cb);
+    encrypt_and_emit(e->conn, NL_PKT_DATA, wire_payload, len, /*is_retransmit*/ false, e->cb);
+}
+
+typedef struct {
+    nl_connection_t *conn;
+    const nl_conn_callbacks_t *cb;
+} retransmit_ctx_t;
+
+/* Shared by both RTO-triggered retransmission (nl_connection_tick) and
+ * receive-triggered fast retransmit (nl_connection_on_packet's DATA
+ * case) -- both reconstruct-and-resend a specific unacked sequence, and
+ * both count as a retransmit for stats purposes. */
+static void on_channel_retransmit(void *ctx, const uint8_t *wire_payload, uint16_t len) {
+    retransmit_ctx_t *r = (retransmit_ctx_t *)ctx;
+    encrypt_and_emit(r->conn, NL_PKT_DATA, wire_payload, len, /*is_retransmit*/ true, r->cb);
 }
 
 nl_result_t nl_connection_send(nl_connection_t *conn, uint8_t channel, nl_delivery_t delivery,
@@ -151,6 +194,7 @@ nl_result_t nl_connection_on_packet(nl_connection_t *conn, uint8_t type,
      * authentication succeeds -- see the comment on
      * nl_replay_window_would_accept() for why the ordering matters. */
     if (!nl_replay_window_would_accept(&conn->recv_replay, counter)) {
+        conn->stats.duplicates_received++;
         pthread_mutex_unlock(&conn->lock);
         return NL_ERR_PROTOCOL_MISMATCH;
     }
@@ -174,11 +218,14 @@ nl_result_t nl_connection_on_packet(nl_connection_t *conn, uint8_t type,
 
     /* Authenticated: now it's safe to commit this counter to the replay window. */
     if (!nl_replay_window_check(&conn->recv_replay, counter)) {
+        conn->stats.duplicates_received++;
         pthread_mutex_unlock(&conn->lock);
         return NL_ERR_PROTOCOL_MISMATCH; /* lost a race with another thread's identical packet */
     }
 
     conn->last_recv_time_ms = now_ms;
+    conn->stats.packets_received++;
+    conn->stats.bytes_received += enc_body_len + 1; /* +1 for the type byte, passed separately */
 
     nl_result_t result = NL_OK;
     bool just_confirmed = false;
@@ -190,8 +237,14 @@ nl_result_t nl_connection_on_packet(nl_connection_t *conn, uint8_t type,
             if (ct_len < 1) { result = NL_ERR_PROTOCOL_MISMATCH; break; }
             uint8_t channel_id = plaintext[0];
             if (channel_id >= conn->channel_count) { result = NL_ERR_CHANNEL_OUT_OF_RANGE; break; }
+            retransmit_ctx_t rctx = { conn, cb };
+            bool has_rtt_sample = false;
+            uint32_t rtt_sample_ms = 0;
             nl_channel_on_receive(&conn->channels[channel_id], now_ms, plaintext, (uint16_t)ct_len,
-                                   on_channel_deliver, &dctx);
+                                   on_channel_deliver, &dctx,
+                                   on_channel_retransmit, &rctx,
+                                   &has_rtt_sample, &rtt_sample_ms);
+            if (has_rtt_sample) update_rtt(conn, rtt_sample_ms);
             break;
         }
         case NL_PKT_KEEPALIVE:
@@ -230,15 +283,7 @@ nl_result_t nl_connection_on_packet(nl_connection_t *conn, uint8_t type,
     return result;
 }
 
-typedef struct {
-    nl_connection_t *conn;
-    const nl_conn_callbacks_t *cb;
-} retransmit_ctx_t;
 
-static void on_channel_retransmit(void *ctx, const uint8_t *wire_payload, uint16_t len) {
-    retransmit_ctx_t *r = (retransmit_ctx_t *)ctx;
-    encrypt_and_emit(r->conn, NL_PKT_DATA, wire_payload, len, r->cb);
-}
 
 void nl_connection_tick(nl_connection_t *conn, uint64_t now_ms, const nl_conn_callbacks_t *cb) {
     pthread_mutex_lock(&conn->lock);
@@ -269,7 +314,7 @@ void nl_connection_tick(nl_connection_t *conn, uint64_t now_ms, const nl_conn_ca
      * timely acks and RTT samples, and the peer's idle timer keeps resetting. */
     if (now_ms - conn->last_send_time_ms >= conn->keepalive_interval_ms) {
         uint8_t empty[1] = {0};
-        encrypt_and_emit(conn, NL_PKT_KEEPALIVE, empty, 0, cb);
+        encrypt_and_emit(conn, NL_PKT_KEEPALIVE, empty, 0, /*is_retransmit*/ false, cb);
         conn->last_send_time_ms = now_ms;
     }
 
@@ -286,7 +331,7 @@ void nl_connection_send_disconnect(nl_connection_t *conn, uint64_t now_ms, const
     pthread_mutex_lock(&conn->lock);
     if (conn->state == NL_CONN_CONNECTED) {
         uint8_t empty[1] = {0};
-        encrypt_and_emit(conn, NL_PKT_DISCONNECT, empty, 0, cb);
+        encrypt_and_emit(conn, NL_PKT_DISCONNECT, empty, 0, /*is_retransmit*/ false, cb);
         conn->state = NL_CONN_DISCONNECTED;
         conn->last_send_time_ms = now_ms;
     }
@@ -296,7 +341,7 @@ void nl_connection_send_disconnect(nl_connection_t *conn, uint64_t now_ms, const
 void nl_connection_send_handshake_complete(nl_connection_t *conn, const nl_conn_callbacks_t *cb) {
     pthread_mutex_lock(&conn->lock);
     uint8_t empty[1] = {0};
-    encrypt_and_emit(conn, NL_PKT_CONNECT_ACCEPTED, empty, 0, cb);
+    encrypt_and_emit(conn, NL_PKT_CONNECT_ACCEPTED, empty, 0, /*is_retransmit*/ false, cb);
     pthread_mutex_unlock(&conn->lock);
 }
 
@@ -305,4 +350,13 @@ uint32_t nl_connection_rtt_ms(nl_connection_t *conn) {
     uint32_t rtt = conn->rtt_ms;
     pthread_mutex_unlock(&conn->lock);
     return rtt;
+}
+
+void nl_connection_get_stats(nl_connection_t *conn, nl_connection_stats_t *out) {
+    pthread_mutex_lock(&conn->lock);
+    *out = conn->stats;
+    out->rtt_ms = conn->rtt_ms;
+    out->rtt_var_ms = (uint32_t)conn->rttvar_ms;
+    out->rto_ms = conn->rto_ms;
+    pthread_mutex_unlock(&conn->lock);
 }

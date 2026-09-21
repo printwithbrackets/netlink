@@ -58,6 +58,20 @@ reimplementations that happen to agree today.
   master server.
 - **C/C++, Python, Go, and Rust bindings** over one shared protocol
   implementation.
+- **Real RTT measurement and adaptive retransmission timing.** Every
+  clean (never-retransmitted) ack produces an RTT sample, smoothed via
+  the Jacobson/Karels algorithm (RFC 6298 -- the same one TCP uses) into
+  a retransmission timeout that adapts to actual path conditions instead
+  of a fixed guess.
+- **Fast retransmit.** When the ack bitmap shows a packet is missing
+  while several newer ones have already arrived (the same signal behind
+  TCP's "three duplicate acks"), the missing packet is retransmitted
+  immediately rather than waiting for the RTO timer -- often shaving a
+  full RTT or more off recovery latency.
+- **Per-peer statistics** (`nl_peer_stats`): packets/bytes sent and
+  received, retransmit count, duplicate/replayed packets rejected,
+  smoothed RTT, RTT variance, and current RTO -- useful for in-game
+  diagnostics or server-side monitoring.
 
 ### Deliberately not included (see [Roadmap](#roadmap--known-limitations))
 
@@ -232,11 +246,17 @@ environment** (a sandboxed Linux container with a C toolchain, OpenSSL,
 and Python, but no Go/Rust toolchain, no IPv6 support at the kernel
 level, and no network access to install either):
 
-- 83 test cases across unit tests (`tests/test_seqbuf.c`,
+- 103 test cases across unit tests (`tests/test_seqbuf.c`,
   `test_crypto.c`, `test_fragment.c`, `test_channel.c`,
-  `test_connection.c`) and real-socket integration tests
-  (`tests/integration/test_integration.c`), all clean under
-  AddressSanitizer + UndefinedBehaviorSanitizer -- no leaks, no UB.
+  `test_connection.c`, `test_network_simulation.c`) and real-socket
+  integration tests (`tests/integration/test_integration.c`), all clean
+  under AddressSanitizer + UndefinedBehaviorSanitizer -- no leaks, no UB.
+- `test_network_simulation.c` specifically drives thousands of messages
+  through a simulated bad network (configurable packet loss, jitter/
+  reordering, duplication) and verifies `RELIABLE_ORDERED` delivery stays
+  complete and correctly ordered throughout -- including at 20% loss and
+  25% duplication -- rather than only ever being exercised over perfect
+  localhost conditions.
 - The integration tests spin up **real client and server endpoints
   communicating over actual loopback UDP sockets**, covering: the full
   encrypted handshake, all four delivery modes, fragmentation of a
@@ -295,6 +315,51 @@ genuinely valuable contribution.
 - **Connection table lookup is O(n)** (linear scan, bounded at 512
   connections internally). Fine for small-to-medium deployments; a hash
   map would be a straightforward improvement for large ones.
+
+### Future work
+
+An external review of this project suggested a substantial list of
+additions to move NetLink from "capable UDP library" toward something
+closer to a full modern transport (congestion control, connection
+migration, flow control, priority/QoS, an RPC layer, built-in
+serialization, compression, protocol capability negotiation, and more --
+plus infrastructure like CMake, fuzzing, and multi-OS CI). It's good
+feedback and most of it is a genuine gap, not a nitpick. Implementing all
+of it to the same tested standard as the rest of this project is
+realistically a much larger effort than one pass; RTT-based adaptive
+retransmission, fast retransmit, per-peer stats, and a randomized
+network-condition test harness (see Testing above) have been implemented
+and tested as a first slice. Roughly in priority order for what's left:
+
+1. **Congestion control** -- RTT/loss-based send-rate adaptation
+   (something closer to slow-start + congestion avoidance than the
+   current fixed-window reliable sending), important once multiple
+   clients share a server's bandwidth.
+2. **Connection migration** -- `PATH_CHALLENGE`/`PATH_RESPONSE` so a
+   client changing networks (mobile Wi-Fi <-> cellular, NAT rebind)
+   doesn't need a full reconnect, QUIC-style.
+3. **Flow control** -- a receive window bounding how much a fast sender
+   can have outstanding against a slow receiver, distinct from congestion
+   control (which asks what the *network* can handle; flow control asks
+   what the *receiver* can handle).
+4. **Expanded/range-based ACKs** -- the current 32-bit ack bitmap works
+   well for the loss patterns tested above, but wider bitmaps or explicit
+   ranges would help on very high-latency/lossy links.
+5. **Priority/QoS per send**, **per-connection rate limiting**, **an
+   optional RPC layer with request/response semantics**, **built-in
+   (optional, separate-from-core) serialization**, **compression**
+   (compress-then-encrypt, never the reverse), **protocol capability
+   negotiation during the handshake** (so future versions don't require
+   moving in lockstep), and the **WebSocket transport** already reserved
+   in the API.
+6. Smaller infrastructure: a C++ RAII wrapper, CMake alongside the
+   Makefile, a pkg-config `.pc` file, fuzzing (libFuzzer/AFL++) on the
+   packet-parsing paths, Windows/macOS/Go/Rust CI, and benchmarks.
+
+If you'd like to tackle any of these, see [CONTRIBUTING.md](CONTRIBUTING.md)
+-- a PR for a single item, with its own tests, is much easier to review
+(and much more likely to actually be correct) than one that tries to do
+several at once.
 
 ## License
 

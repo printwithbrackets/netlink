@@ -230,6 +230,48 @@ TEST(test_discovery_over_real_sockets) {
     nl_endpoint_destroy(server);
 }
 
+TEST(test_peer_stats_over_real_sockets) {
+    nl_config_t cfg; nl_config_default(&cfg);
+    nl_endpoint_t *server = NULL, *client = NULL;
+    nl_address_t bind_addr = addr("127.0.0.1", 34709);
+    nl_server_create(&bind_addr, &cfg, &server);
+    nl_client_create(&cfg, &client);
+
+    nl_peer_id_t client_peer;
+    nl_connect(client, &bind_addr, &client_peer);
+    nl_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 3000));
+    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 3000));
+    nl_peer_id_t server_peer = ev.peer;
+
+    const char *msg = "measure me";
+    nl_send(client, client_peer, 0, NL_RELIABLE_ORDERED, (const uint8_t *)msg, strlen(msg));
+    ASSERT_TRUE(wait_for_event(server, NL_EVENT_DATA, &ev, 3000));
+
+    /* Give the reliable ack a moment to round-trip back to the client so
+     * an RTT sample has actually landed (real sockets, real timing). */
+    nl_send(server, server_peer, 0, NL_RELIABLE_ORDERED, (const uint8_t *)"ack", 3);
+    ASSERT_TRUE(wait_for_event(client, NL_EVENT_DATA, &ev, 3000));
+
+    nl_peer_stats_t cstats, sstats;
+    ASSERT_TRUE(nl_peer_stats(client, client_peer, &cstats));
+    ASSERT_TRUE(nl_peer_stats(server, server_peer, &sstats));
+
+    ASSERT_TRUE(cstats.packets_sent >= 1);
+    ASSERT_TRUE(cstats.bytes_sent > 0);
+    ASSERT_TRUE(sstats.packets_received >= 1);
+    ASSERT_TRUE(sstats.bytes_received > 0);
+    /* A real loopback round trip should be fast but nonzero-measurable;
+     * mainly confirm it's wired up (not still at its zero default) and
+     * not absurd (e.g. not accidentally reporting seconds as ms). */
+    ASSERT_TRUE(cstats.rtt_ms < 2000);
+
+    ASSERT_FALSE(nl_peer_stats(client, 0xDEADBEEF, &cstats)); /* unknown peer */
+
+    nl_endpoint_destroy(client);
+    nl_endpoint_destroy(server);
+}
+
 TEST(test_server_denies_when_full) {
     nl_config_t cfg; nl_config_default(&cfg);
     cfg.max_connections = 1;
@@ -263,6 +305,7 @@ int main(void) {
     RUN_TEST(test_graceful_disconnect_over_real_sockets);
     RUN_TEST(test_ipv6_loopback);
     RUN_TEST(test_discovery_over_real_sockets);
+    RUN_TEST(test_peer_stats_over_real_sockets);
     RUN_TEST(test_server_denies_when_full);
     TEST_SUMMARY();
 }

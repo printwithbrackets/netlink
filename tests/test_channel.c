@@ -59,7 +59,7 @@ TEST(test_unreliable_basic_roundtrip) {
     ASSERT_EQ(cap.count, 1);
 
     delivered_t del = {0};
-    nl_channel_on_receive(&receiver, 1000, cap.packets[0].data, cap.packets[0].len, capture_deliver, &del);
+    nl_channel_on_receive(&receiver, 1000, cap.packets[0].data, cap.packets[0].len, capture_deliver, &del, NULL, NULL, NULL, NULL);
     ASSERT_EQ(del.count, 1);
     ASSERT_EQ(del.channel[0], 3);
     ASSERT_EQ(del.delivery[0], NL_UNRELIABLE);
@@ -86,8 +86,8 @@ TEST(test_unreliable_sequenced_drops_stale) {
 
     /* Simulate network reordering: 3 arrives before 2 (2 gets lost/late) */
     delivered_t del = {0};
-    nl_channel_on_receive(&receiver, 0, cap.packets[2].data, cap.packets[2].len, capture_deliver, &del); /* m3 */
-    nl_channel_on_receive(&receiver, 0, cap.packets[1].data, cap.packets[1].len, capture_deliver, &del); /* m2, stale */
+    nl_channel_on_receive(&receiver, 0, cap.packets[2].data, cap.packets[2].len, capture_deliver, &del, NULL, NULL, NULL, NULL); /* m3 */
+    nl_channel_on_receive(&receiver, 0, cap.packets[1].data, cap.packets[1].len, capture_deliver, &del, NULL, NULL, NULL, NULL); /* m2, stale */
 
     ASSERT_EQ(del.count, 1); /* only m3 delivered; m2 dropped as stale */
     ASSERT_MEM_EQ(del.data[0], m3, strlen(m3));
@@ -109,9 +109,9 @@ TEST(test_reliable_unordered_delivers_all_ignores_order) {
 
     delivered_t del = {0};
     /* deliver out of order: 2, 0, 1 */
-    nl_channel_on_receive(&receiver, 0, cap.packets[2].data, cap.packets[2].len, capture_deliver, &del);
-    nl_channel_on_receive(&receiver, 0, cap.packets[0].data, cap.packets[0].len, capture_deliver, &del);
-    nl_channel_on_receive(&receiver, 0, cap.packets[1].data, cap.packets[1].len, capture_deliver, &del);
+    nl_channel_on_receive(&receiver, 0, cap.packets[2].data, cap.packets[2].len, capture_deliver, &del, NULL, NULL, NULL, NULL);
+    nl_channel_on_receive(&receiver, 0, cap.packets[0].data, cap.packets[0].len, capture_deliver, &del, NULL, NULL, NULL, NULL);
+    nl_channel_on_receive(&receiver, 0, cap.packets[1].data, cap.packets[1].len, capture_deliver, &del, NULL, NULL, NULL, NULL);
 
     ASSERT_EQ(del.count, 3);
     /* delivered in arrival order (unordered mode), so c, a, b */
@@ -132,9 +132,9 @@ TEST(test_reliable_unordered_dedupes_retransmit) {
     nl_channel_send(&sender, 0, 0, NL_RELIABLE_UNORDERED, (const uint8_t *)m, 1, capture_emit, &cap);
 
     delivered_t del = {0};
-    nl_channel_on_receive(&receiver, 0, cap.packets[0].data, cap.packets[0].len, capture_deliver, &del);
+    nl_channel_on_receive(&receiver, 0, cap.packets[0].data, cap.packets[0].len, capture_deliver, &del, NULL, NULL, NULL, NULL);
     /* simulate a spurious retransmit/duplicate delivery of the same packet */
-    nl_channel_on_receive(&receiver, 0, cap.packets[0].data, cap.packets[0].len, capture_deliver, &del);
+    nl_channel_on_receive(&receiver, 0, cap.packets[0].data, cap.packets[0].len, capture_deliver, &del, NULL, NULL, NULL, NULL);
 
     ASSERT_EQ(del.count, 1); /* delivered exactly once to the application */
 
@@ -158,7 +158,7 @@ TEST(test_reliable_ordered_delivers_in_order_despite_network_reorder) {
     int order[5] = {0, 2, 1, 4, 3};
     delivered_t del = {0};
     for (int i = 0; i < 5; i++) {
-        nl_channel_on_receive(&receiver, 0, cap.packets[order[i]].data, cap.packets[order[i]].len, capture_deliver, &del);
+        nl_channel_on_receive(&receiver, 0, cap.packets[order[i]].data, cap.packets[order[i]].len, capture_deliver, &del, NULL, NULL, NULL, NULL);
     }
 
     ASSERT_EQ(del.count, 5);
@@ -184,13 +184,13 @@ TEST(test_reliable_ordered_withholds_until_gap_fills) {
 
     delivered_t del = {0};
     /* Packet 1 (B) is "lost" for now; deliver 0 (A) then 2 (C). */
-    nl_channel_on_receive(&receiver, 0, cap.packets[0].data, cap.packets[0].len, capture_deliver, &del);
+    nl_channel_on_receive(&receiver, 0, cap.packets[0].data, cap.packets[0].len, capture_deliver, &del, NULL, NULL, NULL, NULL);
     ASSERT_EQ(del.count, 1);
-    nl_channel_on_receive(&receiver, 0, cap.packets[2].data, cap.packets[2].len, capture_deliver, &del);
+    nl_channel_on_receive(&receiver, 0, cap.packets[2].data, cap.packets[2].len, capture_deliver, &del, NULL, NULL, NULL, NULL);
     ASSERT_EQ(del.count, 1); /* C withheld, waiting for B */
 
     /* B finally arrives (e.g. a retransmit) -- both B and C should release. */
-    nl_channel_on_receive(&receiver, 0, cap.packets[1].data, cap.packets[1].len, capture_deliver, &del);
+    nl_channel_on_receive(&receiver, 0, cap.packets[1].data, cap.packets[1].len, capture_deliver, &del, NULL, NULL, NULL, NULL);
     ASSERT_EQ(del.count, 3);
     ASSERT_EQ(del.data[0][0], 'A');
     ASSERT_EQ(del.data[1][0], 'B');
@@ -216,11 +216,11 @@ TEST(test_fragmented_reliable_ordered_message) {
 
     delivered_t del = {0};
     /* deliver fragments out of order */
-    nl_channel_on_receive(&receiver, 0, cap.packets[1].data, cap.packets[1].len, capture_deliver, &del);
+    nl_channel_on_receive(&receiver, 0, cap.packets[1].data, cap.packets[1].len, capture_deliver, &del, NULL, NULL, NULL, NULL);
     ASSERT_EQ(del.count, 0); /* incomplete + out of order, nothing deliverable */
-    nl_channel_on_receive(&receiver, 0, cap.packets[2].data, cap.packets[2].len, capture_deliver, &del);
+    nl_channel_on_receive(&receiver, 0, cap.packets[2].data, cap.packets[2].len, capture_deliver, &del, NULL, NULL, NULL, NULL);
     ASSERT_EQ(del.count, 0);
-    nl_channel_on_receive(&receiver, 0, cap.packets[0].data, cap.packets[0].len, capture_deliver, &del);
+    nl_channel_on_receive(&receiver, 0, cap.packets[0].data, cap.packets[0].len, capture_deliver, &del, NULL, NULL, NULL, NULL);
 
     ASSERT_EQ(del.count, 1); /* the whole reassembled message delivered as one unit */
     ASSERT_EQ(del.len[0], total);
@@ -251,7 +251,7 @@ TEST(test_multiple_channels_independent_sequence_spaces) {
     nl_channel_send(&sender, 0, 7, NL_RELIABLE_ORDERED, (const uint8_t *)"chan7", 5, capture_emit, &cap);
 
     delivered_t del = {0};
-    nl_channel_on_receive(&receiver, 0, cap.packets[0].data, cap.packets[0].len, capture_deliver, &del);
+    nl_channel_on_receive(&receiver, 0, cap.packets[0].data, cap.packets[0].len, capture_deliver, &del, NULL, NULL, NULL, NULL);
     ASSERT_EQ(del.count, 1);
     ASSERT_EQ(del.channel[0], 7);
 
@@ -282,7 +282,7 @@ TEST(test_retransmission_on_tick_when_unacked) {
 
     /* The retransmitted packet must still be understood correctly by a receiver. */
     delivered_t del = {0};
-    nl_channel_on_receive(&receiver, 300, retrans.packets[0].data, retrans.packets[0].len, capture_deliver, &del);
+    nl_channel_on_receive(&receiver, 300, retrans.packets[0].data, retrans.packets[0].len, capture_deliver, &del, NULL, NULL, NULL, NULL);
     ASSERT_EQ(del.count, 1);
     ASSERT_MEM_EQ(del.data[0], "retry-me", 8);
 
@@ -299,12 +299,12 @@ TEST(test_no_retransmit_after_ack_received) {
     nl_channel_send(&sender, 0, 0, NL_RELIABLE_ORDERED, (const uint8_t *)"acked", 5, capture_emit, &cap);
 
     delivered_t del = {0};
-    nl_channel_on_receive(&receiver, 0, cap.packets[0].data, cap.packets[0].len, capture_deliver, &del);
+    nl_channel_on_receive(&receiver, 0, cap.packets[0].data, cap.packets[0].len, capture_deliver, &del, NULL, NULL, NULL, NULL);
 
     /* Receiver's next send piggybacks an ack for what it received. */
     capture_t ack_cap = {0};
     nl_channel_send(&receiver, 0, 0, NL_RELIABLE_ORDERED, (const uint8_t *)"reply", 5, capture_emit, &ack_cap);
-    nl_channel_on_receive(&sender, 0, ack_cap.packets[0].data, ack_cap.packets[0].len, capture_deliver, &del);
+    nl_channel_on_receive(&sender, 0, ack_cap.packets[0].data, ack_cap.packets[0].len, capture_deliver, &del, NULL, NULL, NULL, NULL);
 
     /* Sender's packet is now acked -- ticking well past RTO must NOT retransmit it. */
     capture_t retrans = {0};
@@ -340,6 +340,167 @@ TEST(test_give_up_after_max_retries) {
     nl_channel_free(&sender);
 }
 
+TEST(test_rtt_sample_on_clean_ack) {
+    nl_channel_t sender, receiver;
+    nl_channel_init(&sender);
+    nl_channel_init(&receiver);
+    capture_t cap = {0};
+
+    nl_channel_send(&sender, /*now_ms*/ 1000, 0, NL_RELIABLE_ORDERED, (const uint8_t *)"x", 1, capture_emit, &cap);
+
+    delivered_t del = {0};
+    nl_channel_on_receive(&receiver, 1000, cap.packets[0].data, cap.packets[0].len, capture_deliver, &del,
+                           NULL, NULL, NULL, NULL);
+
+    capture_t ack_cap = {0};
+    nl_channel_send(&receiver, 1000, 0, NL_RELIABLE_ORDERED, (const uint8_t *)"ack", 3, capture_emit, &ack_cap);
+
+    bool has_sample = false;
+    uint32_t sample_ms = 0;
+    /* The ack for our packet 0 arrives 42ms later. */
+    nl_channel_on_receive(&sender, 1042, ack_cap.packets[0].data, ack_cap.packets[0].len, capture_deliver, &del,
+                           NULL, NULL, &has_sample, &sample_ms);
+
+    ASSERT_TRUE(has_sample);
+    ASSERT_EQ(sample_ms, 42);
+
+    nl_channel_free(&sender);
+    nl_channel_free(&receiver);
+}
+
+TEST(test_rtt_no_sample_for_retransmitted_packet) {
+    /* Karn's algorithm: once a packet has been retransmitted, an ack for
+     * it is ambiguous (could be acking the original or the resend), so it
+     * must never be used as an RTT sample. */
+    nl_channel_t sender, receiver;
+    nl_channel_init(&sender);
+    nl_channel_init(&receiver);
+    capture_t cap = {0};
+
+    nl_channel_send(&sender, 0, 0, NL_RELIABLE_ORDERED, (const uint8_t *)"x", 1, capture_emit, &cap);
+
+    /* Force a retransmit via nl_channel_tick before any ack arrives. */
+    capture_t retrans = {0};
+    bool give_up = false;
+    nl_channel_tick(&sender, 0, 500, /*rto_ms*/ 200, 10, capture_emit, &retrans, &give_up);
+    ASSERT_EQ(retrans.count, 1);
+
+    delivered_t del = {0};
+    nl_channel_on_receive(&receiver, 500, retrans.packets[0].data, retrans.packets[0].len, capture_deliver, &del,
+                           NULL, NULL, NULL, NULL);
+    capture_t ack_cap = {0};
+    nl_channel_send(&receiver, 500, 0, NL_RELIABLE_ORDERED, (const uint8_t *)"ack", 3, capture_emit, &ack_cap);
+
+    bool has_sample = true; /* poison: must be set false by the call */
+    uint32_t sample_ms = 0;
+    nl_channel_on_receive(&sender, 600, ack_cap.packets[0].data, ack_cap.packets[0].len, capture_deliver, &del,
+                           NULL, NULL, &has_sample, &sample_ms);
+
+    ASSERT_FALSE(has_sample);
+
+    nl_channel_free(&sender);
+    nl_channel_free(&receiver);
+}
+
+TEST(test_rtt_no_sample_for_unreliable_lane) {
+    /* Unreliable lanes have no send ring / ack tracking at all -- must
+     * not crash and must report no sample. */
+    nl_channel_t sender, receiver;
+    nl_channel_init(&sender);
+    nl_channel_init(&receiver);
+    capture_t cap = {0};
+    nl_channel_send(&sender, 0, 0, NL_UNRELIABLE, (const uint8_t *)"x", 1, capture_emit, &cap);
+
+    delivered_t del = {0};
+    bool has_sample = true;
+    uint32_t sample_ms = 0;
+    nl_channel_on_receive(&receiver, 0, cap.packets[0].data, cap.packets[0].len, capture_deliver, &del,
+                           NULL, NULL, &has_sample, &sample_ms);
+    ASSERT_FALSE(has_sample);
+
+    nl_channel_free(&sender);
+    nl_channel_free(&receiver);
+}
+
+TEST(test_fast_retransmit_triggers_on_reorder_threshold) {
+    nl_channel_t sender, receiver;
+    nl_channel_init(&sender);
+    nl_channel_init(&receiver);
+    capture_t cap = {0};
+
+    /* Send 5 packets: 0,1,2,3,4. Packet 0 gets "lost" (never delivered to
+     * receiver); 1..4 arrive and get acked, so packet 0 accumulates 4
+     * strictly-newer acked packets -- past the threshold of 3. */
+    for (int i = 0; i < 5; i++) {
+        char msg[2] = { (char)('a' + i), 0 };
+        nl_channel_send(&sender, 0, 0, NL_RELIABLE_ORDERED, (const uint8_t *)msg, 1, capture_emit, &cap);
+    }
+    ASSERT_EQ(cap.count, 5);
+
+    delivered_t del = {0};
+    for (int i = 1; i < 5; i++) {
+        nl_channel_on_receive(&receiver, 0, cap.packets[i].data, cap.packets[i].len, capture_deliver, &del,
+                               NULL, NULL, NULL, NULL);
+    }
+    capture_t ack_cap = {0};
+    nl_channel_send(&receiver, 0, 0, NL_RELIABLE_ORDERED, (const uint8_t *)"ack", 3, capture_emit, &ack_cap);
+
+    /* Feed that ack back to the sender -- well before RTO would fire --
+     * and it should immediately fast-retransmit packet 0. */
+    capture_t fast_retrans = {0};
+    nl_channel_on_receive(&sender, 10 /* far less than any real RTO */, ack_cap.packets[0].data,
+                           ack_cap.packets[0].len, capture_deliver, &del,
+                           capture_emit, &fast_retrans, NULL, NULL);
+
+    ASSERT_EQ(fast_retrans.count, 1);
+    /* Confirm it's really packet 0's data being retransmitted, by feeding
+     * it to a fresh receiver and checking the payload. */
+    nl_channel_t fresh_receiver;
+    nl_channel_init(&fresh_receiver);
+    delivered_t del2 = {0};
+    nl_channel_on_receive(&fresh_receiver, 0, fast_retrans.packets[0].data, fast_retrans.packets[0].len,
+                           capture_deliver, &del2, NULL, NULL, NULL, NULL);
+    ASSERT_EQ(del2.count, 1);
+    ASSERT_EQ(del2.data[0][0], 'a');
+    nl_channel_free(&fresh_receiver);
+
+    nl_channel_free(&sender);
+    nl_channel_free(&receiver);
+}
+
+TEST(test_fast_retransmit_does_not_trigger_below_threshold) {
+    nl_channel_t sender, receiver;
+    nl_channel_init(&sender);
+    nl_channel_init(&receiver);
+    capture_t cap = {0};
+
+    /* Send 3 packets: 0,1,2. Packet 0 "lost"; only 1 and 2 arrive -- just
+     * 2 strictly-newer acked packets, below the threshold of 3. Ordinary
+     * reordering commonly looks exactly like this, so it must NOT trigger
+     * a premature retransmit. */
+    for (int i = 0; i < 3; i++) {
+        char msg[2] = { (char)('a' + i), 0 };
+        nl_channel_send(&sender, 0, 0, NL_RELIABLE_ORDERED, (const uint8_t *)msg, 1, capture_emit, &cap);
+    }
+
+    delivered_t del = {0};
+    for (int i = 1; i < 3; i++) {
+        nl_channel_on_receive(&receiver, 0, cap.packets[i].data, cap.packets[i].len, capture_deliver, &del,
+                               NULL, NULL, NULL, NULL);
+    }
+    capture_t ack_cap = {0};
+    nl_channel_send(&receiver, 0, 0, NL_RELIABLE_ORDERED, (const uint8_t *)"ack", 3, capture_emit, &ack_cap);
+
+    capture_t fast_retrans = {0};
+    nl_channel_on_receive(&sender, 10, ack_cap.packets[0].data, ack_cap.packets[0].len, capture_deliver, &del,
+                           capture_emit, &fast_retrans, NULL, NULL);
+
+    ASSERT_EQ(fast_retrans.count, 0);
+
+    nl_channel_free(&sender);
+    nl_channel_free(&receiver);
+}
+
 int main(void) {
     printf("=== channel tests ===\n");
     RUN_TEST(test_unreliable_basic_roundtrip);
@@ -353,5 +514,10 @@ int main(void) {
     RUN_TEST(test_retransmission_on_tick_when_unacked);
     RUN_TEST(test_no_retransmit_after_ack_received);
     RUN_TEST(test_give_up_after_max_retries);
+    RUN_TEST(test_rtt_sample_on_clean_ack);
+    RUN_TEST(test_rtt_no_sample_for_retransmitted_packet);
+    RUN_TEST(test_rtt_no_sample_for_unreliable_lane);
+    RUN_TEST(test_fast_retransmit_triggers_on_reorder_threshold);
+    RUN_TEST(test_fast_retransmit_does_not_trigger_below_threshold);
     TEST_SUMMARY();
 }

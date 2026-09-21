@@ -257,6 +257,29 @@ NL_API bool nl_peer_address(nl_endpoint_t *ep, nl_peer_id_t peer, nl_address_t *
 NL_API uint32_t nl_peer_rtt_ms(nl_endpoint_t *ep, nl_peer_id_t peer);
 NL_API uint32_t nl_peer_count(nl_endpoint_t *ep);
 
+/* Per-peer counters and timing estimates: sent/received packet and byte
+ * counts, retransmissions (RTO-triggered and fast-retransmit combined),
+ * duplicate/replayed packets rejected, and RTT statistics (smoothed RTT,
+ * smoothed RTT variance, and the currently-derived retransmit timeout --
+ * see the README's Architecture section for the estimation algorithm).
+ * Useful for in-game network diagnostics ("Ping: 42ms, Loss: 0.7%") or
+ * server-side monitoring. */
+typedef struct {
+    uint64_t packets_sent;
+    uint64_t packets_received;
+    uint64_t bytes_sent;
+    uint64_t bytes_received;
+    uint64_t retransmits;
+    uint64_t duplicates_received;
+    uint32_t rtt_ms;
+    uint32_t rtt_var_ms;
+    uint32_t rto_ms;
+} nl_peer_stats_t;
+
+/* Copy out a snapshot of `peer`'s counters and RTT estimates. Returns
+ * false if `peer` is not a currently-known connection. Thread-safe. */
+NL_API bool nl_peer_stats(nl_endpoint_t *ep, nl_peer_id_t peer, nl_peer_stats_t *out);
+
 #ifdef __cplusplus
 }
 #endif

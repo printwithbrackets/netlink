@@ -61,8 +61,43 @@ void nl_send_ring_free(nl_send_ring_t *ring);
 bool nl_send_ring_insert(nl_send_ring_t *ring, const uint8_t *data, uint16_t len,
                           uint64_t now_ms, uint16_t *out_seq);
 /* Mark `sequence` (and, per the ack-bitfield convention, the 32 preceding
- * sequences whose corresponding bit is set in ack_bits) as acked. */
-void nl_send_ring_ack(nl_send_ring_t *ring, uint16_t ack, uint32_t ack_bits);
+ * sequences whose corresponding bit is set in ack_bits) as acked.
+ *
+ * If the exact `ack` sequence was newly acked by this call (not already
+ * acked, i.e. this isn't a duplicate/stale ack) AND it was never
+ * retransmitted (retry_count == 0), *out_has_rtt_sample is set true and
+ * *out_rtt_sample_ms is set to the observed round-trip time. Only the
+ * newest sequence is ever used as an RTT sample, and only when it was
+ * never retransmitted -- this is Karn's algorithm: if a packet was
+ * retransmitted, an incoming ack for it is ambiguous (you can't tell
+ * which transmission it's acking), so sampling RTT from it would corrupt
+ * the estimate, typically making it falsely low after a loss episode.
+ * Older sequences newly-acked via the bitfield are never used as samples
+ * for the same reason -- their delivery timing relative to `now_ms` says
+ * as much about queueing/loss as about the path RTT. */
+void nl_send_ring_ack(nl_send_ring_t *ring, uint16_t ack, uint32_t ack_bits, uint64_t now_ms,
+                       bool *out_has_rtt_sample, uint32_t *out_rtt_sample_ms);
+
+/* Fast retransmit: scan for unacked slots that are almost certainly lost
+ * rather than merely delayed/reordered, using the same signal TCP's
+ * "three duplicate acks" heuristic uses -- if `reorder_threshold` or more
+ * strictly-newer sequences are already confirmed acked (per `ack` and
+ * `ack_bits`) while an older one isn't, waiting for the RTO timer is
+ * pure wasted latency; the loss is already evident. Calls `emit` once
+ * per sequence identified this way, marking it as retransmitted (bumping
+ * retry_count and refreshing send_time_ms, exactly as a normal
+ * RTO-triggered retransmit would) so it isn't immediately re-flagged.
+ *
+ * Whether a candidate slot is itself already acked is re-derived directly
+ * from (ack, ack_bits) rather than solely trusted from slot->acked, so
+ * this gives correct results independent of whether nl_send_ring_ack was
+ * called first with these same values (real callers always do both
+ * together with one incoming packet's ack/ack_bits, but correctness here
+ * doesn't depend on that ordering). */
+typedef void (*nl_fast_retransmit_fn)(void *ctx, uint16_t sequence);
+void nl_send_ring_fast_retransmit(nl_send_ring_t *ring, uint16_t ack, uint32_t ack_bits,
+                                   uint32_t reorder_threshold, uint64_t now_ms,
+                                   nl_fast_retransmit_fn emit, void *ctx);
 /* Look up an entry by exact sequence, for a caller that wants to inspect it
  * (e.g. retransmission scan). Returns NULL if not present/valid. */
 nl_send_slot_t *nl_send_ring_get(nl_send_ring_t *ring, uint16_t sequence);

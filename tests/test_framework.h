@@ -15,8 +15,10 @@ static const char *nl_current_test = NULL;
     nl_tests_run++; \
     int before = nl_tests_failed; \
     printf("  RUN  %s\n", #name); \
+    fflush(stdout); \
     name(); \
     if (nl_tests_failed == before) printf("  OK   %s\n", #name); \
+    fflush(stdout); \
 } while (0)
 
 #define ASSERT_TRUE(cond) do { \

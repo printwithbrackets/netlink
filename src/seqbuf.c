@@ -40,12 +40,60 @@ static void ack_one(nl_send_ring_t *ring, uint16_t seq) {
     }
 }
 
-void nl_send_ring_ack(nl_send_ring_t *ring, uint16_t ack, uint32_t ack_bits) {
+void nl_send_ring_ack(nl_send_ring_t *ring, uint16_t ack, uint32_t ack_bits, uint64_t now_ms,
+                       bool *out_has_rtt_sample, uint32_t *out_rtt_sample_ms) {
+    *out_has_rtt_sample = false;
+
+    nl_send_slot_t *ack_slot = &ring->slots[ack & NL_SEQ_RING_MASK];
+    if (ack_slot->valid && ack_slot->sequence == ack && !ack_slot->acked && ack_slot->retry_count == 0) {
+        /* Newest sequence, never retransmitted: a clean RTT sample (Karn's
+         * algorithm -- see the header comment for why retransmitted or
+         * older-via-bitfield sequences are never used as samples). */
+        uint64_t elapsed = now_ms - ack_slot->send_time_ms;
+        *out_has_rtt_sample = true;
+        *out_rtt_sample_ms = (uint32_t)elapsed;
+    }
+
     ack_one(ring, ack);
     for (int i = 0; i < 32; i++) {
         if (ack_bits & (1u << i)) {
             uint16_t seq = (uint16_t)(ack - (i + 1));
             ack_one(ring, seq);
+        }
+    }
+}
+
+void nl_send_ring_fast_retransmit(nl_send_ring_t *ring, uint16_t ack, uint32_t ack_bits,
+                                   uint32_t reorder_threshold, uint64_t now_ms,
+                                   nl_fast_retransmit_fn emit, void *ctx) {
+    for (int i = 0; i < NL_SEQ_RING_SIZE; i++) {
+        nl_send_slot_t *slot = &ring->slots[i];
+        /* slot->acked reflects everything ever acked, including via a
+         * prior ack_bits window that has since scrolled past what the
+         * current `ack_bits` snapshot can represent. */
+        if (!slot->valid || slot->acked) continue;
+        if (nl_seq_greater_than(slot->sequence, ack)) continue; /* newer than the ack horizon, not yet due */
+
+        uint16_t age = (uint16_t)(ack - slot->sequence);
+        if (age == 0 || age > 32) continue; /* == 0 shouldn't occur unacked; > 32 is outside this ack_bits' window */
+
+        /* Is this slot itself acked per the CURRENT snapshot? Re-derive
+         * directly from (ack, ack_bits) rather than only trusting
+         * slot->acked, so this function gives correct results even if a
+         * caller invokes it without first calling nl_send_ring_ack with
+         * these same values (real usage always does both together, but
+         * this way correctness doesn't silently depend on that ordering). */
+        if (ack_bits & (1u << (age - 1))) continue;
+
+        uint32_t newer_acked = 1; /* `ack` itself is always acked by definition */
+        for (uint16_t b = 0; b < (uint16_t)(age - 1); b++) {
+            if (ack_bits & (1u << b)) newer_acked++;
+        }
+
+        if (newer_acked >= reorder_threshold) {
+            emit(ctx, slot->sequence);
+            slot->send_time_ms = now_ms; /* same bookkeeping a normal retransmit performs */
+            slot->retry_count++;
         }
     }
 }

@@ -124,9 +124,46 @@ static void deliver_or_reassemble(nl_lane_t *lane, uint64_t now_ms, uint8_t chan
      * fields defensively). */
 }
 
+static void emit_wire_for_slot(nl_lane_t *lane, uint8_t channel_id, uint8_t delivery,
+                                nl_send_slot_t *slot, nl_channel_retransmit_fn retransmit, void *ctx) {
+    uint16_t ack = 0;
+    uint32_t ack_bits = 0;
+    if (lane->recv_dedupe_init) nl_recv_dedupe_build_ack(&lane->recv_dedupe, &ack, &ack_bits);
+
+    uint8_t wire[NL_MAX_PACKET_SIZE];
+    size_t off = 0;
+    wire[off++] = channel_id;
+    wire[off++] = delivery;
+    nl_put_u16(wire + off, slot->sequence); off += 2;
+    nl_put_u16(wire + off, ack); off += 2;
+    nl_put_u32(wire + off, ack_bits); off += 4;
+    memcpy(wire + off, slot->data, slot->len);
+    off += slot->len;
+
+    retransmit(ctx, wire, (uint16_t)off);
+}
+
+typedef struct {
+    nl_lane_t *lane;
+    uint8_t channel_id;
+    uint8_t delivery;
+    nl_channel_retransmit_fn retransmit;
+    void *retransmit_ctx;
+} fast_retransmit_bridge_t;
+
+static void fast_retransmit_bridge(void *ctx, uint16_t sequence) {
+    fast_retransmit_bridge_t *b = (fast_retransmit_bridge_t *)ctx;
+    nl_send_slot_t *slot = nl_send_ring_get(&b->lane->send_ring, sequence);
+    if (!slot) return; /* shouldn't happen: fast_retransmit only reports slots it found itself */
+    emit_wire_for_slot(b->lane, b->channel_id, b->delivery, slot, b->retransmit, b->retransmit_ctx);
+}
+
 void nl_channel_on_receive(nl_channel_t *chan, uint64_t now_ms,
                             const uint8_t *wire_payload, uint16_t wire_len,
-                            nl_channel_deliver_fn deliver, void *ctx) {
+                            nl_channel_deliver_fn deliver, void *deliver_ctx,
+                            nl_channel_retransmit_fn retransmit, void *retransmit_ctx,
+                            bool *out_has_rtt_sample, uint32_t *out_rtt_sample_ms) {
+    if (out_has_rtt_sample) *out_has_rtt_sample = false;
     if (wire_len < NL_DATA_HEADER_SIZE) return; /* malformed, drop */
 
     size_t off = 0;
@@ -150,7 +187,19 @@ void nl_channel_on_receive(nl_channel_t *chan, uint64_t now_ms,
             if (nl_send_ring_init(&lane->send_ring) != 0) return;
             lane->send_ring_init = true;
         }
-        nl_send_ring_ack(&lane->send_ring, ack, ack_bits);
+        bool has_sample = false;
+        uint32_t sample_ms = 0;
+        nl_send_ring_ack(&lane->send_ring, ack, ack_bits, now_ms, &has_sample, &sample_ms);
+        if (has_sample && out_has_rtt_sample) {
+            *out_has_rtt_sample = true;
+            *out_rtt_sample_ms = sample_ms;
+        }
+
+        if (retransmit) {
+            fast_retransmit_bridge_t bridge = { lane, channel_id, (uint8_t)delivery, retransmit, retransmit_ctx };
+            nl_send_ring_fast_retransmit(&lane->send_ring, ack, ack_bits, NL_FAST_RETRANSMIT_THRESHOLD,
+                                          now_ms, fast_retransmit_bridge, &bridge);
+        }
     }
 
     uint16_t message_id = 0, frag_index = 0, frag_count = 1;
@@ -165,7 +214,7 @@ void nl_channel_on_receive(nl_channel_t *chan, uint64_t now_ms,
 
     if (delivery == NL_UNRELIABLE) {
         deliver_or_reassemble(lane, now_ms, channel_id, delivery, is_fragment, message_id,
-                               frag_index, frag_count, chunk, chunk_len, deliver, ctx);
+                               frag_index, frag_count, chunk, chunk_len, deliver, deliver_ctx);
         return;
     }
 
@@ -176,7 +225,7 @@ void nl_channel_on_receive(nl_channel_t *chan, uint64_t now_ms,
         lane->seq_highest_seen = seq;
         lane->seq_has_received_any = true;
         deliver_or_reassemble(lane, now_ms, channel_id, delivery, is_fragment, message_id,
-                               frag_index, frag_count, chunk, chunk_len, deliver, ctx);
+                               frag_index, frag_count, chunk, chunk_len, deliver, deliver_ctx);
         return;
     }
 
@@ -189,7 +238,7 @@ void nl_channel_on_receive(nl_channel_t *chan, uint64_t now_ms,
 
     if (delivery == NL_RELIABLE_UNORDERED) {
         deliver_or_reassemble(lane, now_ms, channel_id, delivery, is_fragment, message_id,
-                               frag_index, frag_count, chunk, chunk_len, deliver, ctx);
+                               frag_index, frag_count, chunk, chunk_len, deliver, deliver_ctx);
         return;
     }
 
@@ -217,7 +266,7 @@ void nl_channel_on_receive(nl_channel_t *chan, uint64_t now_ms,
             p_cnt = nl_get_u16(pop_buf + p); p += 2;
         }
         deliver_or_reassemble(lane, now_ms, channel_id, delivery, pf, p_mid, p_idx, p_cnt,
-                               pop_buf + p, (uint16_t)(pop_len - p), deliver, ctx);
+                               pop_buf + p, (uint16_t)(pop_len - p), deliver, deliver_ctx);
     }
 }
 
@@ -240,21 +289,7 @@ void nl_channel_tick(nl_channel_t *chan, uint8_t channel_id, uint64_t now_ms, ui
                 continue;
             }
 
-            uint16_t ack = 0;
-            uint32_t ack_bits = 0;
-            if (lane->recv_dedupe_init) nl_recv_dedupe_build_ack(&lane->recv_dedupe, &ack, &ack_bits);
-
-            uint8_t wire[NL_MAX_PACKET_SIZE];
-            size_t off = 0;
-            wire[off++] = channel_id;
-            wire[off++] = (uint8_t)d;
-            nl_put_u16(wire + off, slot->sequence); off += 2;
-            nl_put_u16(wire + off, ack); off += 2;
-            nl_put_u32(wire + off, ack_bits); off += 4;
-            memcpy(wire + off, slot->data, slot->len);
-            off += slot->len;
-
-            retransmit(ctx, wire, (uint16_t)off);
+            emit_wire_for_slot(lane, channel_id, (uint8_t)d, slot, retransmit, ctx);
 
             /* Reset the retransmit clock -- without this the same slot
              * would look "due" again on the very next tick and we'd fire

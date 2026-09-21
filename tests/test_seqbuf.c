@@ -2,6 +2,25 @@
 #include "../src/seqbuf.h"
 #include <string.h>
 
+/* Small file-scope capture helper for tests that need to observe which
+ * sequences nl_send_ring_fast_retransmit() fires for. */
+static uint16_t g_fast_retransmit_fired[16];
+static int g_fast_retransmit_count;
+
+static void fast_retransmit_capture_reset(void) {
+    g_fast_retransmit_count = 0;
+}
+static int fast_retransmit_capture_count(void) {
+    return g_fast_retransmit_count;
+}
+static uint16_t fast_retransmit_capture_get(int i) {
+    return g_fast_retransmit_fired[i];
+}
+static void fast_retransmit_capture(void *ctx, uint16_t sequence) {
+    (void)ctx;
+    if (g_fast_retransmit_count < 16) g_fast_retransmit_fired[g_fast_retransmit_count++] = sequence;
+}
+
 TEST(test_seq_greater_than_basic) {
     ASSERT_TRUE(nl_seq_greater_than(1, 0));
     ASSERT_TRUE(nl_seq_greater_than(100, 99));
@@ -55,7 +74,8 @@ TEST(test_send_ring_ack_marks_slot) {
     uint16_t seq;
     nl_send_ring_insert(&ring, payload, 1, 0, &seq);
     ASSERT_FALSE(nl_send_ring_get(&ring, seq)->acked);
-    nl_send_ring_ack(&ring, seq, 0);
+    bool has_sample; uint32_t sample_ms;
+    nl_send_ring_ack(&ring, seq, 0, 0, &has_sample, &sample_ms);
     ASSERT_TRUE(nl_send_ring_get(&ring, seq)->acked);
     nl_send_ring_free(&ring);
 }
@@ -68,12 +88,148 @@ TEST(test_send_ring_ack_bitfield_marks_older) {
     for (int i = 0; i < 5; i++) nl_send_ring_insert(&ring, payload, 1, 0, &seqs[i]);
     /* seqs = 0,1,2,3,4. Ack seq=4 with bit0 set (=seq 3) and bit2 set (=seq 1). */
     uint32_t ack_bits = (1u << 0) | (1u << 2);
-    nl_send_ring_ack(&ring, 4, ack_bits);
+    bool has_sample; uint32_t sample_ms;
+    nl_send_ring_ack(&ring, 4, ack_bits, 0, &has_sample, &sample_ms);
     ASSERT_TRUE(nl_send_ring_get(&ring, 4)->acked);
     ASSERT_TRUE(nl_send_ring_get(&ring, 3)->acked);  /* bit 0 */
     ASSERT_FALSE(nl_send_ring_get(&ring, 2)->acked); /* not set */
     ASSERT_TRUE(nl_send_ring_get(&ring, 1)->acked);  /* bit 2 */
     ASSERT_FALSE(nl_send_ring_get(&ring, 0)->acked); /* not set */
+    nl_send_ring_free(&ring);
+}
+
+TEST(test_send_ring_ack_rtt_sample_clean) {
+    nl_send_ring_t ring;
+    nl_send_ring_init(&ring);
+    uint8_t payload[] = {0xAA};
+    uint16_t seq;
+    nl_send_ring_insert(&ring, payload, 1, /*send_time_ms*/ 1000, &seq);
+
+    bool has_sample; uint32_t sample_ms;
+    nl_send_ring_ack(&ring, seq, 0, /*now_ms*/ 1075, &has_sample, &sample_ms);
+    ASSERT_TRUE(has_sample);
+    ASSERT_EQ(sample_ms, 75);
+    nl_send_ring_free(&ring);
+}
+
+TEST(test_send_ring_ack_no_rtt_sample_if_already_acked) {
+    /* A duplicate/stale ack for something already acked must not produce
+     * a second (meaningless) RTT sample. */
+    nl_send_ring_t ring;
+    nl_send_ring_init(&ring);
+    uint8_t payload[] = {0xAA};
+    uint16_t seq;
+    nl_send_ring_insert(&ring, payload, 1, 1000, &seq);
+
+    bool has_sample; uint32_t sample_ms;
+    nl_send_ring_ack(&ring, seq, 0, 1050, &has_sample, &sample_ms);
+    ASSERT_TRUE(has_sample);
+
+    nl_send_ring_ack(&ring, seq, 0, 1200, &has_sample, &sample_ms); /* duplicate ack */
+    ASSERT_FALSE(has_sample);
+    nl_send_ring_free(&ring);
+}
+
+TEST(test_send_ring_ack_no_rtt_sample_for_retransmitted) {
+    nl_send_ring_t ring;
+    nl_send_ring_init(&ring);
+    uint8_t payload[] = {0xAA};
+    uint16_t seq;
+    nl_send_ring_insert(&ring, payload, 1, 1000, &seq);
+    nl_send_ring_get(&ring, seq)->retry_count = 1; /* simulate: this slot was retransmitted */
+
+    bool has_sample; uint32_t sample_ms;
+    nl_send_ring_ack(&ring, seq, 0, 1050, &has_sample, &sample_ms);
+    ASSERT_FALSE(has_sample);
+    nl_send_ring_free(&ring);
+}
+
+TEST(test_send_ring_ack_no_rtt_sample_from_bitfield_entries) {
+    /* Only the newest (`ack`) sequence is ever a sample source -- entries
+     * newly-acked purely via the bitfield never produce one, even if
+     * they were never retransmitted, since their delivery timing relative
+     * to `now_ms` doesn't isolate path RTT the way the newest ack does. */
+    nl_send_ring_t ring;
+    nl_send_ring_init(&ring);
+    uint8_t payload[] = {0xAA};
+    uint16_t seq0, seq1;
+    nl_send_ring_insert(&ring, payload, 1, 1000, &seq0);
+    nl_send_ring_insert(&ring, payload, 1, 1010, &seq1);
+
+    bool has_sample; uint32_t sample_ms;
+    /* Ack seq1 directly (produces a sample) and seq0 via bit 0. */
+    nl_send_ring_ack(&ring, seq1, 1u << 0, 1100, &has_sample, &sample_ms);
+    ASSERT_TRUE(has_sample);       /* from seq1, the `ack` field itself */
+    ASSERT_EQ(sample_ms, 90);      /* 1100 - 1010 */
+    ASSERT_TRUE(nl_send_ring_get(&ring, seq0)->acked); /* seq0 acked too, via bitfield */
+    nl_send_ring_free(&ring);
+}
+
+TEST(test_fast_retransmit_triggers_past_threshold) {
+    nl_send_ring_t ring;
+    nl_send_ring_init(&ring);
+    uint8_t payload[] = {0xAA};
+    uint16_t seqs[5];
+    for (int i = 0; i < 5; i++) nl_send_ring_insert(&ring, payload, 1, 0, &seqs[i]);
+
+    /* ack=4, with seqs 1,2,3 acked via bitfield (bits 0,1,2 relative to 4),
+     * seq 0 (age 4) still unacked -- 4 strictly-newer acked (1,2,3,4)
+     * exceeds threshold 3. As in real usage (channel.c always calls
+     * nl_send_ring_ack() before nl_send_ring_fast_retransmit() with the
+     * same ack/ack_bits), apply the ack first so already-acked slots are
+     * correctly excluded from the scan. */
+    uint32_t ack_bits = (1u << 0) | (1u << 1) | (1u << 2);
+    bool has_sample; uint32_t sample_ms;
+    nl_send_ring_ack(&ring, 4, ack_bits, 0, &has_sample, &sample_ms);
+
+    fast_retransmit_capture_reset();
+    nl_send_ring_fast_retransmit(&ring, 4, ack_bits, 3, 100, fast_retransmit_capture, NULL);
+
+    ASSERT_EQ(fast_retransmit_capture_count(), 1);
+    ASSERT_EQ(fast_retransmit_capture_get(0), seqs[0]);
+    /* Fast-retransmitting must bump retry_count and refresh send_time_ms,
+     * exactly like a normal RTO retransmit. */
+    ASSERT_EQ(nl_send_ring_get(&ring, seqs[0])->retry_count, 1u);
+    ASSERT_EQ(nl_send_ring_get(&ring, seqs[0])->send_time_ms, 100u);
+
+    nl_send_ring_free(&ring);
+}
+
+TEST(test_fast_retransmit_correct_without_prior_ack_call) {
+    /* Regression test for the ordering-independence fix: this must give
+     * the same correct result as test_fast_retransmit_triggers_past_threshold
+     * even when nl_send_ring_ack was never called with these values first. */
+    nl_send_ring_t ring;
+    nl_send_ring_init(&ring);
+    uint8_t payload[] = {0xAA};
+    uint16_t seqs[5];
+    for (int i = 0; i < 5; i++) nl_send_ring_insert(&ring, payload, 1, 0, &seqs[i]);
+
+    uint32_t ack_bits = (1u << 0) | (1u << 1) | (1u << 2); /* seqs 1,2,3 acked; seq 0's own bit not covered */
+
+    fast_retransmit_capture_reset();
+    nl_send_ring_fast_retransmit(&ring, 4, ack_bits, 3, 100, fast_retransmit_capture, NULL);
+
+    ASSERT_EQ(fast_retransmit_capture_count(), 1);
+    ASSERT_EQ(fast_retransmit_capture_get(0), seqs[0]);
+
+    nl_send_ring_free(&ring);
+}
+
+TEST(test_fast_retransmit_skips_already_acked) {
+    nl_send_ring_t ring;
+    nl_send_ring_init(&ring);
+    uint8_t payload[] = {0xAA};
+    uint16_t seqs[5];
+    for (int i = 0; i < 5; i++) nl_send_ring_insert(&ring, payload, 1, 0, &seqs[i]);
+    bool has_sample; uint32_t sample_ms;
+    nl_send_ring_ack(&ring, 4, (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3), 0, &has_sample, &sample_ms);
+
+    /* everything acked now -- nothing should fast-retransmit */
+    fast_retransmit_capture_reset();
+    nl_send_ring_fast_retransmit(&ring, 4, (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3), 3, 100,
+                                  fast_retransmit_capture, NULL);
+    ASSERT_EQ(fast_retransmit_capture_count(), 0);
     nl_send_ring_free(&ring);
 }
 
@@ -236,6 +392,13 @@ int main(void) {
     RUN_TEST(test_send_ring_sequence_increments);
     RUN_TEST(test_send_ring_ack_marks_slot);
     RUN_TEST(test_send_ring_ack_bitfield_marks_older);
+    RUN_TEST(test_send_ring_ack_rtt_sample_clean);
+    RUN_TEST(test_send_ring_ack_no_rtt_sample_if_already_acked);
+    RUN_TEST(test_send_ring_ack_no_rtt_sample_for_retransmitted);
+    RUN_TEST(test_send_ring_ack_no_rtt_sample_from_bitfield_entries);
+    RUN_TEST(test_fast_retransmit_triggers_past_threshold);
+    RUN_TEST(test_fast_retransmit_correct_without_prior_ack_call);
+    RUN_TEST(test_fast_retransmit_skips_already_acked);
     RUN_TEST(test_recv_dedupe_rejects_duplicates);
     RUN_TEST(test_recv_dedupe_out_of_order_accepted_once);
     RUN_TEST(test_recv_dedupe_too_old_rejected);
