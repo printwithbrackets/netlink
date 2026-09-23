@@ -246,7 +246,7 @@ environment** (a sandboxed Linux container with a C toolchain, OpenSSL,
 and Python, but no Go/Rust toolchain, no IPv6 support at the kernel
 level, and no network access to install either):
 
-- 103 test cases across unit tests (`tests/test_seqbuf.c`,
+- 112 test cases across unit tests (`tests/test_seqbuf.c`,
   `test_crypto.c`, `test_fragment.c`, `test_channel.c`,
   `test_connection.c`, `test_network_simulation.c`) and real-socket
   integration tests (`tests/integration/test_integration.c`), all clean
@@ -307,11 +307,6 @@ genuinely valuable contribution.
   (e.g. a NAT rebind or network switch), the connection times out rather
   than following the new address, unlike e.g. QUIC.
 - **WebSocket transport and WebRTC** are not implemented (see Features).
-- **Handshake-completion packet has no dedicated retry.** If the final
-  `CONNECT_ACCEPTED` packet is lost, the client's connection attempt
-  times out (bounded, so it fails cleanly) rather than the server
-  retrying delivery. Reconnecting is safe and cheap (fresh ephemeral
-  keys each attempt).
 - **Connection table lookup is O(n)** (linear scan, bounded at 512
   connections internally). Fine for small-to-medium deployments; a hash
   map would be a straightforward improvement for large ones.
@@ -368,3 +363,59 @@ MIT -- see [LICENSE](LICENSE).
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Changelog
+
+### Unreleased
+
+Code review pass over the 0.1.0 core; all findings fixed with regression
+tests (`make` warning-free, `make test` green under ASan/UBSan). Wire
+format and `NL_PROTOCOL_VERSION` unchanged.
+
+- **Handshake retransmission.** `CONNECT_REQUEST`, `CONNECT_CHALLENGE`,
+  and `CONNECT_ACCEPTED` are now retried on a 250 ms timer with a finite
+  budget (`NL_ACCEPT_RETRIES` for the final accept), instead of a single
+  fire-and-forget send that left a lost packet stalling until idle
+  timeout. Duplicate in-flight `REQUEST`s re-send the cached `CHALLENGE`
+  rather than colliding on the pending table; `DENY` tears down a
+  half-open client connection cleanly.
+- **`UNRELIABLE_SEQUENCED` + fragmentation.** The stale-drop gate was
+  applied per fragment sequence number, so a reordered earlier fragment
+  was dropped and the message never reassembled. The gate now runs once
+  per complete message (against that message's highest fragment seq);
+  every fragment reaches reassembly first.
+- **Reassembly expiry on every tick.** `nl_channel_tick` now calls
+  `nl_reassembly_expire` on each lane, so incomplete messages are
+  reclaimed after `NL_REASSEMBLY_TIMEOUT_MS` (8 s) instead of only under
+  slot-eviction pressure.
+- **`encryption_enabled = false` rejected.** There is no cleartext mode;
+  `nl_server_create`/`nl_client_create` return `NL_ERR_UNSUPPORTED`
+  rather than silently encrypting (or shipping a protocol hole).
+- **Discovery hardening.** Replies must echo the most recent probe's
+  nonce (delayed/forged replies are dropped). Discovery has its own
+  rate-limit budget (200/s/endpoint), separate from the handshake
+  limiter, so a flood of probes can't starve connect attempts.
+- **`max_connections` clamped** to the hard internal cap (512) at
+  endpoint create, so discovery advertises the real limit instead of a
+  value that would pass REQUEST-time checks and then fail silently at
+  slot allocation.
+- **Duplicate `nl_connect` rejected.** A second connect to the same
+  address while one is in flight or established returns
+  `NL_ERR_ALREADY_CONNECTED` instead of colliding on pending-table
+  lookups.
+- **`server_name` copied at create.** The endpoint owns a copy of
+  `config.server_name`; clobbering the caller's buffer after
+  `nl_server_create` no longer changes what discovery reports.
+- **Endpoint failure cleanup.** All create failure paths (resolve,
+  socket, bind, I/O thread) free via `endpoint_free` — sockets, pending
+  entries, connection table, queue, mutexes, and the server secret —
+  instead of leaking a partial endpoint.
+- **Dead pending state removed.** `PENDING_CLIENT_AWAIT_ACCEPTED` is now
+  released/teardown correctly on confirm, deny, and expiry (including
+  destroying half-open client connections so `CONNECT_FAILED` is not
+  delivered twice).
+- **Regression tests** for the above: sequenced out-of-order fragments,
+  channel-tick reassembly expiry, ACCEPTED retransmit budget,
+  `encryption_enabled` rejection, duplicate connect, discovery wrong
+  nonce + rate limit (raw-socket injection, works without broadcast),
+  `max_connections` clamp, and `server_name` copy.

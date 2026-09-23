@@ -8,6 +8,12 @@
 #define NL_MAX_RTO_MS 10000
 #define NL_MAX_RETRIES 15
 #define NL_ENCRYPTED_PACKET_SCRATCH (NL_MAX_PACKET_SIZE + NL_ENC_HEADER_SIZE + NL_GCM_TAG_SIZE + 64)
+/* How many times (including the initial send) the server will put
+ * CONNECT_ACCEPTED on the wire before giving up on the client hearing it.
+ * Combined with NL_HANDSHAKE_RETRY_MS below this covers multi-second
+ * loss windows without unbounded resend if the client is gone. */
+#define NL_ACCEPT_RETRIES 8
+#define NL_HANDSHAKE_RETRY_MS 250
 
 /* Jacobson/Karels smoothed RTT + RTTVAR update (the same algorithm TCP's
  * RTO estimation uses, RFC 6298), fed only by clean samples -- see
@@ -65,6 +71,8 @@ nl_connection_t *nl_connection_create(nl_peer_id_t id, const struct sockaddr_sto
     conn->rtt_ms = NL_DEFAULT_RTT_MS;
     conn->rto_ms = NL_DEFAULT_RTT_MS * 2;
     if (conn->rto_ms < NL_MIN_RTO_MS) conn->rto_ms = NL_MIN_RTO_MS;
+    conn->accept_sent_ms = 0;
+    conn->accept_retries_left = 0;
 
     conn->connection_timeout_ms = connection_timeout_ms;
     conn->keepalive_interval_ms = keepalive_interval_ms;
@@ -300,6 +308,24 @@ void nl_connection_tick(nl_connection_t *conn, uint64_t now_ms, const nl_conn_ca
         return;
     }
 
+    /* Server-side CONNECT_ACCEPTED retransmission: the client only becomes
+     * "connected" once it decrypts one of these, so a single lost datagram
+     * would otherwise stall the handshake until the idle timeout. Only the
+     * server side ever arms this (is_client_side connections never send
+     * ACCEPTED); budget is finite so a vanished client can't pin us forever.
+     * Re-arming stops once the client has sent anything back that we could
+     * authenticate -- receiving a valid packet proves the handshake keys
+     * round-tripped, so further ACCEPTED retries are pointless. */
+    if (!conn->is_client_side && conn->accept_retries_left > 0 &&
+        conn->last_recv_time_ms <= conn->accept_sent_ms) {
+        if (now_ms - conn->accept_sent_ms >= NL_HANDSHAKE_RETRY_MS) {
+            uint8_t empty[1] = {0};
+            encrypt_and_emit(conn, NL_PKT_CONNECT_ACCEPTED, empty, 0, /*is_retransmit*/ false, cb);
+            conn->accept_sent_ms = now_ms;
+            conn->accept_retries_left--;
+        }
+    }
+
     /* Retransmission scan across every channel's reliable lanes. */
     retransmit_ctx_t rctx = { conn, cb };
     bool any_gave_up = false;
@@ -338,10 +364,20 @@ void nl_connection_send_disconnect(nl_connection_t *conn, uint64_t now_ms, const
     pthread_mutex_unlock(&conn->lock);
 }
 
-void nl_connection_send_handshake_complete(nl_connection_t *conn, const nl_conn_callbacks_t *cb) {
+void nl_connection_send_handshake_complete(nl_connection_t *conn, uint64_t now_ms,
+                                            bool is_retry, const nl_conn_callbacks_t *cb) {
     pthread_mutex_lock(&conn->lock);
     uint8_t empty[1] = {0};
     encrypt_and_emit(conn, NL_PKT_CONNECT_ACCEPTED, empty, 0, /*is_retransmit*/ false, cb);
+    if (is_retry) {
+        /* Tick-driven resend: refresh the timer, leave the remaining budget
+         * alone (it was armed by the initial send). */
+        conn->accept_sent_ms = now_ms;
+    } else {
+        /* Initial send arms the retransmission budget. */
+        conn->accept_sent_ms = now_ms;
+        conn->accept_retries_left = NL_ACCEPT_RETRIES;
+    }
     pthread_mutex_unlock(&conn->lock);
 }
 

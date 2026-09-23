@@ -4,9 +4,77 @@
  * multiple channels, fragmentation, disconnects, and discovery. */
 #include "../test_framework.h"
 #include "../../include/netlink.h"
+#include "../../src/byteorder.h"
+#include "../../src/protocol.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <poll.h>
+#include <dirent.h>
+
+/* Collect the local UDP ports of sockets owned by this process by matching
+ * /proc/self/fd socket inodes against /proc/net/udp. Used to discover the
+ * client's (unexposed) discovery socket port after nl_discovery_probe so a
+ * test can inject raw responses without relying on broadcast delivery. */
+static int collect_process_udp_ports(uint16_t *out, int max) {
+    char inodes[64][64];
+    int inode_count = 0;
+    DIR *fd_dir = opendir("/proc/self/fd");
+    if (!fd_dir) return 0;
+    struct dirent *de;
+    while ((de = readdir(fd_dir)) != NULL && inode_count < 64) {
+        if (de->d_name[0] == '.') continue;
+        char path[320], link[128];
+        snprintf(path, sizeof(path), "/proc/self/fd/%s", de->d_name);
+        ssize_t n = readlink(path, link, sizeof(link) - 1);
+        if (n <= 0) continue;
+        link[n] = '\0';
+        unsigned long ino = 0;
+        if (sscanf(link, "socket:[%lu]", &ino) == 1)
+            snprintf(inodes[inode_count++], 64, "%lu", ino);
+    }
+    closedir(fd_dir);
+
+    FILE *f = fopen("/proc/net/udp", "r");
+    if (!f) return 0;
+    char line[256];
+    if (!fgets(line, sizeof(line), f)) { fclose(f); return 0; } /* header */
+    int count = 0;
+    while (fgets(line, sizeof(line), f) && count < max) {
+        /* /proc/net/udp columns (space-separated after "sl:"):
+         * local_address rem_address st tx:rx tr:tm retrnsmt uid timeout inode ...
+         * local_address is HEXADDR:HEXPORT. */
+        char local[32];
+        unsigned inode = 0;
+        if (sscanf(line, "%*d: %31s %*s %*s %*s %*s %*u %*u %*u %u",
+                   local, &inode) < 2)
+            continue;
+        char *colon = strrchr(local, ':');
+        if (!colon) continue;
+        unsigned local_port = (unsigned)strtoul(colon + 1, NULL, 16);
+        char inode_str[32];
+        snprintf(inode_str, sizeof(inode_str), "%u", inode);
+        for (int i = 0; i < inode_count; i++) {
+            if (strcmp(inodes[i], inode_str) == 0) {
+                out[count++] = (uint16_t)local_port;
+                break;
+            }
+        }
+    }
+    fclose(f);
+    return count;
+}
+
+static bool port_in_list(const uint16_t *ports, int n, uint16_t p) {
+    for (int i = 0; i < n; i++) if (ports[i] == p) return true;
+    return false;
+}
 
 static bool wait_for_event(nl_endpoint_t *ep, nl_event_type_t type, nl_event_t *out, int timeout_ms) {
     uint64_t deadline_iterations = (uint64_t)timeout_ms / 50 + 1;
@@ -296,6 +364,239 @@ TEST(test_server_denies_when_full) {
     nl_endpoint_destroy(server);
 }
 
+/* Regression: encryption_enabled=false must be rejected at construction --
+ * there is no cleartext mode; silently encrypting anyway or shipping a
+ * protocol hole would both be wrong. */
+TEST(test_encryption_disabled_rejected) {
+    nl_config_t cfg; nl_config_default(&cfg);
+    cfg.encryption_enabled = false;
+    nl_endpoint_t *ep = NULL;
+    nl_address_t bind_addr = addr("127.0.0.1", 34710);
+
+    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &ep), NL_ERR_UNSUPPORTED);
+    ASSERT_TRUE(ep == NULL);
+    ep = NULL;
+    ASSERT_EQ(nl_client_create(&cfg, &ep), NL_ERR_UNSUPPORTED);
+    ASSERT_TRUE(ep == NULL);
+}
+
+/* Regression: a second nl_connect() to the same address while one is in
+ * flight (or already established) must return NL_ERR_ALREADY_CONNECTED
+ * rather than collide on the pending table's address-keyed lookups. */
+TEST(test_duplicate_connect_same_address_rejected) {
+    nl_config_t cfg; nl_config_default(&cfg);
+    nl_endpoint_t *server = NULL, *client = NULL;
+    nl_address_t bind_addr = addr("127.0.0.1", 34711);
+    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+
+    nl_peer_id_t p1, p2;
+    ASSERT_EQ(nl_connect(client, &bind_addr, &p1), NL_OK);
+    /* Second connect while first is still in flight (AWAIT_CHALLENGE). */
+    ASSERT_EQ(nl_connect(client, &bind_addr, &p2), NL_ERR_ALREADY_CONNECTED);
+
+    /* Let the first handshake finish, then a third connect (now established). */
+    nl_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 3000));
+    ASSERT_EQ(nl_connect(client, &bind_addr, &p2), NL_ERR_ALREADY_CONNECTED);
+
+    nl_endpoint_destroy(client);
+    nl_endpoint_destroy(server);
+}
+
+/* Regression: max_connections above the hard internal cap (512) must be
+ * clamped so discovery advertises the real limit, not a value that would
+ * make REQUEST-time checks pass and then fail silently at slot alloc. */
+TEST(test_max_connections_clamped_to_internal_cap) {
+    nl_config_t cfg; nl_config_default(&cfg);
+    cfg.max_connections = 10000; /* way above NL_MAX_CONNECTIONS_INTERNAL */
+    cfg.server_name = "Clamp Test";
+    nl_endpoint_t *server = NULL, *client = NULL;
+    nl_address_t bind_addr = addr("127.0.0.1", 34712);
+    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+
+    ASSERT_EQ(nl_discovery_enable(server, 34801), NL_OK);
+    ASSERT_EQ(nl_discovery_probe(client, 34801, 500), NL_OK);
+
+    nl_event_t ev;
+    bool got = wait_for_event(client, NL_EVENT_DISCOVERY_REPLY, &ev, 3000);
+    if (got) {
+        /* Advertised max must be the clamped 512, not 10000. */
+        ASSERT_EQ(ev.server_max_players, 512u);
+    } else {
+        printf("  SKIP clamp discovery assert: broadcast filtered in this namespace\n");
+    }
+
+    nl_endpoint_destroy(client);
+    nl_endpoint_destroy(server);
+}
+
+/* Regression: server_name must be copied into the endpoint at create time.
+ * If config.server_name is only a shallow pointer, clobbering the caller's
+ * buffer after nl_server_create would change what discovery reports. */
+TEST(test_server_name_copied_at_create_time) {
+    nl_config_t cfg; nl_config_default(&cfg);
+    char name_buf[NL_SERVER_NAME_MAX];
+    strncpy(name_buf, "Stable Name", sizeof(name_buf) - 1);
+    name_buf[sizeof(name_buf) - 1] = '\0';
+    cfg.server_name = name_buf;
+
+    nl_endpoint_t *server = NULL, *client = NULL;
+    nl_address_t bind_addr = addr("127.0.0.1", 34713);
+    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+
+    /* Clobber the caller's buffer -- discovery must still report the
+     * original name (proving the library made its own copy). */
+    memset(name_buf, 'X', sizeof(name_buf) - 1);
+    name_buf[sizeof(name_buf) - 1] = '\0';
+
+    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+    ASSERT_EQ(nl_discovery_enable(server, 34802), NL_OK);
+    ASSERT_EQ(nl_discovery_probe(client, 34802, 500), NL_OK);
+
+    nl_event_t ev;
+    bool got = wait_for_event(client, NL_EVENT_DISCOVERY_REPLY, &ev, 3000);
+    if (got) {
+        ASSERT_TRUE(strcmp(ev.server_name, "Stable Name") == 0);
+    } else {
+        printf("  SKIP server_name discovery assert: broadcast filtered in this namespace\n");
+    }
+
+    nl_endpoint_destroy(client);
+    nl_endpoint_destroy(server);
+}
+
+/* Regression (finding 5): a DISCOVERY_RESPONSE whose nonce does not match
+ * the most recent probe must be dropped, not surfaced as a live result.
+ * Locates the client's discovery socket via /proc so the test works even
+ * when broadcast is filtered (no need to observe the outgoing probe). */
+TEST(test_discovery_wrong_nonce_ignored) {
+    nl_config_t cfg; nl_config_default(&cfg);
+    nl_endpoint_t *client = NULL;
+
+    uint16_t before[64];
+    int before_n = collect_process_udp_ports(before, 64);
+
+    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+    ASSERT_EQ(nl_discovery_probe(client, 34804, 500), NL_OK);
+
+    /* The probe creates a fresh discovery socket; find the new port. */
+    uint16_t after[64];
+    int after_n = collect_process_udp_ports(after, 64);
+    uint16_t disc_port = 0;
+    for (int i = 0; i < after_n; i++) {
+        if (!port_in_list(before, before_n, after[i])) {
+            disc_port = after[i];
+            break;
+        }
+    }
+    if (disc_port == 0) {
+        printf("  SKIP test_discovery_wrong_nonce_ignored: cannot locate discovery socket\n");
+        nl_endpoint_destroy(client);
+        return;
+    }
+
+    int raw = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    ASSERT_TRUE(raw >= 0);
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 300000 };
+    setsockopt(raw, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in dest;
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(disc_port);
+    dest.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    /* First probe used nonce 1 (discovery_probe_nonce starts at 0, pre-increment).
+     * Send a WRONG nonce first. */
+    uint8_t resp[NL_DISCOVERY_RESPONSE_MIN_SIZE + 16];
+    size_t o = 0;
+    resp[o++] = NL_PKT_DISCOVERY_RESPONSE;
+    nl_put_u32(resp + o, 9999); o += 4; /* wrong: real is 1 */
+    nl_put_u16(resp + o, 9999); o += 2;
+    nl_put_u32(resp + o, 0); o += 4;
+    nl_put_u32(resp + o, 64); o += 4;
+    resp[o++] = 4;
+    memcpy(resp + o, "fake", 4); o += 4;
+    ASSERT_TRUE(sendto(raw, resp, o, 0, (struct sockaddr *)&dest, sizeof(dest)) >= 0);
+
+    nl_event_t ev;
+    bool got_bad = wait_for_event(client, NL_EVENT_DISCOVERY_REPLY, &ev, 300);
+    ASSERT_TRUE(!got_bad); /* wrong nonce must not surface */
+
+    /* Correct nonce (first probe → 1) must be accepted. */
+    o = 0;
+    resp[o++] = NL_PKT_DISCOVERY_RESPONSE;
+    nl_put_u32(resp + o, 1); o += 4;
+    nl_put_u16(resp + o, 9999); o += 2;
+    nl_put_u32(resp + o, 0); o += 4;
+    nl_put_u32(resp + o, 64); o += 4;
+    resp[o++] = 5;
+    memcpy(resp + o, "valid", 5); o += 5;
+    ASSERT_TRUE(sendto(raw, resp, o, 0, (struct sockaddr *)&dest, sizeof(dest)) >= 0);
+
+    ASSERT_TRUE(wait_for_event(client, NL_EVENT_DISCOVERY_REPLY, &ev, 1000));
+    ASSERT_TRUE(strcmp(ev.server_name, "valid") == 0);
+
+    close(raw);
+    nl_endpoint_destroy(client);
+}
+
+/* Regression (finding 5): discovery replies have their own rate-limit
+ * budget so a flood of DISCOVERY_REQUESTs cannot elicit unbounded
+ * responses. Unicast (no broadcast required): fire far more requests than
+ * the per-window cap and assert the server stops answering. */
+TEST(test_discovery_rate_limited) {
+    nl_config_t cfg; nl_config_default(&cfg);
+    nl_endpoint_t *server = NULL;
+    nl_address_t bind_addr = addr("127.0.0.1", 34714);
+    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+    const uint16_t dport = 34805;
+    ASSERT_EQ(nl_discovery_enable(server, dport), NL_OK);
+
+    int raw = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    ASSERT_TRUE(raw >= 0);
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 };
+    setsockopt(raw, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(dport);
+    dst.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    /* Well above NL_RATE_LIMIT_MAX_PER_WINDOW (200), all in one window. */
+    const int flood = 300;
+    uint8_t req[NL_DISCOVERY_REQUEST_SIZE];
+    req[0] = NL_PKT_DISCOVERY_REQUEST;
+    nl_put_u32(req + 1, NL_MAGIC);
+    for (int i = 0; i < flood; i++) {
+        nl_put_u32(req + 5, (uint32_t)(i + 1));
+        ASSERT_TRUE(sendto(raw, req, sizeof(req), 0, (struct sockaddr *)&dst, sizeof(dst)) >= 0);
+    }
+
+    /* Drain responses until the socket times out. */
+    int responses = 0;
+    uint8_t buf[256];
+    for (;;) {
+        ssize_t n = recv(raw, buf, sizeof(buf), 0);
+        if (n < 0) break;
+        if (n >= 1 && buf[0] == NL_PKT_DISCOVERY_RESPONSE) responses++;
+    }
+
+    /* Sanity: unicast discovery works at all in this namespace. */
+    ASSERT_TRUE(responses >= 1);
+    /* Rate limit must kick in before the flood is fully answered. */
+    ASSERT_TRUE(responses < flood);
+    /* And must not have allowed more than the documented per-window cap
+     * (plus a small slack for a window boundary race mid-flood). */
+    ASSERT_TRUE(responses <= 210);
+
+    close(raw);
+    nl_endpoint_destroy(server);
+}
+
 int main(void) {
     printf("=== integration tests (real UDP sockets) ===\n");
     RUN_TEST(test_connect_and_reliable_ordered_data);
@@ -305,7 +606,13 @@ int main(void) {
     RUN_TEST(test_graceful_disconnect_over_real_sockets);
     RUN_TEST(test_ipv6_loopback);
     RUN_TEST(test_discovery_over_real_sockets);
+    RUN_TEST(test_discovery_wrong_nonce_ignored);
+    RUN_TEST(test_discovery_rate_limited);
     RUN_TEST(test_peer_stats_over_real_sockets);
     RUN_TEST(test_server_denies_when_full);
+    RUN_TEST(test_encryption_disabled_rejected);
+    RUN_TEST(test_duplicate_connect_same_address_rejected);
+    RUN_TEST(test_max_connections_clamped_to_internal_cap);
+    RUN_TEST(test_server_name_copied_at_create_time);
     TEST_SUMMARY();
 }

@@ -219,13 +219,46 @@ void nl_channel_on_receive(nl_channel_t *chan, uint64_t now_ms,
     }
 
     if (delivery == NL_UNRELIABLE_SEQUENCED) {
-        if (lane->seq_has_received_any && !nl_seq_greater_than(seq, lane->seq_highest_seen)) {
-            return; /* stale/out-of-order for a sequenced lane: drop, no retry */
+        if (!is_fragment) {
+            if (lane->seq_has_received_any && !nl_seq_greater_than(seq, lane->seq_highest_seen)) {
+                return; /* stale/out-of-order for a sequenced lane: drop, no retry */
+            }
+            lane->seq_highest_seen = seq;
+            lane->seq_has_received_any = true;
+            deliver(deliver_ctx, channel_id, delivery, chunk, chunk_len);
+            return;
         }
-        lane->seq_highest_seen = seq;
-        lane->seq_has_received_any = true;
-        deliver_or_reassemble(lane, now_ms, channel_id, delivery, is_fragment, message_id,
-                               frag_index, frag_count, chunk, chunk_len, deliver, deliver_ctx);
+        /* Fragmented sequenced message: every fragment must reach reassembly
+         * even if individual sequence numbers arrive out of order -- gating
+         * each fragment on seq_highest_seen would drop the earlier fragment
+         * of a reordered pair and strand the message incomplete forever.
+         * Track this message's highest fragment seq instead, and apply the
+         * stale-drop gate only when the whole message is ready to deliver. */
+        if (!lane->seq_frag_active || lane->seq_frag_msg_id != message_id) {
+            lane->seq_frag_active = true;
+            lane->seq_frag_msg_id = message_id;
+            lane->seq_frag_max_seq = seq;
+        } else if (nl_seq_greater_than(seq, lane->seq_frag_max_seq)) {
+            lane->seq_frag_max_seq = seq;
+        }
+        if (!lane->reassembly_init) {
+            nl_reassembly_tracker_init(&lane->reassembly);
+            lane->reassembly_init = true;
+        }
+        const uint8_t *out_data;
+        uint32_t out_len;
+        nl_reassemble_result_t r = nl_reassembly_feed(&lane->reassembly, now_ms, message_id, frag_index,
+                                                       frag_count, chunk, chunk_len, &out_data, &out_len);
+        if (r == NL_REASSEMBLE_COMPLETE) {
+            lane->seq_frag_active = false;
+            if (!lane->seq_has_received_any ||
+                nl_seq_greater_than(lane->seq_frag_max_seq, lane->seq_highest_seen)) {
+                lane->seq_highest_seen = lane->seq_frag_max_seq;
+                lane->seq_has_received_any = true;
+                deliver(deliver_ctx, channel_id, delivery, out_data, out_len);
+            }
+            /* else: whole message is stale relative to already-delivered data */
+        }
         return;
     }
 
@@ -274,6 +307,14 @@ void nl_channel_tick(nl_channel_t *chan, uint8_t channel_id, uint64_t now_ms, ui
                       uint32_t max_retries, nl_channel_retransmit_fn retransmit, void *ctx,
                       bool *out_give_up) {
     *out_give_up = false;
+    /* Reclaim stale reassembly slots every tick (fragment.h documents this
+     * as the expected caller); without it, incomplete messages only free
+     * their slots under eviction pressure and the timeout never fires. */
+    for (int i = 0; i < NL_LANES_PER_CHANNEL; i++) {
+        if (chan->lanes[i].reassembly_init) {
+            nl_reassembly_expire(&chan->lanes[i].reassembly, now_ms);
+        }
+    }
     for (int d = NL_RELIABLE_UNORDERED; d <= NL_RELIABLE_ORDERED; d++) {
         nl_lane_t *lane = &chan->lanes[d];
         if (!lane->in_use || !lane->send_ring_init) continue;

@@ -158,11 +158,12 @@ typedef struct {
     nl_transport_t transport;
     nl_af_t        family;              /* address family to bind/connect with */
     uint8_t        channel_count;       /* 1..NL_MAX_CHANNELS, default 4 */
-    uint32_t       max_connections;     /* server only; 0 = library default (64) */
+    uint32_t       max_connections;     /* server only; 0 = library default (64), capped at 512 */
     uint32_t       connection_timeout_ms; /* no traffic for this long => disconnect; 0 = default (10000) */
     uint32_t       keepalive_interval_ms; /* 0 = default (1000) */
-    bool           encryption_enabled;  /* default true. Disabling is for local/LAN debugging ONLY. */
-    const char    *server_name;         /* used in discovery responses, optional */
+    bool           encryption_enabled;  /* must be true (the default). false returns NL_ERR_UNSUPPORTED
+                                           from nl_server_create/nl_client_create -- there is no cleartext mode. */
+    const char    *server_name;         /* used in discovery responses, optional; copied by the library */
 } nl_config_t;
 
 NL_API void nl_config_default(nl_config_t *cfg);
@@ -210,7 +211,9 @@ NL_API nl_result_t nl_client_create(const nl_config_t *cfg,
                                      nl_endpoint_t **out_endpoint);
 
 /* Begin connecting to a remote server. Non-blocking; results in an
- * NL_EVENT_CONNECTED or NL_EVENT_CONNECT_FAILED event. */
+ * NL_EVENT_CONNECTED or NL_EVENT_CONNECT_FAILED event. Returns
+ * NL_ERR_ALREADY_CONNECTED if a handshake to this address is already in
+ * flight or a connection to it already exists. */
 NL_API nl_result_t nl_connect(nl_endpoint_t *ep, const nl_address_t *server_addr,
                                nl_peer_id_t *out_peer);
 

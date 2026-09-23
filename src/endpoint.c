@@ -19,7 +19,10 @@
  *     stale pointer when it's freed. A sharded lock (e.g. per-bucket in a
  *     real hash table) would remove this bottleneck; see README roadmap.
  *   - `pending_lock` guards the in-progress-handshake table, independent
- *     of `connections_lock`.
+ *     of `connections_lock`. Nesting is one-way only: connections_lock
+ *     may be held while acquiring pending_lock (ep_on_connected releasing
+ *     an AWAIT_ACCEPTED entry), never the reverse -- every pending_lock
+ *     holder releases it before taking connections_lock.
  *   - `queue_lock` (+ `queue_cond`) guards the event queue.
  *   - Callbacks invoked *while* connections_lock is already held (i.e.
  *     from inside a call chain that started under it) must NOT attempt to
@@ -45,6 +48,10 @@
 #define NL_RATE_LIMIT_WINDOW_MS 1000
 #define NL_RATE_LIMIT_MAX_PER_WINDOW 200
 #define NL_IO_POLL_INTERVAL_MS 50
+/* Handshake retransmit cadence. UDP is lossy; a single lost REQUEST,
+ * CHALLENGE, or RESPONSE would otherwise stall connect until the pending
+ * timeout. Matches NL_HANDSHAKE_RETRY_MS in connection.c for ACCEPTED. */
+#define NL_HANDSHAKE_RETRY_MS 250
 
 static uint64_t now_ms(void) {
     struct timespec ts;
@@ -148,6 +155,14 @@ typedef struct {
     uint64_t connection_id;
     uint8_t channel_count;
     uint64_t created_ms;
+    /* Last cleartext handshake datagram we put on the wire for this entry
+     * (REQUEST / CHALLENGE / RESPONSE), retained so the IO thread can
+     * retransmit it while the entry is still in_use. CONNECT_ACCEPTED is
+     * handled separately by connection.c's accept_retries_left budget. */
+    uint8_t retry_packet[NL_CONNECT_RESPONSE_SIZE > NL_CONNECT_CHALLENGE_SIZE
+                             ? NL_CONNECT_RESPONSE_SIZE : NL_CONNECT_CHALLENGE_SIZE];
+    uint16_t retry_packet_len;
+    uint64_t last_retry_ms;
 } pending_t;
 
 /* ---- event queue ---- */
@@ -162,6 +177,7 @@ typedef struct event_node {
 struct nl_endpoint {
     bool is_server;
     nl_config_t config;
+    char server_name_buf[NL_SERVER_NAME_MAX]; /* owned copy of config.server_name */
     nl_socket_t sock;
 
     uint8_t server_secret[32]; /* server role only: HMAC key for connect cookies */
@@ -178,11 +194,15 @@ struct nl_endpoint {
     uint8_t *returned_owned_data;
 
     pthread_t io_thread;
+    bool io_thread_started;
     volatile bool running;
 
     nl_socket_t discovery_sock;
     uint16_t discovery_port;
     uint32_t discovery_probe_nonce;
+    uint32_t discovery_expected_nonce; /* last probe's nonce; replies must echo it */
+    uint64_t discovery_rate_window_start_ms;
+    uint32_t discovery_rate_count;
 
     uint64_t rate_window_start_ms;
     uint32_t rate_count;
@@ -192,6 +212,8 @@ typedef struct {
     nl_endpoint_t *ep;
     nl_connection_t *conn;
 } conn_ctx_t;
+
+static void release_pending_by_connid(nl_endpoint_t *ep, nl_peer_id_t connid, pending_role_t role);
 
 /* ---- event queue push/pop ---- */
 
@@ -282,6 +304,12 @@ static void ep_on_disconnected(void *ctx, nl_peer_id_t peer, nl_result_t reason)
 
 static void ep_on_connected(void *ctx, nl_peer_id_t peer) {
     conn_ctx_t *c = (conn_ctx_t *)ctx;
+    /* Client-side ACCEPTED confirmed: stop retransmitting the RESPONSE.
+     * Nesting connections_lock -> pending_lock is the one allowed order
+     * (see file header). Server side never fires this (it pushes CONNECTED
+     * directly from handle_connect_response). */
+    release_pending_by_connid(c->ep, peer, PENDING_CLIENT_AWAIT_ACCEPTED);
+
     nl_event_t ev; memset(&ev, 0, sizeof(ev));
     ev.event_type = NL_EVENT_CONNECTED;
     ev.peer = peer;
@@ -331,21 +359,94 @@ static pending_t *find_pending_by_addr_locked(nl_endpoint_t *ep, const struct so
     return NULL;
 }
 
+/* Match a CONNECT_RESPONSE to its pending entry on the full triple the
+ * client echoes back (cookie + pubkey + nonce), not address alone. Two
+ * in-flight handshakes from the same source address would otherwise
+ * collide on addr-only lookup and cross-derive keys. */
+static pending_t *find_pending_response_locked(nl_endpoint_t *ep, const struct sockaddr_storage *addr,
+                                               const uint8_t cookie[16], const uint8_t pub[32],
+                                               const uint8_t nonce[16]) {
+    for (int i = 0; i < NL_MAX_PENDING; i++) {
+        pending_t *p = &ep->pending[i];
+        if (!p->in_use || p->role != PENDING_SERVER_AWAIT_RESPONSE) continue;
+        if (!addr_equal(&p->addr, addr)) continue;
+        if (!nl_crypto_const_time_eq(cookie, p->cookie, 16)) continue;
+        if (memcmp(pub, p->peer_pubkey, 32) != 0) continue;
+        if (memcmp(nonce, p->peer_nonce, 16) != 0) continue;
+        return p;
+    }
+    return NULL;
+}
+
+static void release_pending_by_connid(nl_endpoint_t *ep, nl_peer_id_t connid, pending_role_t role) {
+    pthread_mutex_lock(&ep->pending_lock);
+    for (int i = 0; i < NL_MAX_PENDING; i++) {
+        pending_t *p = &ep->pending[i];
+        if (p->in_use && p->role == role && p->connection_id == connid) {
+            release_pending_locked(p);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&ep->pending_lock);
+}
+
 static void expire_pending(nl_endpoint_t *ep, uint64_t now) {
+    /* Collect AWAIT_ACCEPTED timeouts first: those have a live (but never
+     * confirmed) client-side connection that must be torn down under
+     * connections_lock -- and that lock must not be taken while holding
+     * pending_lock (see file-header locking discipline). */
+    nl_peer_id_t accepted_timeouts[NL_MAX_PENDING];
+    int n_accepted = 0;
+
     pthread_mutex_lock(&ep->pending_lock);
     for (int i = 0; i < NL_MAX_PENDING; i++) {
         if (ep->pending[i].in_use && (now - ep->pending[i].created_ms) > NL_PENDING_TIMEOUT_MS) {
             pending_role_t role = ep->pending[i].role;
             uint64_t connid = ep->pending[i].connection_id;
             release_pending_locked(&ep->pending[i]);
-            if (role == PENDING_CLIENT_AWAIT_CHALLENGE || role == PENDING_CLIENT_AWAIT_ACCEPTED) {
+            if (role == PENDING_CLIENT_AWAIT_CHALLENGE) {
                 nl_event_t ev; memset(&ev, 0, sizeof(ev));
                 ev.event_type = NL_EVENT_CONNECT_FAILED;
                 ev.peer = connid;
                 ev.disconnect_reason = NL_ERR_TIMEOUT;
                 push_event(ep, ev, NULL, 0);
+            } else if (role == PENDING_CLIENT_AWAIT_ACCEPTED && n_accepted < NL_MAX_PENDING) {
+                accepted_timeouts[n_accepted++] = connid;
             }
         }
+    }
+    pthread_mutex_unlock(&ep->pending_lock);
+
+    if (n_accepted > 0) {
+        pthread_mutex_lock(&ep->connections_lock);
+        for (int j = 0; j < n_accepted; j++) {
+            nl_connection_t *conn = find_connection_locked(ep, accepted_timeouts[j]);
+            if (!conn || !conn->is_client_side || conn->handshake_confirmed) continue;
+            int slot = find_connection_slot_by_ptr_locked(ep, conn);
+            if (slot >= 0) ep->connections[slot] = NULL;
+            nl_connection_destroy(conn);
+            nl_event_t ev; memset(&ev, 0, sizeof(ev));
+            ev.event_type = NL_EVENT_CONNECT_FAILED;
+            ev.peer = accepted_timeouts[j];
+            ev.disconnect_reason = NL_ERR_TIMEOUT;
+            push_event(ep, ev, NULL, 0);
+        }
+        pthread_mutex_unlock(&ep->connections_lock);
+    }
+}
+
+/* Retransmit any pending cleartext handshake datagram that is due. Runs on
+ * the IO thread each poll cycle; entries stop retrying when released (or
+ * when expire_pending reclaims them at NL_PENDING_TIMEOUT_MS). */
+static void retry_pending_handshakes(nl_endpoint_t *ep, uint64_t now) {
+    pthread_mutex_lock(&ep->pending_lock);
+    for (int i = 0; i < NL_MAX_PENDING; i++) {
+        pending_t *p = &ep->pending[i];
+        if (!p->in_use || p->retry_packet_len == 0) continue;
+        if (now - p->last_retry_ms < NL_HANDSHAKE_RETRY_MS) continue;
+        sendto(ep->sock, p->retry_packet, p->retry_packet_len, 0,
+               (const struct sockaddr *)&p->addr, p->addr_len);
+        p->last_retry_ms = now;
     }
     pthread_mutex_unlock(&ep->pending_lock);
 }
@@ -361,6 +462,18 @@ static bool rate_limit_check(nl_endpoint_t *ep, uint64_t now) {
     }
     ep->rate_count++;
     return ep->rate_count <= NL_RATE_LIMIT_MAX_PER_WINDOW;
+}
+
+/* Separate fixed-window counter for discovery responses. Shares neither
+ * bucket nor budget with the handshake limiter so a discovery flood cannot
+ * also starve legitimate CONNECT_REQUESTs (and vice versa). */
+static bool rate_limit_discovery(nl_endpoint_t *ep, uint64_t now) {
+    if (now - ep->discovery_rate_window_start_ms > NL_RATE_LIMIT_WINDOW_MS) {
+        ep->discovery_rate_window_start_ms = now;
+        ep->discovery_rate_count = 0;
+    }
+    ep->discovery_rate_count++;
+    return ep->discovery_rate_count <= NL_RATE_LIMIT_MAX_PER_WINDOW;
 }
 
 static nl_result_t deny_reason_to_result(uint8_t reason) {
@@ -432,6 +545,21 @@ static void handle_connect_request(nl_endpoint_t *ep, const uint8_t *buf, size_t
     }
 
     pthread_mutex_lock(&ep->pending_lock);
+    /* A retransmitted REQUEST for a handshake still in flight: refresh the
+     * CHALLENGE retry timer instead of allocating a second pending entry
+     * (which would collide on address-only lookups below). */
+    pending_t *existing = find_pending_by_addr_locked(ep, from, PENDING_SERVER_AWAIT_RESPONSE);
+    if (existing && existing->connection_id == client_connid &&
+        memcmp(client_pub, existing->peer_pubkey, 32) == 0 &&
+        memcmp(client_nonce, existing->peer_nonce, 16) == 0 &&
+        existing->retry_packet_len > 0) {
+        sendto(ep->sock, existing->retry_packet, existing->retry_packet_len, 0,
+               (const struct sockaddr *)from, from_len);
+        existing->last_retry_ms = now;
+        pthread_mutex_unlock(&ep->pending_lock);
+        return;
+    }
+
     pending_t *p = acquire_pending_slot_locked(ep, now);
     p->my_keypair = nl_keypair_generate();
     if (!p->my_keypair) { memset(p, 0, sizeof(*p)); pthread_mutex_unlock(&ep->pending_lock); return; }
@@ -458,17 +586,19 @@ static void handle_connect_request(nl_endpoint_t *ep, const uint8_t *buf, size_t
 
     uint8_t server_pub[32];
     nl_keypair_public(p->my_keypair, server_pub);
-    uint8_t server_nonce_copy[16]; memcpy(server_nonce_copy, p->my_nonce, 16);
-    uint8_t cookie_copy[16]; memcpy(cookie_copy, p->cookie, 16);
-    pthread_mutex_unlock(&ep->pending_lock);
 
-    uint8_t out[NL_CONNECT_CHALLENGE_SIZE];
+    /* Build and retain the CHALLENGE under pending_lock so a concurrent
+     * retransmitted REQUEST can find it already armed for retry. */
+    uint8_t *out = p->retry_packet;
     size_t o = 0;
     out[o++] = NL_PKT_CONNECT_CHALLENGE;
     memcpy(out + o, server_pub, 32); o += 32;
-    memcpy(out + o, server_nonce_copy, 16); o += 16;
-    memcpy(out + o, cookie_copy, 16); o += 16;
+    memcpy(out + o, p->my_nonce, 16); o += 16;
+    memcpy(out + o, p->cookie, 16); o += 16;
+    p->retry_packet_len = (uint16_t)o;
+    p->last_retry_ms = now;
     sendto(ep->sock, out, o, 0, (const struct sockaddr *)from, from_len);
+    pthread_mutex_unlock(&ep->pending_lock);
 }
 
 static void handle_connect_response(nl_endpoint_t *ep, const uint8_t *buf, size_t len,
@@ -481,9 +611,8 @@ static void handle_connect_response(nl_endpoint_t *ep, const uint8_t *buf, size_
     uint8_t client_nonce[16]; memcpy(client_nonce, buf + off, 16); off += 16;
 
     pthread_mutex_lock(&ep->pending_lock);
-    pending_t *p = find_pending_by_addr_locked(ep, from, PENDING_SERVER_AWAIT_RESPONSE);
-    if (!p || !nl_crypto_const_time_eq(cookie, p->cookie, 16) ||
-        memcmp(client_pub, p->peer_pubkey, 32) != 0 || memcmp(client_nonce, p->peer_nonce, 16) != 0) {
+    pending_t *p = find_pending_response_locked(ep, from, cookie, client_pub, client_nonce);
+    if (!p) {
         pthread_mutex_unlock(&ep->pending_lock);
         return; /* invalid/spoofed/stale response, drop silently */
     }
@@ -515,12 +644,21 @@ static void handle_connect_response(nl_endpoint_t *ep, const uint8_t *buf, size_
     memset(&keys, 0, sizeof(keys));
     if (!conn) { pthread_mutex_unlock(&ep->connections_lock); return; }
     int slot = find_free_connection_slot_locked(ep);
-    if (slot < 0) { nl_connection_destroy(conn); pthread_mutex_unlock(&ep->connections_lock); return; }
+    if (slot < 0) {
+        /* Table filled past max_connections between the REQUEST-time check
+         * and now (or max_connections was raised above the hard internal
+         * cap). Fail closed with an explicit deny so the client doesn't
+         * hang until its pending timeout. */
+        nl_connection_destroy(conn);
+        send_denied(ep, &paddr, paddr_len, NL_DENY_SERVER_FULL);
+        pthread_mutex_unlock(&ep->connections_lock);
+        return;
+    }
     ep->connections[slot] = conn;
 
     conn_ctx_t cctx = { ep, conn };
     nl_conn_callbacks_t cb = make_callbacks(&cctx);
-    nl_connection_send_handshake_complete(conn, &cb);
+    nl_connection_send_handshake_complete(conn, now, /*is_retry*/ false, &cb);
 
     nl_event_t ev; memset(&ev, 0, sizeof(ev));
     ev.event_type = NL_EVENT_CONNECTED;
@@ -555,9 +693,22 @@ static void handle_connect_challenge(nl_endpoint_t *ep, const uint8_t *buf, size
     uint64_t connid = p->connection_id;
     uint8_t channel_count = p->channel_count;
     uint8_t client_pub[32]; nl_keypair_public(p->my_keypair, client_pub);
-    uint8_t client_nonce_copy[16]; memcpy(client_nonce_copy, p->my_nonce, 16);
 
-    release_pending_locked(p); /* client needs no further pending state once keys are derived */
+    /* Keep the pending entry as AWAIT_ACCEPTED with the RESPONSE armed for
+     * retry: a lost RESPONSE would otherwise stall until the 5s timeout.
+     * Released by ep_on_connected when ACCEPTED decrypts, by DENIED, or by
+     * expire_pending. The keypair is only needed through RESPONSE. */
+    uint8_t out[NL_CONNECT_RESPONSE_SIZE];
+    size_t o = 0;
+    out[o++] = NL_PKT_CONNECT_RESPONSE;
+    memcpy(out + o, cookie, 16); o += 16;
+    memcpy(out + o, client_pub, 32); o += 32;
+    memcpy(out + o, p->my_nonce, 16); o += 16;
+    memcpy(p->retry_packet, out, o);
+    p->retry_packet_len = (uint16_t)o;
+    p->last_retry_ms = now;
+    p->role = PENDING_CLIENT_AWAIT_ACCEPTED;
+    if (p->my_keypair) { nl_keypair_free(p->my_keypair); p->my_keypair = NULL; }
     pthread_mutex_unlock(&ep->pending_lock);
 
     pthread_mutex_lock(&ep->connections_lock);
@@ -574,12 +725,6 @@ static void handle_connect_challenge(nl_endpoint_t *ep, const uint8_t *buf, size
     pthread_mutex_unlock(&ep->connections_lock);
     memset(&keys, 0, sizeof(keys));
 
-    uint8_t out[NL_CONNECT_RESPONSE_SIZE];
-    size_t o = 0;
-    out[o++] = NL_PKT_CONNECT_RESPONSE;
-    memcpy(out + o, cookie, 16); o += 16;
-    memcpy(out + o, client_pub, 32); o += 32;
-    memcpy(out + o, client_nonce_copy, 16); o += 16;
     sendto(ep->sock, out, o, 0, (const struct sockaddr *)from, from_len);
 }
 
@@ -588,11 +733,32 @@ static void handle_connect_denied(nl_endpoint_t *ep, const uint8_t *buf, size_t 
     if (len < NL_CONNECT_DENIED_SIZE) return;
     uint8_t reason = buf[1];
 
+    nl_peer_id_t connid = NL_INVALID_PEER;
+    bool was_accepted = false;
+
     pthread_mutex_lock(&ep->pending_lock);
     pending_t *p = find_pending_by_addr_locked(ep, from, PENDING_CLIENT_AWAIT_CHALLENGE);
-    nl_peer_id_t connid = NL_INVALID_PEER;
+    if (!p) {
+        p = find_pending_by_addr_locked(ep, from, PENDING_CLIENT_AWAIT_ACCEPTED);
+        if (p) was_accepted = true;
+    }
     if (p) { connid = p->connection_id; release_pending_locked(p); }
     pthread_mutex_unlock(&ep->pending_lock);
+
+    /* DENIED can arrive after the client already created a connection
+     * (server's table filled between CHALLENGE and RESPONSE). Tear that
+     * half-open connection down so CONNECT_FAILED isn't followed later by
+     * a spurious DISCONNECT. */
+    if (was_accepted && connid != NL_INVALID_PEER) {
+        pthread_mutex_lock(&ep->connections_lock);
+        nl_connection_t *conn = find_connection_locked(ep, connid);
+        if (conn && conn->is_client_side && !conn->handshake_confirmed) {
+            int slot = find_connection_slot_by_ptr_locked(ep, conn);
+            if (slot >= 0) ep->connections[slot] = NULL;
+            nl_connection_destroy(conn);
+        }
+        pthread_mutex_unlock(&ep->connections_lock);
+    }
 
     nl_event_t ev; memset(&ev, 0, sizeof(ev));
     ev.event_type = NL_EVENT_CONNECT_FAILED;
@@ -612,6 +778,9 @@ static void process_discovery_packet(nl_endpoint_t *ep, const uint8_t *buf, size
         uint32_t magic = nl_get_u32(buf + 1);
         if (magic != NL_MAGIC) return;
         uint32_t nonce = nl_get_u32(buf + 5);
+        /* Own budget so a discovery flood can't starve the handshake
+         * rate limiter (and vice versa). */
+        if (!rate_limit_discovery(ep, now_ms())) return;
 
         pthread_mutex_lock(&ep->connections_lock);
         uint32_t player_count = count_active_connections_locked(ep);
@@ -642,7 +811,10 @@ static void process_discovery_packet(nl_endpoint_t *ep, const uint8_t *buf, size
         if (len < NL_DISCOVERY_RESPONSE_MIN_SIZE) return;
         size_t off = 1;
         uint32_t nonce = nl_get_u32(buf + off); off += 4;
-        (void)nonce;
+        /* Only the most recent probe's nonce is accepted: a delayed or
+         * spoofed reply from an earlier probe (or a forged one) is dropped
+         * rather than surfaced as a live discovery result. */
+        if (nonce != ep->discovery_expected_nonce) return;
         uint16_t server_port = nl_get_u16(buf + off); off += 2;
         uint32_t player_count = nl_get_u32(buf + off); off += 4;
         uint32_t max_players = nl_get_u32(buf + off); off += 4;
@@ -752,6 +924,7 @@ static void *io_thread_main(void *arg) {
 
         uint64_t now = now_ms();
         tick_all_connections(ep, now);
+        retry_pending_handshakes(ep, now);
         expire_pending(ep, now);
     }
     return NULL;
@@ -767,8 +940,20 @@ static nl_endpoint_t *endpoint_alloc(bool is_server, const nl_config_t *cfg) {
     if (ep->config.channel_count == 0) ep->config.channel_count = 4;
     if (ep->config.channel_count > NL_MAX_CHANNELS) ep->config.channel_count = NL_MAX_CHANNELS;
     if (ep->config.max_connections == 0) ep->config.max_connections = 64;
+    /* Hard internal table is NL_MAX_CONNECTIONS_INTERNAL; a larger config
+     * value would make REQUEST-time checks pass and then fail silently at
+     * slot allocation. Clamp so discovery's advertised max matches reality. */
+    if (ep->config.max_connections > NL_MAX_CONNECTIONS_INTERNAL)
+        ep->config.max_connections = NL_MAX_CONNECTIONS_INTERNAL;
     if (ep->config.connection_timeout_ms == 0) ep->config.connection_timeout_ms = 10000;
     if (ep->config.keepalive_interval_ms == 0) ep->config.keepalive_interval_ms = 1000;
+    if (cfg->server_name) {
+        strncpy(ep->server_name_buf, cfg->server_name, NL_SERVER_NAME_MAX - 1);
+        ep->server_name_buf[NL_SERVER_NAME_MAX - 1] = '\0';
+        ep->config.server_name = ep->server_name_buf;
+    } else {
+        ep->config.server_name = NULL;
+    }
     ep->sock = NL_INVALID_SOCKET;
     ep->discovery_sock = NL_INVALID_SOCKET;
     nl_crypto_random(ep->server_secret, 32);
@@ -785,7 +970,35 @@ static nl_result_t start_io_thread(nl_endpoint_t *ep) {
         ep->running = false;
         return NL_ERR_INTERNAL;
     }
+    ep->io_thread_started = true;
     return NL_OK;
+}
+
+/* Free an endpoint that never started its IO thread (construction failure
+ * path) or after destroy has joined it. Destroys mutexes/sockets/queue --
+ * the previous bare free(ep) leaked all of those and left ASan noise. */
+static void endpoint_free(nl_endpoint_t *ep) {
+    for (int i = 0; i < NL_MAX_CONNECTIONS_INTERNAL; i++) {
+        if (ep->connections[i]) nl_connection_destroy(ep->connections[i]);
+    }
+    for (int i = 0; i < NL_MAX_PENDING; i++) {
+        if (ep->pending[i].in_use) release_pending_locked(&ep->pending[i]);
+    }
+
+    event_node_t *n = ep->queue_head;
+    while (n) { event_node_t *next = n->next; free(n->payload); free(n); n = next; }
+    free(ep->returned_owned_data);
+
+    if (ep->sock != NL_INVALID_SOCKET) nl_close_socket(ep->sock);
+    if (ep->discovery_sock != NL_INVALID_SOCKET) nl_close_socket(ep->discovery_sock);
+
+    pthread_mutex_destroy(&ep->pending_lock);
+    pthread_mutex_destroy(&ep->connections_lock);
+    pthread_mutex_destroy(&ep->queue_lock);
+    pthread_cond_destroy(&ep->queue_cond);
+
+    memset(ep->server_secret, 0, sizeof(ep->server_secret));
+    free(ep);
 }
 
 nl_result_t nl_server_create(const nl_address_t *bind_addr, const nl_config_t *cfg, nl_endpoint_t **out_endpoint) {
@@ -795,18 +1008,22 @@ nl_result_t nl_server_create(const nl_address_t *bind_addr, const nl_config_t *c
     if (cfg) local_cfg = *cfg; else nl_config_default(&local_cfg);
 
     if (local_cfg.transport != NL_TRANSPORT_UDP) return NL_ERR_UNSUPPORTED; /* see docs/websocket for the other transport */
+    /* No cleartext mode: the handshake always X25519+HKDFs session keys and
+     * every post-handshake packet is AEAD-encrypted. Reject at construction
+     * rather than silently encrypting anyway or shipping a protocol hole. */
+    if (!local_cfg.encryption_enabled) return NL_ERR_UNSUPPORTED;
 
     nl_endpoint_t *ep = endpoint_alloc(true, &local_cfg);
     if (!ep) return NL_ERR_OUT_OF_MEMORY;
 
     struct sockaddr_storage addr; socklen_t addr_len; int family;
     if (!resolve_address(bind_addr, true, &addr, &addr_len, &family)) {
-        free(ep);
+        endpoint_free(ep);
         return NL_ERR_INVALID_ARGUMENT;
     }
 
     ep->sock = socket(family, SOCK_DGRAM, IPPROTO_UDP);
-    if (ep->sock == NL_INVALID_SOCKET) { free(ep); return NL_ERR_SOCKET; }
+    if (ep->sock == NL_INVALID_SOCKET) { endpoint_free(ep); return NL_ERR_SOCKET; }
 
     int reuse = 1;
     setsockopt(ep->sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
@@ -818,16 +1035,14 @@ nl_result_t nl_server_create(const nl_address_t *bind_addr, const nl_config_t *c
 #endif
 
     if (bind(ep->sock, (struct sockaddr *)&addr, addr_len) != 0) {
-        nl_close_socket(ep->sock);
-        free(ep);
+        endpoint_free(ep);
         return NL_ERR_BIND_FAILED;
     }
     nl_socket_set_nonblocking(ep->sock);
 
     nl_result_t r = start_io_thread(ep);
     if (r != NL_OK) {
-        nl_close_socket(ep->sock);
-        free(ep);
+        endpoint_free(ep);
         return r;
     }
 
@@ -841,6 +1056,7 @@ nl_result_t nl_client_create(const nl_config_t *cfg, nl_endpoint_t **out_endpoin
     nl_config_t local_cfg;
     if (cfg) local_cfg = *cfg; else nl_config_default(&local_cfg);
     if (local_cfg.transport != NL_TRANSPORT_UDP) return NL_ERR_UNSUPPORTED;
+    if (!local_cfg.encryption_enabled) return NL_ERR_UNSUPPORTED;
 
     nl_endpoint_t *ep = endpoint_alloc(false, &local_cfg);
     if (!ep) return NL_ERR_OUT_OF_MEMORY;
@@ -849,13 +1065,12 @@ nl_result_t nl_client_create(const nl_config_t *cfg, nl_endpoint_t **out_endpoin
                : (local_cfg.family == NL_AF_INET6) ? AF_INET6
                : AF_INET; /* default to IPv4 for the ephemeral client socket; connect() re-resolves per target */
     ep->sock = socket(family, SOCK_DGRAM, IPPROTO_UDP);
-    if (ep->sock == NL_INVALID_SOCKET) { free(ep); return NL_ERR_SOCKET; }
+    if (ep->sock == NL_INVALID_SOCKET) { endpoint_free(ep); return NL_ERR_SOCKET; }
     nl_socket_set_nonblocking(ep->sock);
 
     nl_result_t r = start_io_thread(ep);
     if (r != NL_OK) {
-        nl_close_socket(ep->sock);
-        free(ep);
+        endpoint_free(ep);
         return r;
     }
 
@@ -869,6 +1084,17 @@ nl_result_t nl_connect(nl_endpoint_t *ep, const nl_address_t *server_addr, nl_pe
     struct sockaddr_storage addr; socklen_t addr_len; int family;
     if (!resolve_address(server_addr, false, &addr, &addr_len, &family)) return NL_ERR_INVALID_ARGUMENT;
 
+    /* One in-flight (or established) handshake per server address: two
+     * concurrent nl_connect()s to the same addr would collide on the
+     * pending table's address-keyed lookups and cross-derive keys. */
+    pthread_mutex_lock(&ep->connections_lock);
+    bool already = false;
+    for (int i = 0; i < NL_MAX_CONNECTIONS_INTERNAL; i++) {
+        if (ep->connections[i] && addr_equal(&ep->connections[i]->addr, &addr)) { already = true; break; }
+    }
+    pthread_mutex_unlock(&ep->connections_lock);
+    if (already) return NL_ERR_ALREADY_CONNECTED;
+
     nl_keypair_t *kp = nl_keypair_generate();
     if (!kp) return NL_ERR_CRYPTO;
     uint8_t pub[32];
@@ -880,7 +1106,23 @@ nl_result_t nl_connect(nl_endpoint_t *ep, const nl_address_t *server_addr, nl_pe
         nl_crypto_random((uint8_t *)&connid, sizeof(connid));
     } while (connid == NL_INVALID_PEER);
 
+    uint8_t out[NL_CONNECT_REQUEST_SIZE];
+    size_t o = 0;
+    out[o++] = NL_PKT_CONNECT_REQUEST;
+    nl_put_u32(out + o, NL_MAGIC); o += 4;
+    nl_put_u16(out + o, NL_PROTOCOL_VERSION); o += 2;
+    out[o++] = ep->config.channel_count;
+    nl_put_u64(out + o, connid); o += 8;
+    memcpy(out + o, pub, 32); o += 32;
+    memcpy(out + o, nonce, 16); o += 16;
+
     pthread_mutex_lock(&ep->pending_lock);
+    if (find_pending_by_addr_locked(ep, &addr, PENDING_CLIENT_AWAIT_CHALLENGE) ||
+        find_pending_by_addr_locked(ep, &addr, PENDING_CLIENT_AWAIT_ACCEPTED)) {
+        pthread_mutex_unlock(&ep->pending_lock);
+        nl_keypair_free(kp);
+        return NL_ERR_ALREADY_CONNECTED;
+    }
     pending_t *p = acquire_pending_slot_locked(ep, now_ms());
     p->in_use = true;
     p->role = PENDING_CLIENT_AWAIT_CHALLENGE;
@@ -891,17 +1133,10 @@ nl_result_t nl_connect(nl_endpoint_t *ep, const nl_address_t *server_addr, nl_pe
     p->connection_id = connid;
     p->channel_count = ep->config.channel_count;
     p->created_ms = now_ms();
+    memcpy(p->retry_packet, out, o);
+    p->retry_packet_len = (uint16_t)o;
+    p->last_retry_ms = p->created_ms;
     pthread_mutex_unlock(&ep->pending_lock);
-
-    uint8_t out[NL_CONNECT_REQUEST_SIZE];
-    size_t o = 0;
-    out[o++] = NL_PKT_CONNECT_REQUEST;
-    nl_put_u32(out + o, NL_MAGIC); o += 4;
-    nl_put_u16(out + o, NL_PROTOCOL_VERSION); o += 2;
-    out[o++] = ep->config.channel_count;
-    nl_put_u64(out + o, connid); o += 8;
-    memcpy(out + o, pub, 32); o += 32;
-    memcpy(out + o, nonce, 16); o += 16;
 
     sendto(ep->sock, out, o, 0, (struct sockaddr *)&addr, addr_len);
 
@@ -927,29 +1162,11 @@ nl_result_t nl_disconnect(nl_endpoint_t *ep, nl_peer_id_t peer) {
 void nl_endpoint_destroy(nl_endpoint_t *ep) {
     if (!ep) return;
     ep->running = false;
-    pthread_join(ep->io_thread, NULL);
-
-    for (int i = 0; i < NL_MAX_CONNECTIONS_INTERNAL; i++) {
-        if (ep->connections[i]) nl_connection_destroy(ep->connections[i]);
-    }
-    for (int i = 0; i < NL_MAX_PENDING; i++) {
-        if (ep->pending[i].in_use) release_pending_locked(&ep->pending[i]);
-    }
-
-    event_node_t *n = ep->queue_head;
-    while (n) { event_node_t *next = n->next; free(n->payload); free(n); n = next; }
-    free(ep->returned_owned_data);
-
-    if (ep->sock != NL_INVALID_SOCKET) nl_close_socket(ep->sock);
-    if (ep->discovery_sock != NL_INVALID_SOCKET) nl_close_socket(ep->discovery_sock);
-
-    pthread_mutex_destroy(&ep->pending_lock);
-    pthread_mutex_destroy(&ep->connections_lock);
-    pthread_mutex_destroy(&ep->queue_lock);
-    pthread_cond_destroy(&ep->queue_cond);
-
-    memset(ep->server_secret, 0, sizeof(ep->server_secret));
-    free(ep);
+    /* pthread_join on a never-started thread is UB; construction-failure
+     * paths free via endpoint_free without joining, and destroy only
+     * reaches here after a successful start_io_thread. */
+    if (ep->io_thread_started) pthread_join(ep->io_thread, NULL);
+    endpoint_free(ep);
 }
 
 nl_result_t nl_send(nl_endpoint_t *ep, nl_peer_id_t peer, uint8_t channel, nl_delivery_t delivery,
@@ -1054,6 +1271,7 @@ nl_result_t nl_discovery_probe(nl_endpoint_t *ep, uint16_t discovery_port, int t
     bcast.sin_addr.s_addr = INADDR_BROADCAST;
 
     uint32_t nonce = ++ep->discovery_probe_nonce;
+    ep->discovery_expected_nonce = nonce;
     uint8_t out[NL_DISCOVERY_REQUEST_SIZE];
     out[0] = NL_PKT_DISCOVERY_REQUEST;
     nl_put_u32(out + 1, NL_MAGIC);

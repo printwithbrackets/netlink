@@ -96,6 +96,100 @@ TEST(test_unreliable_sequenced_drops_stale) {
     nl_channel_free(&receiver);
 }
 
+/* Regression: fragmented UNRELIABLE_SEQUENCED messages must not be gated
+ * per-fragment on seq_highest_seen -- that would drop the earlier fragment
+ * of a reordered pair and strand reassembly incomplete forever. Each
+ * fragment must reach reassembly; the stale-drop gate applies only once
+ * the whole message is ready to deliver. */
+TEST(test_sequenced_fragmented_reassembles_out_of_order_fragments) {
+    nl_channel_t sender, receiver;
+    nl_channel_init(&sender);
+    nl_channel_init(&receiver);
+    capture_t cap = {0};
+
+    /* >1 fragment so the fragmented sequenced path is taken. */
+    size_t total = NL_FRAGMENT_CHUNK_SIZE + 300;
+    uint8_t *big = (uint8_t *)malloc(total);
+    for (size_t i = 0; i < total; i++) big[i] = (uint8_t)((i * 17 + 3) & 0xFF);
+
+    nl_result_t r = nl_channel_send(&sender, 0, 0, NL_UNRELIABLE_SEQUENCED, big, total, capture_emit, &cap);
+    ASSERT_EQ(r, NL_OK);
+    ASSERT_TRUE(cap.count >= 2); /* at least 2 fragments */
+
+    /* Deliver fragments in reverse arrival order. Before the fix, fragment
+     * 0 would be dropped as "stale" relative to a higher sequence already
+     * seen from fragment 1, and the message would never reassemble. */
+    delivered_t del = {0};
+    for (int i = cap.count - 1; i >= 0; i--) {
+        nl_channel_on_receive(&receiver, 0, cap.packets[i].data, cap.packets[i].len,
+                               capture_deliver, &del, NULL, NULL, NULL, NULL);
+    }
+
+    ASSERT_EQ(del.count, 1); /* whole message delivered exactly once */
+    ASSERT_EQ(del.len[0], (uint32_t)total);
+    uint8_t *cmp = (uint8_t *)malloc(total);
+    memcpy(cmp, del.data[0], total < sizeof(del.data[0]) ? total : sizeof(del.data[0]));
+    ASSERT_TRUE(total <= sizeof(del.data[0]));
+    ASSERT_MEM_EQ(cmp, big, total);
+
+    free(cmp);
+    free(big);
+    nl_channel_free(&sender);
+    nl_channel_free(&receiver);
+}
+
+/* Regression: nl_channel_tick must reclaim stale reassembly slots via
+ * nl_reassembly_expire on every lane, not only under eviction pressure.
+ * Without this, incomplete messages pinned their slots until the table
+ * filled (fragment.h documents tick as the expected caller). */
+TEST(test_channel_tick_expires_stale_reassembly) {
+    nl_channel_t chan;
+    nl_channel_init(&chan);
+    capture_t cap = {0};
+
+    /* NL_UNRELIABLE so the sequence-dedupe path doesn't interfere when we
+     * deliberately re-feed the same wire fragments after the tick. */
+    size_t total = NL_FRAGMENT_CHUNK_SIZE * 2 + 50;
+    uint8_t *big = (uint8_t *)malloc(total);
+    memset(big, 0xCD, total);
+    ASSERT_EQ(nl_channel_send(&chan, /*now_ms*/ 0, 0, NL_UNRELIABLE, big, total, capture_emit, &cap), NL_OK);
+    ASSERT_TRUE(cap.count >= 2);
+
+    delivered_t del = {0};
+    /* Feed only fragment 0 at t=0: incomplete. */
+    nl_channel_on_receive(&chan, 0, cap.packets[0].data, cap.packets[0].len,
+                          capture_deliver, &del, NULL, NULL, NULL, NULL);
+    ASSERT_EQ(del.count, 0);
+
+    /* Tick past NL_REASSEMBLY_TIMEOUT_MS: expire must free the slot. */
+    bool give_up = false;
+    nl_channel_tick(&chan, 0, NL_REASSEMBLY_TIMEOUT_MS + 100, /*rto_ms*/ 10000, /*max_retries*/ 10,
+                    capture_emit, &cap, &give_up);
+
+    /* If expire ran, fragment 0's bookkeeping is gone. Feeding only the
+     * LATER fragments must start a fresh, still-incomplete reassembly
+     * (del.count stays 0). If expire had NOT run, fragment 0 would still
+     * be present and feeding 1..n-1 would complete the message -- which
+     * this assertion would catch. */
+    for (int i = 1; i < cap.count; i++) {
+        nl_channel_on_receive(&chan, /*now_ms*/ NL_REASSEMBLY_TIMEOUT_MS + 100,
+                              cap.packets[i].data, cap.packets[i].len,
+                              capture_deliver, &del, NULL, NULL, NULL, NULL);
+    }
+    ASSERT_EQ(del.count, 0); /* slot was reclaimed: still missing fragment 0 */
+
+    /* Now feed fragment 0 as well: fresh reassembly completes correctly. */
+    nl_channel_on_receive(&chan, NL_REASSEMBLY_TIMEOUT_MS + 100,
+                          cap.packets[0].data, cap.packets[0].len,
+                          capture_deliver, &del, NULL, NULL, NULL, NULL);
+    ASSERT_EQ(del.count, 1);
+    ASSERT_EQ(del.len[0], (uint32_t)total);
+    ASSERT_MEM_EQ(del.data[0], big, total);
+
+    nl_channel_free(&chan);
+    free(big);
+}
+
 TEST(test_reliable_unordered_delivers_all_ignores_order) {
     nl_channel_t sender, receiver;
     nl_channel_init(&sender);
@@ -505,6 +599,8 @@ int main(void) {
     printf("=== channel tests ===\n");
     RUN_TEST(test_unreliable_basic_roundtrip);
     RUN_TEST(test_unreliable_sequenced_drops_stale);
+    RUN_TEST(test_sequenced_fragmented_reassembles_out_of_order_fragments);
+    RUN_TEST(test_channel_tick_expires_stale_reassembly);
     RUN_TEST(test_reliable_unordered_delivers_all_ignores_order);
     RUN_TEST(test_reliable_unordered_dedupes_retransmit);
     RUN_TEST(test_reliable_ordered_delivers_in_order_despite_network_reorder);

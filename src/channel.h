@@ -44,6 +44,12 @@ typedef struct {
     bool          reorder_ring_init;
     uint16_t      seq_highest_seen;      /* UNRELIABLE_SEQUENCED only */
     bool          seq_has_received_any;  /* UNRELIABLE_SEQUENCED only */
+    /* UNRELIABLE_SEQUENCED + fragmentation: the stale-drop gate must be
+     * applied once per complete message (using this message's highest
+     * fragment sequence), not once per fragment -- see channel.c. */
+    uint16_t      seq_frag_msg_id;
+    uint16_t      seq_frag_max_seq;
+    bool          seq_frag_active;
     nl_reassembly_tracker_t reassembly;  /* any mode carrying fragmented messages */
     bool          reassembly_init;
 } nl_lane_t;

@@ -95,6 +95,11 @@ typedef struct nl_connection {
     uint32_t keepalive_interval_ms;
 
     bool handshake_confirmed; /* client-side: has CONNECT_ACCEPTED been seen yet */
+    /* Server-side: CONNECT_ACCEPTED retransmission bookkeeping. The client
+     * may silently drop the single ACCEPTED datagram; until it confirms by
+     * successfully decrypting one, the server must be willing to resend. */
+    uint64_t accept_sent_ms;      /* when ACCEPTED was last put on the wire */
+    uint32_t accept_retries_left; /* countdown; 0 = stop retrying this handshake */
 
     pthread_mutex_t lock;
 } nl_connection_t;
@@ -134,8 +139,13 @@ void nl_connection_send_disconnect(nl_connection_t *conn, uint64_t now_ms, const
  * every packet after the cleartext handshake messages is encrypted by
  * policy). Carries no payload; the client learns its assigned identity
  * from the packet's own cleartext connection_id field, same as any other
- * encrypted packet. */
-void nl_connection_send_handshake_complete(nl_connection_t *conn, const nl_conn_callbacks_t *cb);
+ * encrypted packet.
+ *
+ * `is_retry` distinguishes the initial send (arms accept_retries_left /
+ * accept_sent_ms for the tick-driven resend loop) from a retransmission
+ * (just puts another copy on the wire without re-arming the budget). */
+void nl_connection_send_handshake_complete(nl_connection_t *conn, uint64_t now_ms,
+                                            bool is_retry, const nl_conn_callbacks_t *cb);
 
 uint32_t nl_connection_rtt_ms(nl_connection_t *conn);
 

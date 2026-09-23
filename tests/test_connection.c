@@ -196,6 +196,13 @@ static void harness_send_disconnect(harness_t *h, nl_connection_t *conn, uint64_
     drain_queue();
 }
 
+static void harness_send_handshake_complete(harness_t *h, nl_connection_t *conn, uint64_t now_ms, bool is_retry) {
+    enter_in_flight(conn);
+    nl_connection_send_handshake_complete(conn, now_ms, is_retry, &h->cb);
+    exit_in_flight();
+    drain_queue();
+}
+
 /* Derive a matching pair of directional keys the way the real handshake
  * would (X25519 + HKDF), so this test also incidentally exercises that
  * connection.c's crypto usage is consistent with crypto.c's, without
@@ -339,11 +346,50 @@ TEST(test_connection_graceful_disconnect_notifies_peer) {
 
     harness_send_disconnect(&ch, cc, 0);
     ASSERT_EQ(sh.disconnect_count, 1);
-    ASSERT_EQ(sh.last_disconnect_reason, NL_OK); /* graceful, not a timeout/error */
+    ASSERT_EQ(sh.disconnect_count == 1 && sh.last_disconnect_reason == NL_OK, 1); /* graceful, not a timeout/error */
 
     /* Further sends on the now-disconnected client connection must fail cleanly. */
     nl_result_t r = harness_send(&ch, cc, 0, NL_UNRELIABLE, (const uint8_t *)"x", 1, 0);
     ASSERT_EQ(r, NL_ERR_NOT_CONNECTED);
+
+    nl_connection_destroy(cc);
+    nl_connection_destroy(sc);
+}
+
+/* Regression: server-side CONNECT_ACCEPTED must be retransmitted until the
+ * client confirms (or the finite budget runs out). A single lost ACCEPTED
+ * previously stalled the client handshake until idle timeout. */
+TEST(test_connection_accept_retransmits_until_budget_exhausted) {
+    harness_t ch, sh;
+    nl_connection_t *cc, *sc;
+    /* keepalive far beyond the test so only ACCEPTED retries tick. */
+    make_pair(&ch, &sh, &cc, &sc, /*timeout*/ 100000, /*keepalive*/ 100000);
+
+    /* Client never "hears" ACCEPTED: drop everything the server sends. */
+    sh.drop_next_send = true;
+    harness_send_handshake_complete(&sh, sc, /*now_ms*/ 0, /*is_retry*/ false);
+    ASSERT_EQ(sh.packets_sent, 1); /* initial ACCEPTED (then dropped via drop_next_send) */
+
+    /* After NL_HANDSHAKE_RETRY_MS (250ms) with no inbound from the client,
+     * the server must put another ACCEPTED on the wire. */
+    sh.drop_next_send = false;
+    int before = sh.packets_sent;
+    /* tick at 300ms: past one retry interval. */
+    harness_tick(&sh, sc, 300);
+    ASSERT_TRUE(sh.packets_sent > before); /* at least one retransmit */
+
+    /* Once the client has sent *something* the server authenticates,
+     * last_recv advances past accept_sent and retries stop. The harness
+     * stamps inbound packets with peer_harness->now_ms (not the sender's
+     * now_ms argument), so set it to the intended receive time first --
+     * otherwise the server sees last_recv=0 and keeps retransmitting. */
+    sh.now_ms = 400;
+    harness_send(&ch, cc, 0, NL_UNRELIABLE, (const uint8_t *)"confirm", 7, 400);
+    ASSERT_EQ(sh.data_count, 1);
+
+    int before2 = sh.packets_sent;
+    harness_tick(&sh, sc, 700); /* past another retry window */
+    ASSERT_EQ(sh.packets_sent, before2); /* no more ACCEPTED once client proved reachability */
 
     nl_connection_destroy(cc);
     nl_connection_destroy(sc);
@@ -480,6 +526,7 @@ int main(void) {
     RUN_TEST(test_connection_retransmit_on_tick_and_stops_after_ack);
     RUN_TEST(test_connection_idle_timeout_disconnects);
     RUN_TEST(test_connection_graceful_disconnect_notifies_peer);
+    RUN_TEST(test_connection_accept_retransmits_until_budget_exhausted);
     RUN_TEST(test_connection_keepalive_sent_when_idle);
     RUN_TEST(test_connection_stats_track_sent_and_received);
     RUN_TEST(test_connection_rtt_measured_from_real_roundtrip);
