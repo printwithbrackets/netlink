@@ -9,7 +9,7 @@ Python, Go, and Rust all speaking the same wire protocol.
 ```
  C / C++ client  |                                   | Go server
  Python client   |---  same wire protocol  ----------|
- Rust client     |    (UDP, X25519 + AES-256-GCM)     | Rust / C server
+ Rust client     |    (UDP, X25519 + AES-256-GCM)    | Rust / C server
 ```
 
 ## Why one C core instead of a reimplementation per language
