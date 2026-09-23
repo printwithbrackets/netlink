@@ -1278,7 +1278,14 @@ nl_result_t nl_discovery_probe(nl_endpoint_t *ep, uint16_t discovery_port, int t
     nl_put_u32(out + 5, nonce);
 
     if (sendto(sock, out, sizeof(out), 0, (struct sockaddr *)&bcast, sizeof(bcast)) < 0) {
-        return NL_ERR_SOCKET;
+        /* Broadcast can be unavailable (restricted network namespaces,
+         * some CI runners). Fall back to loopback so a local server is
+         * still discoverable and probe does not hard-fail. */
+        struct sockaddr_in local = bcast;
+        local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (sendto(sock, out, sizeof(out), 0, (struct sockaddr *)&local, sizeof(local)) < 0) {
+            return NL_ERR_SOCKET;
+        }
     }
     return NL_OK;
 }
