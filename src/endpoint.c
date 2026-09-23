@@ -1279,10 +1279,13 @@ nl_result_t nl_discovery_probe(nl_endpoint_t *ep, uint16_t discovery_port, int t
 
     if (sendto(sock, out, sizeof(out), 0, (struct sockaddr *)&bcast, sizeof(bcast)) < 0) {
         /* Broadcast can be unavailable (restricted network namespaces,
-         * some CI runners). Fall back to loopback so a local server is
-         * still discoverable and probe does not hard-fail. */
+         * some CI runners). Fall back to 127.0.0.1 so a local server is
+         * still discoverable and probe does not hard-fail. Use the
+         * numeric address: INADDR_LOOPBACK is BSD-only and hidden under
+         * strict _POSIX_C_SOURCE on Darwin (where this file compiles
+         * clean with -std=c11). */
         struct sockaddr_in local = bcast;
-        local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        local.sin_addr.s_addr = htonl(0x7F000001);
         if (sendto(sock, out, sizeof(out), 0, (struct sockaddr *)&local, sizeof(local)) < 0) {
             return NL_ERR_SOCKET;
         }
