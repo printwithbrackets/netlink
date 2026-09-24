@@ -292,15 +292,14 @@ This is the one section worth reading before trusting any of the above:
 what's claimed here is exactly what was verified, not more.
 
 **Built, run, and passing in this project's own development
-environment** (a sandboxed Linux container with a C toolchain, OpenSSL,
-and Python, but no Go/Rust toolchain, no IPv6 support at the kernel
-level, and no network access to install either):
+environment** (a Linux container with a C toolchain, OpenSSL, Python, Go,
+and Rust):
 
-- 147 test cases across unit tests (`tests/test_seqbuf.c`,
+- 156 C test cases across unit tests (`tests/test_seqbuf.c`,
   `test_crypto.c`, `test_fragment.c`, `test_channel.c`,
   `test_connection.c`, `test_network_simulation.c`,
   `test_websocket.c`: 128 cases) and real-socket integration tests
-  (`tests/integration/test_integration.c`: 19 cases,
+  (`tests/integration/test_integration.c`: 23 cases,
   `tests/integration/test_websocket_integration.c`: 5 cases), all clean
   under AddressSanitizer + UndefinedBehaviorSanitizer -- no leaks, no UB.
 - `test_network_simulation.c` specifically drives thousands of messages
@@ -317,38 +316,34 @@ level, and no network access to install either):
   parking + standalone acks), one-way reliable traffic (server never
   app-sends -- acks must ride on `NL_PKT_ACK`), multiple independent
   channels, graceful disconnect, LAN discovery (including random-nonce
-  rejection and `from_address` taken from the socket source), and
-  server-full denial.
-- The **Python bindings**, tested the same way (real `Server` + `Client`
-  over real sockets, covering echo, all delivery modes, fragmentation,
-  priority/`send_ex`, peer stats/capabilities, disconnect, and
-  server-full denial) -- 7/7 passing.
+  rejection and `from_address` taken from the socket source),
+  server-full denial, and the previously untested introspection APIs
+  (`nl_peer_address`, `nl_peer_rtt_ms`, `nl_peer_count`, `nl_send_ex`,
+  `nl_error_string`).
+- The **Python bindings** (9 tests), **Go bindings** (10 tests via
+  `go test`), and **Rust bindings** (11 tests via `cargo test`), each
+  exercised the same way: real `Server` + `Client` over real sockets,
+  covering echo, all delivery modes, fragmentation, priority/`send_ex`,
+  peer stats/capabilities/RTT/count, disconnect, and server-full denial.
+  Run them all with `make test-bindings`.
 - The **example C programs** (`echo_server`/`echo_client`), run as two
   independent OS processes exchanging messages across three channels and
-  delivery modes.
+  delivery modes. The Go and Rust example servers also build in CI.
 - The **WebSocket transport** (`NL_TRANSPORT_WEBSOCKET`): HTTP upgrade +
   encrypted NetLink handshake + reliable/unordered/unreliable delivery
   and fragmentation over loopback TCP, exercised by
   `tests/integration/test_websocket_integration.c` (5 cases).
 
-**Written but not compiled/run here, for lack of toolchain:**
+**Written but not compiled/run here, for lack of toolchain/platform:**
 
-- The **Go bindings** (`bindings/go`) and **Rust bindings**
-  (`bindings/rust`). Both are written carefully against the exact struct
-  layouts in `include/netlink.h` (the same header the Python bindings
-  were verified against), following standard cgo/FFI patterns, but they
-  need a first real `go build`/`cargo build` pass. Each binding's README
-  says this explicitly.
 - **Windows** (`socket_compat.h`'s `_WIN32` branch uses documented Winsock
   APIs following the same logic as the POSIX path, but wasn't build-tested
   here).
 - **IPv6**, at the integration-test level: the code path is implemented
   (dual-stack binding, `AF_INET6` throughout) and the test for it exists
-  and runs, but this sandbox's container has no IPv6 support at the
-  kernel/namespace level at all (`socket(AF_INET6, ...)` itself fails),
-  so the test skips itself rather than reporting a false pass. If you run
-  the test suite somewhere with IPv6 available, please check that it
-  actually passes.
+  and runs, but if the host has no IPv6 support the test skips itself
+  rather than reporting a false pass. If you run the test suite somewhere
+  with IPv6 available, please check that it actually passes.
 
 If you build and test any of the above in an environment that has the
 missing pieces, a PR (or even just an issue reporting the result) is a
@@ -421,6 +416,15 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ### Unreleased
 
+- **Go and Rust bindings verified and covered by tests.** First real
+  `go build`/`go vet`/`go test` and `cargo build`/`cargo test` pass
+  against the compiled C library (10 Go tests, 11 Rust tests over real
+  loopback sockets). CI jobs for both are no longer best-effort.
+  New `make test-bindings` target runs Python + Go + Rust binding tests.
+- **Previously untested public C APIs covered:** `nl_peer_address`,
+  `nl_peer_rtt_ms`, `nl_peer_count`, `nl_send_ex`, and `nl_error_string`
+  now have integration tests; Python binding gained `peer_rtt_ms` /
+  `peer_count` / `error_string` coverage (9 tests total).
 - **WebSocket transport implemented** (`NL_TRANSPORT_WEBSOCKET`). TCP +
   RFC6455 framing with a real HTTP upgrade handshake (`Sec-WebSocket-
   Key`/`Accept`, SHA-1 via OpenSSL EVP) and the existing encrypted

@@ -65,13 +65,19 @@ not reimplement any protocol logic. If a binding's struct layout doesn't
 match the C header, that's a bug in the binding, not a reason to add
 protocol logic on the binding side.
 
-The Python bindings are built and tested against the compiled library as
-part of this repository's own test suite. The Go and Rust bindings are
-written against the same ABI but, depending on the environment a given
-change was made in, may not have been compiled with their native
-toolchains -- if you have `go` or `cargo` available, running their
-respective test/build commands and reporting results is a genuinely
-useful contribution on its own.
+The Python, Go, and Rust bindings are all built and tested against the
+compiled C library as part of this repository's own test suite (`make
+test-bindings`, also run in CI). If you change a binding, run its native
+test command:
+
+```sh
+# from the repository root, after `make`
+make test-bindings
+# or individually:
+cd bindings/python && NETLINK_LIBRARY_PATH=../../build/libnetlink.so python3 tests/test_python_bindings.py
+cd bindings/go     && go test ./...
+cd bindings/rust   && cargo test
+```
 
 ## Reporting security issues
 

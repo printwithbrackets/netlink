@@ -6,19 +6,18 @@ protocol (one C core, thin bindings on top), so any client here should
 work against any server here without modification.
 
 **What's been verified by running it, in the environment that built this
-project:** every combination *involving the C core directly or via the
-Python bindings* -- i.e. C client <-> C server, Python client <-> C
-server, Python client <-> Python server, and the C/Python examples below
-against the C example server. See the top-level README's Testing section
-for the exact list.
+project:** every combination below -- C client <-> C server, Python
+client <-> C server, Python client <-> Python server, Go client/server
+tests (`go test`), Rust client/server tests (`cargo test`), and the
+C/Python/Go/Rust examples (Go and Rust example servers build in CI;
+C examples are run as two processes in the authoring environment). See
+the top-level README's Testing section for the exact list.
 
-**What needs your toolchain to verify:** anything involving a Go or Rust
-*server*, since no Go or Rust toolchain was available while building this
-project. The combinations below are written to work -- the bindings were
-built against the exact same C ABI the Python bindings were verified
-against, byte-for-byte -- but you're the first to actually compile and
-run the Go/Rust side. If something doesn't build or doesn't connect,
-that's genuinely useful to report (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+**What still benefits from a manual run:** live cross-language example
+pairings (e.g. C client against a manually started Go or Rust example
+server on a real LAN) -- the automated tests cover the protocol over
+loopback, but the step-by-step commands below are for interactive
+verification.
 
 ## 0. Build the C core first
 

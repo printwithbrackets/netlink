@@ -1,10 +1,11 @@
 # NetLink build system.
 #
 # Targets:
-#   make            - build the static and shared libraries
-#   make test       - build and run every unit + integration test
-#   make examples   - build the example programs
-#   make clean      - remove build artifacts
+#   make               - build the static and shared libraries
+#   make test          - build and run every unit + integration test (C)
+#   make test-bindings - run Python/Go/Rust binding tests (needs go, cargo, python3)
+#   make examples      - build the example programs
+#   make clean         - remove build artifacts
 #
 # Requires: a C11 compiler, pthreads, and OpenSSL's libcrypto (headers +
 # shared library). On most Linux distros: apt install libssl-dev (or
@@ -55,8 +56,18 @@ $(SHARED_LIB): $(OBJ)
 TEST_BIN_DIR := $(BUILD_DIR)/tests
 TEST_CFLAGS := $(CFLAGS) -g -fsanitize=address,undefined $(INCLUDES)
 
-.PHONY: test test-unit test-integration
+.PHONY: test test-unit test-integration test-bindings
 test: all test-unit test-integration
+
+# Language-binding tests (require `make` first, plus go/cargo/python3).
+test-bindings: all
+	@echo "--- Python binding tests ---"
+	cd bindings/python && NETLINK_LIBRARY_PATH=../../build/libnetlink.so \
+		python3 tests/test_python_bindings.py
+	@echo "--- Go binding tests ---"
+	cd bindings/go && go vet ./... && go test -count=1 -timeout 120s ./...
+	@echo "--- Rust binding tests ---"
+	cd bindings/rust && cargo test
 
 test-unit: | $(BUILD_DIR)
 	mkdir -p $(TEST_BIN_DIR)

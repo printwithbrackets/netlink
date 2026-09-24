@@ -181,6 +181,57 @@ def test_send_ex_priority_and_peer_stats():
         server.close()
 
 
+def test_peer_rtt_ms_and_peer_count():
+    port = next_port()
+    server = netlink.Server("127.0.0.1", port)
+    client = netlink.Client()
+    try:
+        assert client.peer_count() == 0
+        assert server.peer_count() == 0
+        assert client.peer_rtt_ms(1) == 0  # unknown peer
+
+        peer = client.connect("127.0.0.1", port)
+        wait_for(client, netlink.EventType.CONNECTED)
+        server_ev = wait_for(server, netlink.EventType.CONNECTED)
+        assert client.peer_count() == 1
+        assert server.peer_count() == 1
+
+        # Force a reliable round trip so an RTT sample lands.
+        client.send(peer, channel=0, data=b"rtt probe",
+                    delivery=netlink.Delivery.RELIABLE_ORDERED)
+        wait_for(server, netlink.EventType.DATA)
+        server.send(server_ev.peer, channel=0, data=b"rtt pong",
+                    delivery=netlink.Delivery.RELIABLE_ORDERED)
+        wait_for(client, netlink.EventType.DATA)
+
+        rtt = client.peer_rtt_ms(peer)
+        assert isinstance(rtt, int)
+        assert rtt < 2000
+        assert client.peer_rtt_ms(peer + 999) == 0
+    finally:
+        client.close()
+        server.close()
+
+
+def test_error_string_available():
+    # NetLinkError goes through nl_error_string; force a failure path
+    # (duplicate connect -> NL_ERR_ALREADY_CONNECTED) without requiring pytest.
+    port = next_port()
+    server = netlink.Server("127.0.0.1", port)
+    client = netlink.Client()
+    try:
+        client.connect("127.0.0.1", port)
+        try:
+            client.connect("127.0.0.1", port)
+            raise AssertionError("second connect should have raised")
+        except netlink.NetLinkError as e:
+            assert e.code == -6  # NL_ERR_ALREADY_CONNECTED
+            assert "already connected" in str(e)
+    finally:
+        client.close()
+        server.close()
+
+
 if __name__ == "__main__":
     # Self-contained runner: discovers test_* functions and runs them
     # without requiring pytest (which may not be installed).

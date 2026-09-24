@@ -62,9 +62,8 @@ jobs:
           NETLINK_LIBRARY_PATH=../../build/libnetlink.so pytest tests/ -v
 
   go-bindings:
-    name: Go bindings (best-effort -- not yet verified upstream)
+    name: Go bindings
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -74,16 +73,23 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
       - name: Build native library
         run: make
-      - name: Build Go bindings
+      - name: Build and vet Go bindings
         run: |
           cd bindings/go
           go build ./...
           go vet ./...
+      - name: Run Go binding tests
+        run: |
+          cd bindings/go
+          go test -count=1 -timeout 120s ./...
+      - name: Build Go example
+        run: |
+          cd bindings/go/examples/echo_server
+          go build -o /tmp/go_echo_server .
 
   rust-bindings:
-    name: Rust bindings (best-effort -- not yet verified upstream)
+    name: Rust bindings
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -91,8 +97,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
       - name: Build native library
         run: make
-      - name: Build Rust bindings
+      - name: Build and test Rust bindings
         run: |
           cd bindings/rust
           cargo build
           cargo test
+      - name: Build Rust example
+        run: |
+          cd bindings/rust
+          cargo build --examples

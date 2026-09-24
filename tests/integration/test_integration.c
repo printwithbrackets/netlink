@@ -695,9 +695,156 @@ TEST(test_version_string_matches_macros) {
     ASSERT_TRUE(strcmp(nl_version_string(), expected) == 0);
 }
 
+/* nl_error_string must return a stable, non-empty description for every
+ * documented error code (and "unknown error" for out-of-range values) so
+ * bindings that surface it to users never get NULL or "". */
+TEST(test_error_string_covers_all_codes) {
+    const nl_result_t codes[] = {
+        NL_OK, NL_ERR_INVALID_ARGUMENT, NL_ERR_OUT_OF_MEMORY, NL_ERR_SOCKET,
+        NL_ERR_BIND_FAILED, NL_ERR_NOT_CONNECTED, NL_ERR_ALREADY_CONNECTED,
+        NL_ERR_MESSAGE_TOO_LARGE, NL_ERR_CHANNEL_OUT_OF_RANGE, NL_ERR_QUEUE_FULL,
+        NL_ERR_CRYPTO, NL_ERR_PROTOCOL_MISMATCH, NL_ERR_TIMEOUT,
+        NL_ERR_PEER_NOT_FOUND, NL_ERR_DENIED, NL_ERR_UNSUPPORTED,
+        NL_ERR_SERVER_FULL, NL_ERR_INTERNAL,
+    };
+    for (size_t i = 0; i < sizeof(codes) / sizeof(codes[0]); i++) {
+        const char *s = nl_error_string(codes[i]);
+        ASSERT_TRUE(s != NULL);
+        ASSERT_TRUE(s[0] != '\0');
+        ASSERT_TRUE(strcmp(s, "unknown error") != 0);
+    }
+    /* Out-of-range: still returns a non-NULL fallback. */
+    ASSERT_TRUE(strcmp(nl_error_string((nl_result_t)-12345), "unknown error") == 0);
+    ASSERT_TRUE(strcmp(nl_error_string(NL_OK), "ok") == 0);
+}
+
+/* nl_send_ex is the priority-tagged send path; exercise a high-priority
+ * send end-to-end and confirm it arrives intact (priority is local
+ * queue-ordering, so we only assert delivery, not wire encoding). */
+TEST(test_send_ex_high_priority_over_real_sockets) {
+    nl_config_t cfg; nl_config_default(&cfg);
+    nl_endpoint_t *server = NULL, *client = NULL;
+    nl_address_t bind_addr = addr("127.0.0.1", 34718);
+    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+
+    nl_peer_id_t client_peer;
+    ASSERT_EQ(nl_connect(client, &bind_addr, &client_peer), NL_OK);
+    nl_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 3000));
+    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 3000));
+    nl_peer_id_t server_peer = ev.peer;
+
+    const char *msg = "urgent high-priority payload";
+    ASSERT_EQ(nl_send_ex(client, client_peer, 0, NL_RELIABLE_ORDERED,
+                         (const uint8_t *)msg, strlen(msg), NL_PRIORITY_HIGH), NL_OK);
+    ASSERT_TRUE(wait_for_event(server, NL_EVENT_DATA, &ev, 3000));
+    ASSERT_EQ(ev.data_len, strlen(msg));
+    ASSERT_MEM_EQ(ev.data, msg, strlen(msg));
+
+    /* Error paths: unknown peer and null endpoint. */
+    ASSERT_EQ(nl_send_ex(client, 0xDEADBEEF, 0, NL_RELIABLE_ORDERED,
+                         (const uint8_t *)msg, strlen(msg), NL_PRIORITY_NORMAL),
+              NL_ERR_PEER_NOT_FOUND);
+    ASSERT_EQ(nl_send_ex(NULL, client_peer, 0, NL_RELIABLE_ORDERED,
+                         (const uint8_t *)msg, strlen(msg), NL_PRIORITY_NORMAL),
+              NL_ERR_INVALID_ARGUMENT);
+    ASSERT_EQ(nl_send_ex(client, client_peer, 0, NL_RELIABLE_ORDERED, NULL, 5,
+                         NL_PRIORITY_NORMAL), NL_ERR_INVALID_ARGUMENT);
+
+    (void)server_peer;
+    nl_endpoint_destroy(client);
+    nl_endpoint_destroy(server);
+}
+
+/* nl_peer_address: returns the remote address of a live connection and
+ * false for unknown peers / null args. */
+TEST(test_peer_address_over_real_sockets) {
+    nl_config_t cfg; nl_config_default(&cfg);
+    nl_endpoint_t *server = NULL, *client = NULL;
+    nl_address_t bind_addr = addr("127.0.0.1", 34719);
+    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+
+    nl_peer_id_t client_peer;
+    ASSERT_EQ(nl_connect(client, &bind_addr, &client_peer), NL_OK);
+    nl_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 3000));
+    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 3000));
+    nl_peer_id_t server_peer = ev.peer;
+
+    nl_address_t out;
+    memset(&out, 0, sizeof(out));
+    ASSERT_TRUE(nl_peer_address(server, server_peer, &out));
+    ASSERT_TRUE(strcmp(out.host, "127.0.0.1") == 0);
+    ASSERT_TRUE(out.port != 0);
+
+    memset(&out, 0, sizeof(out));
+    ASSERT_TRUE(nl_peer_address(client, client_peer, &out));
+    ASSERT_TRUE(out.port != 0);
+
+    ASSERT_FALSE(nl_peer_address(client, 0xDEADBEEF, &out));
+    ASSERT_FALSE(nl_peer_address(NULL, client_peer, &out));
+    ASSERT_FALSE(nl_peer_address(client, client_peer, NULL));
+
+    nl_endpoint_destroy(client);
+    nl_endpoint_destroy(server);
+}
+
+/* nl_peer_rtt_ms / nl_peer_count: after a reliable round trip the RTT
+ * estimate must be wired up (bounded), and peer_count must track live
+ * connections (0 before, 1 after, 0 after disconnect). */
+TEST(test_peer_rtt_ms_and_peer_count) {
+    nl_config_t cfg; nl_config_default(&cfg);
+    nl_endpoint_t *server = NULL, *client = NULL;
+    nl_address_t bind_addr = addr("127.0.0.1", 34720);
+    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+
+    ASSERT_EQ(nl_peer_count(client), 0u);
+    ASSERT_EQ(nl_peer_count(server), 0u);
+    ASSERT_EQ(nl_peer_rtt_ms(client, 1), 0u); /* unknown peer -> 0 */
+    ASSERT_EQ(nl_peer_rtt_ms(NULL, 1), 0u);
+
+    nl_peer_id_t client_peer;
+    ASSERT_EQ(nl_connect(client, &bind_addr, &client_peer), NL_OK);
+    nl_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 3000));
+    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 3000));
+    nl_peer_id_t server_peer = ev.peer;
+
+    ASSERT_EQ(nl_peer_count(client), 1u);
+    ASSERT_EQ(nl_peer_count(server), 1u);
+
+    const char *msg = "ping for rtt";
+    ASSERT_EQ(nl_send(client, client_peer, 0, NL_RELIABLE_ORDERED,
+                      (const uint8_t *)msg, strlen(msg)), NL_OK);
+    ASSERT_TRUE(wait_for_event(server, NL_EVENT_DATA, &ev, 3000));
+    ASSERT_EQ(nl_send(server, server_peer, 0, NL_RELIABLE_ORDERED,
+                      (const uint8_t *)"pong", 4), NL_OK);
+    ASSERT_TRUE(wait_for_event(client, NL_EVENT_DATA, &ev, 3000));
+
+    /* Loopback RTT should be small but the estimate must be live. */
+    ASSERT_TRUE(nl_peer_rtt_ms(client, client_peer) < 2000);
+    ASSERT_TRUE(nl_peer_rtt_ms(client, 0xDEADBEEF) == 0u);
+
+    ASSERT_EQ(nl_disconnect(client, client_peer), NL_OK);
+    ASSERT_TRUE(wait_for_event(server, NL_EVENT_DISCONNECTED, &ev, 3000));
+
+    /* Allow the client's local side to tear the connection down too. */
+    for (int i = 0; i < 40 && nl_peer_count(client) > 0; i++) {
+        nl_poll_event(client, &ev, 50);
+    }
+    ASSERT_EQ(nl_peer_count(client), 0u);
+
+    nl_endpoint_destroy(client);
+    nl_endpoint_destroy(server);
+}
+
 int main(void) {
     printf("=== integration tests (real UDP sockets) ===\n");
     RUN_TEST(test_version_string_matches_macros);
+    RUN_TEST(test_error_string_covers_all_codes);
     RUN_TEST(test_connect_and_reliable_ordered_data);
     RUN_TEST(test_capability_negotiation_intersects_both_sides);
     RUN_TEST(test_all_delivery_modes_over_real_sockets);
@@ -711,6 +858,9 @@ int main(void) {
     RUN_TEST(test_discovery_wrong_nonce_ignored);
     RUN_TEST(test_discovery_rate_limited);
     RUN_TEST(test_peer_stats_over_real_sockets);
+    RUN_TEST(test_peer_address_over_real_sockets);
+    RUN_TEST(test_peer_rtt_ms_and_peer_count);
+    RUN_TEST(test_send_ex_high_priority_over_real_sockets);
     RUN_TEST(test_server_denies_when_full);
     RUN_TEST(test_encryption_disabled_rejected);
     RUN_TEST(test_duplicate_connect_same_address_rejected);

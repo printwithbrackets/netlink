@@ -2,14 +2,9 @@
 
 Go (cgo) bindings for [NetLink](../../README.md).
 
-**Testing status:** the C core and the Python bindings in this repository
-were built and run in the environment that produced them, including a
-full test suite over real sockets. This Go binding was **not** -- no Go
-toolchain was available in that environment. It's written carefully
-against the same C ABI (`include/netlink.h`) the Python bindings were
-verified against, using standard cgo patterns, but treat it as needing
-its first real `go build && go vet && go test` pass rather than
-pre-verified. Contributions confirming (or fixing) it are very welcome.
+**Testing status:** built, vetted, and passing real-socket integration
+tests (`go test ./...`) against the compiled C library. CI runs
+`go build`, `go vet`, and `go test` on every push.
 
 ## Setup
 
@@ -19,9 +14,17 @@ Build the native library first (from the repository root):
 make CRYPTO_CFLAGS="..." CRYPTO_LIBS="..."   # see the top-level README for flags on your platform
 ```
 
-This produces `build/libnetlink.a`. The cgo preamble in `netlink.go`
-points at `../../include` and `../../build` relative to this file
-(`${SRCDIR}`); adjust if you vendor this package elsewhere.
+This produces `build/libnetlink.a` and `build/libnetlink.so`. The cgo
+preamble in `netlink.go` points at `../../include` and `../../build`
+relative to this file (`${SRCDIR}`), with an rpath so `go test` finds
+the shared library without extra environment variables; adjust if you
+vendor this package elsewhere.
+
+## Tests
+
+```sh
+go test ./...
+```
 
 ## Usage
 

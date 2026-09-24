@@ -20,7 +20,7 @@ package netlink
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../../include
-#cgo LDFLAGS: -L${SRCDIR}/../../build -lnetlink -lcrypto -lpthread
+#cgo LDFLAGS: -L${SRCDIR}/../../build -Wl,-rpath,${SRCDIR}/../../build -lnetlink -lcrypto -lpthread
 #include <stdlib.h>
 #include <string.h>
 #include "netlink.h"
