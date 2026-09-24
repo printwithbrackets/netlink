@@ -67,7 +67,7 @@ TEST(test_x25519_rejects_all_zero_public_key) {
 
 TEST(test_hkdf_deterministic) {
     uint8_t secret[32]; nl_crypto_random(secret, 32);
-    uint8_t salt[16] = "salt-material...";
+    uint8_t salt[16] = { 's','a','l','t','-','m','a','t','e','r','i','a','l','.','.','.' };
     uint8_t info[] = "netlink v1 c2s";
     uint8_t out1[32], out2[32];
     ASSERT_TRUE(nl_crypto_hkdf_sha256(secret, 32, salt, 16, info, sizeof(info), out1, 32));
@@ -77,7 +77,7 @@ TEST(test_hkdf_deterministic) {
 
 TEST(test_hkdf_different_info_different_output) {
     uint8_t secret[32]; nl_crypto_random(secret, 32);
-    uint8_t salt[16] = "salt-material...";
+    uint8_t salt[16] = { 's','a','l','t','-','m','a','t','e','r','i','a','l','.','.','.' };
     uint8_t out_c2s[32], out_s2c[32];
     ASSERT_TRUE(nl_crypto_hkdf_sha256(secret, 32, salt, 16, (const uint8_t *)"c2s", 3, out_c2s, 32));
     ASSERT_TRUE(nl_crypto_hkdf_sha256(secret, 32, salt, 16, (const uint8_t *)"s2c", 3, out_s2c, 32));
@@ -85,8 +85,8 @@ TEST(test_hkdf_different_info_different_output) {
 }
 
 TEST(test_hmac_deterministic_and_key_sensitive) {
-    uint8_t key1[16] = "key-one-material";
-    uint8_t key2[16] = "key-two-material";
+    uint8_t key1[16] = { 'k','e','y','-','o','n','e','-','m','a','t','e','r','i','a','l' };
+    uint8_t key2[16] = { 'k','e','y','-','t','w','o','-','m','a','t','e','r','i','a','l' };
     uint8_t data[] = "some cookie material";
     uint8_t out1[16], out2[16], out3[16];
     ASSERT_TRUE(nl_crypto_hmac_sha256(key1, 16, data, sizeof(data), out1, 16));

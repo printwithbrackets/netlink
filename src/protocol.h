@@ -14,10 +14,10 @@
  *   byte 0       : packet_type (nl_packet_type_t)
  *   ...          : type-specific fields, see structs below
  *
- * For encrypted types (DATA, KEEPALIVE, DISCONNECT):
+ * For encrypted types (DATA, ACK, KEEPALIVE, DISCONNECT, CONNECT_ACCEPTED):
  *   byte 0       : packet_type
  *   bytes 1-8    : connection_id (u64)            \_ AAD (authenticated,
- *   bytes 9-16   : nonce_counter (u64)             /  not encrypted)
+ *   bytes 9-16   : nonce_counter (u64)             / not encrypted)
  *   bytes 17..N-17: AES-256-GCM ciphertext
  *   last 16 bytes : GCM authentication tag
  */
@@ -37,6 +37,7 @@ typedef enum {
     NL_PKT_DATA              = 0x06, /* encrypted */
     NL_PKT_DISCONNECT        = 0x07, /* encrypted */
     NL_PKT_KEEPALIVE         = 0x08, /* encrypted */
+    NL_PKT_ACK               = 0x09, /* encrypted */
     NL_PKT_DISCOVERY_REQUEST = 0x0A,
     NL_PKT_DISCOVERY_RESPONSE= 0x0B,
 } nl_packet_type_t;
@@ -85,8 +86,9 @@ typedef enum {
 /* CONNECT_RESPONSE:
  *   u8  type
  *   u8  cookie[16]
- *   u8  client_pubkey[32]   (repeated so the server's cookie-verification
- *                             path can stay stateless if desired)
+ *   u8  client_pubkey[32]   (echoed back so the server can match the
+ *                             response against the pending handshake entry
+ *                             that created the cookie)
  *   u8  client_nonce[16]
  */
 #define NL_CONNECT_RESPONSE_SIZE (1 + 16 + 32 + 16)
@@ -100,8 +102,6 @@ typedef enum {
 typedef enum {
     NL_DENY_SERVER_FULL         = 1,
     NL_DENY_PROTOCOL_MISMATCH   = 2,
-    NL_DENY_BAD_COOKIE          = 3,
-    NL_DENY_RATE_LIMITED        = 4,
 } nl_deny_reason_t;
 
 /* ---- Encrypted packet cleartext header (the "AAD" portion) ---- */
@@ -130,15 +130,27 @@ typedef enum {
 #define NL_DATA_HEADER_SIZE (1 + 1 + 2 + 2 + 4 + 2 + 1)
 #define NL_FRAGMENT_HEADER_SIZE (2 + 2 + 2)
 
+/* ---- ACK payload (AEAD plaintext of NL_PKT_ACK) ----
+ * Sent when a reliable receive has no outgoing DATA to piggyback the
+ * ack on (the "one-way traffic" case: acks would otherwise only ride
+ * on DATA in the reverse direction, so a receiver that never sends app
+ * data would never ack, stalling the sender until RTO). Carries the
+ * same (ack, ack_bits, rwnd) triple a DATA header does, plus which
+ * channel/lane it covers.
+ *   u8  channel
+ *   u8  delivery              (must be a reliable nl_delivery_t)
+ *   u16 ack
+ *   u32 ack_bits
+ *   u16 rwnd                  (our advertised receive window)
+ */
+#define NL_ACK_PAYLOAD_SIZE (1 + 1 + 2 + 4 + 2)
+
 /* Default receive window (bytes) advertised when nothing better is known.
  * Lives here so channel-level tests can stamp it without pulling in
  * connection.h; connection.c uses the same value as its initial capacity. */
 #ifndef NL_RECV_WINDOW_DEFAULT
 #define NL_RECV_WINDOW_DEFAULT 32768u
 #endif
-
-/* ---- KEEPALIVE plaintext: empty, or 1 byte flag (0=ping,1=pong) + u32 echo ---- */
-#define NL_KEEPALIVE_SIZE (1 + 4)
 
 /* ---- DISCOVERY_REQUEST:
  *   u8  type

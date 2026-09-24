@@ -109,12 +109,16 @@ static void deferred_free_all(nl_connection_t *conn) {
 }
 
 /* Insert keeping descending priority (higher number first); stable FIFO
- * within equal priority by inserting after all strictly-greater entries. */
+ * within equal priority by inserting after all strictly-greater entries.
+ * A partial-send continuation parked at the head is never displaced --
+ * later messages queue behind it so RELIABLE_ORDERED fragments on its
+ * lane can't interleave with another message's. */
 static bool deferred_push(nl_connection_t *conn, uint8_t channel, nl_delivery_t delivery,
-                          uint8_t priority, const uint8_t *data, size_t len) {
+                          uint8_t priority, const uint8_t *data, size_t len,
+                          bool continuation, uint16_t frag_start, uint16_t message_id) {
     if (conn->deferred_count >= NL_DEFERRED_MAX_MSGS) return false;
     if (conn->deferred_bytes + len > NL_DEFERRED_MAX_BYTES) return false;
-    if (len > UINT16_MAX) return false;
+    if (len > NL_MAX_MESSAGE_SIZE) return false;
 
     nl_deferred_msg_t *m = (nl_deferred_msg_t *)calloc(1, sizeof(*m));
     if (!m) return false;
@@ -124,10 +128,19 @@ static bool deferred_push(nl_connection_t *conn, uint8_t channel, nl_delivery_t 
     m->channel = channel;
     m->delivery = (uint8_t)delivery;
     m->priority = priority;
-    m->len = (uint16_t)len;
+    m->continuation = continuation;
+    m->frag_start = frag_start;
+    m->message_id = message_id;
+    m->len = (uint32_t)len;
     m->next = NULL;
 
-    if (!conn->deferred_head || conn->deferred_head->priority < priority) {
+    nl_deferred_msg_t *head = conn->deferred_head;
+    if (head && head->continuation) {
+        nl_deferred_msg_t *cur = head;
+        while (cur->next && cur->next->priority >= priority) cur = cur->next;
+        m->next = cur->next;
+        cur->next = m;
+    } else if (!head || head->priority < priority) {
         m->next = conn->deferred_head;
         conn->deferred_head = m;
     } else {
@@ -193,6 +206,8 @@ nl_connection_t *nl_connection_create(nl_peer_id_t id, const struct sockaddr_sto
     conn->ssthresh = NL_SSTHRESH_INITIAL_PACKETS;
     conn->cwnd_ack_accum = 0;
     conn->peer_rwnd = (uint16_t)NL_RECV_WINDOW_DEFAULT;
+    conn->peer_rwnd_capacity = (uint16_t)NL_RECV_WINDOW_DEFAULT;
+    conn->peer_window_in_flight = 0;
     conn->recv_window_size = NL_RECV_WINDOW_DEFAULT;
     conn->recv_window_used = 0;
     conn->rate_bps = 0;
@@ -288,46 +303,147 @@ typedef struct {
     size_t len;
     uint64_t now_ms;
     const nl_conn_callbacks_t *cb;
+    uint16_t frag_count;
+    uint16_t frag_start;
+    uint16_t message_id; /* set for continuations; ignored when frag_start==0 */
 } send_attempt_t;
+
+typedef struct {
+    nl_result_t result;
+    uint16_t sent_frags;
+    uint16_t message_id;
+    uint32_t bytes_sent;
+} send_outcome_t;
 
 static bool is_reliable_mode(nl_delivery_t d) {
     return d == NL_RELIABLE_UNORDERED || d == NL_RELIABLE_ORDERED;
 }
 
-/* May this payload leave now? Congestion window gates reliable only (no
- * ack clock for unreliable); peer rwnd gates both. Does NOT consume rate
- * tokens -- call rate_consume only once emit is actually committed, so a
- * failed window check never steals budget. */
-static bool send_window_open(nl_connection_t *conn, const send_attempt_t *a) {
-    if (is_reliable_mode(a->delivery) && reliable_in_flight(conn) >= conn->cwnd) {
-        return false;
+static uint16_t frag_count_for(size_t len) {
+    if (len <= NL_FRAGMENT_CHUNK_SIZE) return 1;
+    return nl_fragment_count_needed(len); /* 0 if len exceeds NL_MAX_MESSAGE_SIZE */
+}
+
+/* Payload bytes carried by fragments [from_frag, frag_count). */
+static uint32_t frag_bytes_from(size_t len, uint16_t frag_count, uint16_t from_frag) {
+    if (from_frag >= frag_count) return 0;
+    if (frag_count <= 1) return (uint32_t)len;
+    size_t before = (size_t)from_frag * NL_FRAGMENT_CHUNK_SIZE;
+    if (before > len) before = len;
+    return (uint32_t)(len - before);
+}
+
+static uint16_t frag_chunk_len(size_t len, uint16_t frag_count, uint16_t i) {
+    if (frag_count <= 1) return (uint16_t)len;
+    size_t off = (size_t)i * NL_FRAGMENT_CHUNK_SIZE;
+    size_t rem = len - off;
+    if (rem > NL_FRAGMENT_CHUNK_SIZE) rem = NL_FRAGMENT_CHUNK_SIZE;
+    return (uint16_t)rem;
+}
+
+/* How many fragments from a->frag_start may leave now? 0 = fully blocked.
+ * Combines: congestion window + send-ring room (reliable only), the peer's
+ * receive window (both modes -- see the rwnd rule on nl_connection_t), and
+ * the sender rate limiter. Never consumes rate tokens: do_channel_send
+ * consumes only what actually gets emitted, so a failed check can't steal
+ * budget. */
+static uint16_t send_window_frags(nl_connection_t *conn, const send_attempt_t *a) {
+    if (a->frag_start >= a->frag_count) return 0;
+    uint32_t maxf = (uint32_t)(a->frag_count - a->frag_start);
+
+    if (is_reliable_mode(a->delivery)) {
+        uint32_t in_flight = reliable_in_flight(conn);
+        if (in_flight >= conn->cwnd) return 0;
+        uint32_t room = conn->cwnd - in_flight;
+        if (room > NL_SEQ_RING_SIZE) room = NL_SEQ_RING_SIZE;
+        nl_lane_t *lane = &conn->channels[a->channel].lanes[a->delivery];
+        if (lane->send_ring_init) {
+            if (lane->send_ring.unacked_count >= NL_SEQ_RING_SIZE) return 0;
+            uint32_t ring_room = (uint32_t)NL_SEQ_RING_SIZE - lane->send_ring.unacked_count;
+            if (room > ring_room) room = ring_room;
+        }
+        if (maxf > room) maxf = room;
     }
-    if ((uint32_t)a->len > (uint32_t)conn->peer_rwnd) return false;
+
+    /* Peer receive window: `avail` is the last advertisement minus
+     * everything we've sent since it (which the peer hasn't accounted
+     * for yet). A message whose remaining bytes exceed the window:
+     *   - could fit in a full window (rem <= capacity) -> wait, so a
+     *     mid-message stall never strands reassembly of something the
+     *     peer could take whole;
+     *   - can never fit (rem > capacity) -> stream the fragments that
+     *     fit while avail > 0; the continuation parks for the rest. */
+    uint32_t rem_bytes = frag_bytes_from(a->len, a->frag_count, a->frag_start);
+    uint32_t avail = ((uint32_t)conn->peer_rwnd > conn->peer_window_in_flight)
+                         ? (uint32_t)conn->peer_rwnd - conn->peer_window_in_flight
+                         : 0;
+    if (rem_bytes > avail) {
+        if (rem_bytes <= conn->peer_rwnd_capacity) return 0;
+        if (avail == 0) return 0;
+        uint16_t fit = 0;
+        uint32_t bytes = 0;
+        for (uint16_t i = a->frag_start; i < a->frag_count; i++) {
+            uint16_t c = frag_chunk_len(a->len, a->frag_count, i);
+            if (bytes + c > avail) break;
+            bytes += c;
+            fit++;
+        }
+        if (fit == 0) return 0;
+        if (maxf > fit) maxf = fit;
+    }
+
+    /* Rate limiter: an unfragmented message needs its full length in
+     * tokens (so 20 tokens still blocks a 40-byte send, exactly as
+     * before); a fragmented one goes fragment-by-fragment from the
+     * current start so a large message makes progress as tokens refill. */
     if (conn->rate_bps != 0) {
         rate_refill(conn, a->now_ms);
-        if (conn->rate_tokens < (double)a->len) return false;
+        uint32_t rate_frags = 0;
+        uint32_t spent = 0;
+        for (uint16_t i = a->frag_start; i < a->frag_count; i++) {
+            uint16_t c = frag_chunk_len(a->len, a->frag_count, i);
+            if (conn->rate_tokens < (double)(spent + c)) break;
+            spent += c;
+            rate_frags++;
+        }
+        if (rate_frags == 0) return 0;
+        if (maxf > rate_frags) maxf = rate_frags;
     }
-    return true;
+
+    return (uint16_t)maxf;
 }
 
 static void rate_consume(nl_connection_t *conn, size_t bytes) {
     if (conn->rate_bps != 0) conn->rate_tokens -= (double)bytes;
 }
 
-static nl_result_t do_channel_send(nl_connection_t *conn, const send_attempt_t *a) {
-    rate_consume(conn, a->len);
+/* Emit up to `max_frags` fragments starting at a->frag_start and account
+ * rate/peer-window usage for what actually went out. */
+static send_outcome_t do_channel_send(nl_connection_t *conn, const send_attempt_t *a,
+                                      uint16_t max_frags) {
+    send_outcome_t out = { NL_ERR_INTERNAL, 0, a->message_id, 0 };
     emit_ctx_t ectx = { conn, a->cb };
     uint16_t rwnd = nl_connection_adv_window(conn);
-    nl_result_t r = nl_channel_send(&conn->channels[a->channel], a->now_ms, a->channel, a->delivery,
-                                     a->data, a->len, rwnd, on_channel_emit, &ectx);
-    if (r == NL_OK) conn->last_send_time_ms = a->now_ms;
-    return r;
+    uint16_t frag_count = 0;
+    out.result = nl_channel_send_range(&conn->channels[a->channel], a->now_ms, a->channel,
+                                       a->delivery, a->data, a->len, rwnd,
+                                       a->frag_start, max_frags, &out.message_id,
+                                       on_channel_emit, &ectx, &out.sent_frags, &frag_count);
+    if (out.result != NL_OK) return out;
+    out.bytes_sent = frag_bytes_from(a->len, a->frag_count, a->frag_start)
+                     - frag_bytes_from(a->len, a->frag_count,
+                                       (uint16_t)(a->frag_start + out.sent_frags));
+    rate_consume(conn, out.bytes_sent);
+    conn->peer_window_in_flight += out.bytes_sent;
+    conn->last_send_time_ms = a->now_ms;
+    return out;
 }
 
 /* Called with the lock held after any event that may have opened budget
  * (acks, tick/refill, peer rwnd update). Only the head is tried so
  * priority order is never violated by a lower-priority tail sneaking past
- * a blocked head. */
+ * a blocked head. A partially-sent head becomes a continuation and stays
+ * at the head until its last fragment goes out. */
 static void flush_deferred(nl_connection_t *conn, uint64_t now_ms, const nl_conn_callbacks_t *cb) {
     while (conn->deferred_head) {
         nl_deferred_msg_t *head = conn->deferred_head;
@@ -339,19 +455,36 @@ static void flush_deferred(nl_connection_t *conn, uint64_t now_ms, const nl_conn
             .len = head->len,
             .now_ms = now_ms,
             .cb = cb,
+            .frag_count = frag_count_for(head->len),
+            .frag_start = head->frag_start,
+            .message_id = head->message_id,
         };
-        if (!send_window_open(conn, &a)) break;
-        rate_consume(conn, head->len);
-        emit_ctx_t ectx = { conn, cb };
-        uint16_t rwnd = nl_connection_adv_window(conn);
-        nl_result_t r = nl_channel_send(&conn->channels[head->channel], now_ms, head->channel,
-                                         (nl_delivery_t)head->delivery, head->data, head->len,
-                                         rwnd, on_channel_emit, &ectx);
-        if (r != NL_OK) break; /* channel-level reject: leave head parked */
-        conn->last_send_time_ms = now_ms;
-        deferred_pop(conn);
-        free(head->data);
-        free(head);
+        if (a.frag_count == 0 || a.frag_start >= a.frag_count) {
+            /* Corrupt head (or a continuation whose range already went
+             * out): drop it rather than spin on it every flush. */
+            deferred_pop(conn);
+            free(head->data);
+            free(head);
+            continue;
+        }
+        uint16_t maxf = send_window_frags(conn, &a);
+        if (maxf == 0) break;
+        send_outcome_t out = do_channel_send(conn, &a, maxf);
+        if (out.result != NL_OK) break; /* channel-level reject: leave head parked */
+        if (out.sent_frags == 0) break; /* ring refused (unacked target slot): wait for acks */
+        if ((uint32_t)a.frag_start + out.sent_frags >= a.frag_count) {
+            deferred_pop(conn);
+            free(head->data);
+            free(head);
+            continue; /* fully sent: try the next head */
+        }
+        /* Partial: park the remainder as the continuation head and stop
+         * -- the window/rate that capped this send applies to the next
+         * fragment too. */
+        head->frag_start = (uint16_t)(a.frag_start + out.sent_frags);
+        head->message_id = out.message_id;
+        head->continuation = true;
+        break;
     }
 }
 
@@ -372,12 +505,19 @@ nl_result_t nl_connection_send(nl_connection_t *conn, uint8_t channel, nl_delive
     send_attempt_t a = {
         .conn = conn, .channel = channel, .delivery = delivery,
         .data = data, .len = len, .now_ms = now_ms, .cb = cb,
+        .frag_count = frag_count_for(len), .frag_start = 0, .message_id = 0,
     };
+    if (a.frag_count == 0) {
+        pthread_mutex_unlock(&conn->lock);
+        return NL_ERR_MESSAGE_TOO_LARGE;
+    }
 
     /* Anything already parked must go out first: always enqueue behind it
-     * so priority/FIFO order is never violated by a later immediate send. */
+     * so priority/FIFO order (and continuation-head integrity) is never
+     * violated by a later immediate send. */
     if (conn->deferred_head != NULL) {
-        if (!deferred_push(conn, channel, delivery, priority, data, len)) {
+        if (!deferred_push(conn, channel, delivery, priority, data, len,
+                           /*continuation*/ false, 0, 0)) {
             pthread_mutex_unlock(&conn->lock);
             return NL_ERR_QUEUE_FULL;
         }
@@ -386,19 +526,36 @@ nl_result_t nl_connection_send(nl_connection_t *conn, uint8_t channel, nl_delive
         return NL_OK;
     }
 
-    if (send_window_open(conn, &a)) {
-        nl_result_t r = do_channel_send(conn, &a);
-        if (r == NL_OK) {
+    uint16_t maxf = send_window_frags(conn, &a);
+    if (maxf > 0) {
+        /* A partial send needs somewhere to park its tail; verify queue
+         * room up front rather than emit fragments we can't continue. */
+        if (maxf < a.frag_count &&
+            (conn->deferred_count >= NL_DEFERRED_MAX_MSGS ||
+             conn->deferred_bytes + len > NL_DEFERRED_MAX_BYTES)) {
             pthread_mutex_unlock(&conn->lock);
-            return NL_OK;
+            return NL_ERR_QUEUE_FULL;
         }
-        /* Permanent channel-level failure (bad size etc.) -- do not defer. */
+        send_outcome_t out = do_channel_send(conn, &a, maxf);
+        if (out.result != NL_OK) {
+            /* Permanent channel-level failure (bad size etc.) -- do not defer. */
+            pthread_mutex_unlock(&conn->lock);
+            return out.result;
+        }
+        if (out.sent_frags < a.frag_count) {
+            /* Partial: park the continuation at the (empty) head. Room
+             * was verified above, so this cannot fail. */
+            deferred_push(conn, channel, delivery, priority, data, len,
+                          /*continuation*/ true,
+                          (uint16_t)(a.frag_start + out.sent_frags), out.message_id);
+        }
         pthread_mutex_unlock(&conn->lock);
-        return r;
+        return NL_OK;
     }
 
     /* Window/rate closed: park until budget opens (tick/ack/rwnd update). */
-    if (!deferred_push(conn, channel, delivery, priority, data, len)) {
+    if (!deferred_push(conn, channel, delivery, priority, data, len,
+                       /*continuation*/ false, 0, 0)) {
         pthread_mutex_unlock(&conn->lock);
         return NL_ERR_QUEUE_FULL;
     }
@@ -493,14 +650,15 @@ nl_result_t nl_connection_on_packet(nl_connection_t *conn, uint8_t type,
             deliver_ctx_t dctx = { conn->id, cb, conn };
             /* Route by the channel_id embedded in the plaintext (byte 0
              * of the DATA payload) into that channel's state. */
-            if (ct_len < 1) { result = NL_ERR_PROTOCOL_MISMATCH; break; }
+            if (ct_len < NL_DATA_HEADER_SIZE) { result = NL_ERR_PROTOCOL_MISMATCH; break; }
             uint8_t channel_id = plaintext[0];
             if (channel_id >= conn->channel_count) { result = NL_ERR_CHANNEL_OUT_OF_RANGE; break; }
+            if (plaintext[1] >= NL_LANES_PER_CHANNEL) break; /* malformed delivery: drop */
             retransmit_ctx_t rctx = { conn, cb };
             bool has_rtt_sample = false;
             uint32_t rtt_sample_ms = 0;
             uint32_t newly_acked = 0;
-            uint16_t peer_rwnd = conn->peer_rwnd;
+            uint16_t peer_rwnd = 0; /* header pre-checked above: always written */
             uint16_t adv = nl_connection_adv_window(conn);
 
             nl_channel_on_receive(&conn->channels[channel_id], now_ms, plaintext, (uint16_t)ct_len,
@@ -508,7 +666,44 @@ nl_result_t nl_connection_on_packet(nl_connection_t *conn, uint8_t type,
                                    on_channel_retransmit, &rctx,
                                    &has_rtt_sample, &rtt_sample_ms,
                                    &newly_acked, &peer_rwnd);
+            /* Fresh rwnd advertisement: update capacity, reset the
+             * in-flight tally (this value reflects everything received
+             * up to the peer's send time). */
+            if (peer_rwnd > conn->peer_rwnd_capacity) conn->peer_rwnd_capacity = peer_rwnd;
             conn->peer_rwnd = peer_rwnd;
+            conn->peer_window_in_flight = 0;
+            total_newly_acked += newly_acked;
+            if (has_rtt_sample) update_rtt(conn, rtt_sample_ms);
+            if (conn->stats.retransmits > retx_before) fast_loss = true;
+            break;
+        }
+        case NL_PKT_ACK: {
+            /* Standalone ack for lanes with no reverse DATA to piggyback
+             * on (one-way traffic). Same effects as a piggybacked ack. */
+            if (ct_len < NL_ACK_PAYLOAD_SIZE) { result = NL_ERR_PROTOCOL_MISMATCH; break; }
+            uint8_t channel_id = plaintext[0];
+            uint8_t delivery_raw = plaintext[1];
+            if (channel_id >= conn->channel_count) { result = NL_ERR_CHANNEL_OUT_OF_RANGE; break; }
+            if (delivery_raw != NL_RELIABLE_UNORDERED && delivery_raw != NL_RELIABLE_ORDERED) {
+                result = NL_ERR_PROTOCOL_MISMATCH;
+                break;
+            }
+            uint16_t ack = nl_get_u16(plaintext + 2);
+            uint32_t ack_bits = nl_get_u32(plaintext + 4);
+            uint16_t peer_rwnd = nl_get_u16(plaintext + 8);
+            if (peer_rwnd > conn->peer_rwnd_capacity) conn->peer_rwnd_capacity = peer_rwnd;
+            conn->peer_rwnd = peer_rwnd;
+            conn->peer_window_in_flight = 0;
+
+            retransmit_ctx_t rctx = { conn, cb };
+            bool has_rtt_sample = false;
+            uint32_t rtt_sample_ms = 0;
+            uint32_t newly_acked = 0;
+            uint16_t adv = nl_connection_adv_window(conn);
+            nl_channel_apply_ack(&conn->channels[channel_id], now_ms, channel_id,
+                                 (nl_delivery_t)delivery_raw, ack, ack_bits, adv,
+                                 on_channel_retransmit, &rctx,
+                                 &has_rtt_sample, &rtt_sample_ms, &newly_acked);
             total_newly_acked += newly_acked;
             if (has_rtt_sample) update_rtt(conn, rtt_sample_ms);
             if (conn->stats.retransmits > retx_before) fast_loss = true;
@@ -554,6 +749,36 @@ nl_result_t nl_connection_on_packet(nl_connection_t *conn, uint8_t type,
     }
 
     return result;
+}
+
+/* Caller must hold conn->lock. Emits one NL_PKT_ACK per lane that has
+ * received reliable data since its last piggybacked/standalone ack. */
+static void flush_acks_locked(nl_connection_t *conn, const nl_conn_callbacks_t *cb) {
+    uint16_t adv = nl_connection_adv_window(conn);
+    for (uint8_t c = 0; c < conn->channel_count; c++) {
+        for (int d = NL_RELIABLE_UNORDERED; d <= NL_RELIABLE_ORDERED; d++) {
+            nl_lane_t *lane = &conn->channels[c].lanes[d];
+            if (!lane->ack_dirty || !lane->recv_dedupe_init) continue;
+            uint16_t ack;
+            uint32_t ack_bits;
+            nl_recv_dedupe_build_ack(&lane->recv_dedupe, &ack, &ack_bits);
+            uint8_t payload[NL_ACK_PAYLOAD_SIZE];
+            payload[0] = c;
+            payload[1] = (uint8_t)d;
+            nl_put_u16(payload + 2, ack);
+            nl_put_u32(payload + 4, ack_bits);
+            nl_put_u16(payload + 8, adv);
+            encrypt_and_emit(conn, NL_PKT_ACK, payload, NL_ACK_PAYLOAD_SIZE, /*is_retransmit*/ false, cb);
+            lane->ack_dirty = false;
+        }
+    }
+}
+
+void nl_connection_flush_acks(nl_connection_t *conn, uint64_t now_ms, const nl_conn_callbacks_t *cb) {
+    (void)now_ms;
+    pthread_mutex_lock(&conn->lock);
+    if (conn->state == NL_CONN_CONNECTED) flush_acks_locked(conn, cb);
+    pthread_mutex_unlock(&conn->lock);
 }
 
 void nl_connection_tick(nl_connection_t *conn, uint64_t now_ms, const nl_conn_callbacks_t *cb) {
@@ -607,6 +832,12 @@ void nl_connection_tick(nl_connection_t *conn, uint64_t now_ms, const nl_conn_ca
         rate_refill(conn, now_ms);
         flush_deferred(conn, now_ms, cb);
     }
+
+    /* Safety-net ack flush: normally the endpoint flushes right after
+     * draining the socket, but a tick-driven pass covers ticks that
+     * happen without new inbound traffic (and the unit-test harness,
+     * which has no endpoint). */
+    flush_acks_locked(conn, cb);
 
     /* Idle keepalive so a channel with no application traffic still gets
      * timely acks and RTT samples, and the peer's idle timer keeps resetting. */

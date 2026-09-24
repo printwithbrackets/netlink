@@ -99,6 +99,15 @@ mod raw {
             data: *const u8,
             len: usize,
         ) -> c_int;
+        pub fn nl_send_ex(
+            ep: *mut nl_endpoint_t,
+            peer: u64,
+            channel: u8,
+            delivery: c_int,
+            data: *const u8,
+            len: usize,
+            priority: u8,
+        ) -> c_int;
         pub fn nl_poll_event(ep: *mut nl_endpoint_t, out: *mut nl_event_t, timeout_ms: c_int) -> bool;
 
         pub fn nl_discovery_enable(ep: *mut nl_endpoint_t, discovery_port: u16) -> c_int;
@@ -106,6 +115,22 @@ mod raw {
 
         pub fn nl_peer_rtt_ms(ep: *mut nl_endpoint_t, peer: u64) -> u32;
         pub fn nl_peer_count(ep: *mut nl_endpoint_t) -> u32;
+        pub fn nl_peer_stats(ep: *mut nl_endpoint_t, peer: u64, out: *mut nl_peer_stats_t) -> bool;
+        pub fn nl_peer_capabilities(ep: *mut nl_endpoint_t, peer: u64, out: *mut u32) -> bool;
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    pub struct nl_peer_stats_t {
+        pub packets_sent: u64,
+        pub packets_received: u64,
+        pub bytes_sent: u64,
+        pub bytes_received: u64,
+        pub retransmits: u64,
+        pub duplicates_received: u64,
+        pub rtt_ms: u32,
+        pub rtt_var_ms: u32,
+        pub rto_ms: u32,
     }
 }
 
@@ -144,6 +169,35 @@ impl EventType {
 
 /// A peer connection identifier, valid within the endpoint that produced it.
 pub type PeerId = u64;
+
+/// Send priorities for `send_ex` (mirrors `NL_PRIORITY_*`).
+pub mod priority {
+    pub const LOW: u8 = 0;
+    pub const NORMAL: u8 = 64;
+    pub const HIGH: u8 = 128;
+    pub const CRITICAL: u8 = 192;
+}
+
+/// Capability bits negotiated in the handshake (mirrors `NL_CAP_*`).
+pub mod caps {
+    pub const FLOW_CONTROL: u32 = 0x0000_0001;
+    pub const PRIORITY: u32 = 0x0000_0002;
+    pub const RATE_LIMIT: u32 = 0x0000_0004;
+}
+
+/// Snapshot of per-peer counters and RTT estimates (`nl_peer_stats`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PeerStats {
+    pub packets_sent: u64,
+    pub packets_received: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub retransmits: u64,
+    pub duplicates_received: u64,
+    pub rtt_ms: u32,
+    pub rtt_var_ms: u32,
+    pub rto_ms: u32,
+}
 
 /// An error returned by the underlying library (a non-OK `nl_result_t`).
 #[derive(Debug, Clone)]
@@ -307,6 +361,22 @@ impl Endpoint {
         check(res)
     }
 
+    /// Like [`send`](Self::send), with an explicit priority (0..255; see
+    /// [`priority`]). When the send window is closed, higher-priority
+    /// messages flush first as budget opens.
+    pub fn send_ex(
+        &self,
+        peer: PeerId,
+        channel: u8,
+        delivery: Delivery,
+        data: &[u8],
+        priority: u8,
+    ) -> Result<(), NetLinkError> {
+        let ptr = if data.is_empty() { std::ptr::null() } else { data.as_ptr() };
+        let res = unsafe { raw::nl_send_ex(self.handle, peer, channel, delivery as c_int, ptr, data.len(), priority) };
+        check(res)
+    }
+
     /// Wait up to `timeout` for the next event. A zero timeout returns
     /// immediately if nothing is queued.
     pub fn poll_event(&self, timeout: Duration) -> Option<Event> {
@@ -331,6 +401,35 @@ impl Endpoint {
 
     pub fn peer_count(&self) -> u32 {
         unsafe { raw::nl_peer_count(self.handle) }
+    }
+
+    /// Snapshot of per-peer counters and RTT estimates. Returns `None`
+    /// if `peer` is not a currently-known connection.
+    pub fn peer_stats(&self, peer: PeerId) -> Option<PeerStats> {
+        let mut raw_stats = unsafe { std::mem::zeroed::<raw::nl_peer_stats_t>() };
+        let ok = unsafe { raw::nl_peer_stats(self.handle, peer, &mut raw_stats) };
+        if !ok {
+            return None;
+        }
+        Some(PeerStats {
+            packets_sent: raw_stats.packets_sent,
+            packets_received: raw_stats.packets_received,
+            bytes_sent: raw_stats.bytes_sent,
+            bytes_received: raw_stats.bytes_received,
+            retransmits: raw_stats.retransmits,
+            duplicates_received: raw_stats.duplicates_received,
+            rtt_ms: raw_stats.rtt_ms,
+            rtt_var_ms: raw_stats.rtt_var_ms,
+            rto_ms: raw_stats.rto_ms,
+        })
+    }
+
+    /// Negotiated `NL_CAP_*` bitmask with this peer. Returns `None` if
+    /// `peer` is not a currently-known connection.
+    pub fn peer_capabilities(&self, peer: PeerId) -> Option<u32> {
+        let mut caps: u32 = 0;
+        let ok = unsafe { raw::nl_peer_capabilities(self.handle, peer, &mut caps) };
+        if ok { Some(caps) } else { None }
     }
 }
 

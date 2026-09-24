@@ -90,9 +90,6 @@ static void sim_network_send(sim_network_t *net, const uint8_t *data, uint16_t l
  * ready (simulating reordering), to `receiver`. */
 static void sim_network_deliver_ready(sim_network_t *net, uint32_t now_tick, nl_channel_t *receiver,
                                        nl_channel_deliver_fn deliver, void *deliver_ctx) {
-    /* Collect ready indices, then shuffle-deliver by repeatedly picking a
-     * random one among the remaining ready set -- simple and sufficient
-     * reordering for this test's purposes. */
     int ready_idx[SIM_MAX_INFLIGHT];
     int ready_count = 0;
     for (int i = 0; i < net->count; i++) {
@@ -108,11 +105,10 @@ static void sim_network_deliver_ready(sim_network_t *net, uint32_t now_tick, nl_
 
         sim_packet_t *p = &net->packets[idx];
         p->active = false;
-        nl_channel_on_receive(receiver, now_tick, p->data, p->len, NL_RECV_WINDOW_DEFAULT, deliver, deliver_ctx, NULL, NULL, NULL, NULL, NULL, NULL);
+        nl_channel_on_receive(receiver, now_tick, p->data, p->len, NL_RECV_WINDOW_DEFAULT,
+                              deliver, deliver_ctx, NULL, NULL, NULL, NULL, NULL, NULL);
     }
 
-    /* Compact out inactive entries occasionally to bound memory over a
-     * long run (not performance-critical for a test). */
     int w = 0;
     for (int i = 0; i < net->count; i++) {
         if (net->packets[i].active) net->packets[w++] = net->packets[i];
@@ -186,6 +182,27 @@ static void run_reliability_stress_test(const char *name, uint32_t seed, int mes
         }
 
         sim_network_deliver_ready(&net, now_tick, &receiver, collect_deliver, &log);
+
+        /* Hand the receiver's cumulative ack state back to the sender --
+         * the channel layer only carries acks piggybacked on outgoing
+         * DATA, and this one-way sim has no reverse application traffic.
+         * Stand-in for reverse-path DATA/ACK packets: subject to the same
+         * loss as everything else. If an ack batch is "lost", the next
+         * retransmit sets ack_dirty again (even for duplicates) and a
+         * later batch is cumulative, so nothing is permanently stranded.
+         */
+        nl_lane_t *rlane = &receiver.lanes[NL_RELIABLE_ORDERED];
+        if (rlane->ack_dirty && rlane->recv_dedupe_init) {
+            if (!rng_chance(net.loss_percent)) {
+                uint16_t ack;
+                uint32_t ack_bits;
+                nl_recv_dedupe_build_ack(&rlane->recv_dedupe, &ack, &ack_bits);
+                nl_channel_apply_ack(&sender, now_tick, 0, NL_RELIABLE_ORDERED,
+                                     ack, ack_bits, NL_RECV_WINDOW_DEFAULT,
+                                     emit_to_network, &ectx, NULL, NULL, NULL);
+            }
+            rlane->ack_dirty = false;
+        }
 
         /* Retransmission scan, using a fixed small RTO in virtual ticks. */
         bool give_up = false;

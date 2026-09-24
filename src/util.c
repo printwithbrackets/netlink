@@ -30,6 +30,7 @@ const char *nl_error_string(nl_result_t code) {
 }
 
 void nl_config_default(nl_config_t *cfg) {
+    if (!cfg) return;
     memset(cfg, 0, sizeof(*cfg));
     cfg->transport = NL_TRANSPORT_UDP;
     cfg->family = NL_AF_UNSPEC;

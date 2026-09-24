@@ -27,6 +27,11 @@
 
 #define NL_LANES_PER_CHANNEL 4 /* one per nl_delivery_t value */
 
+/* Cap on per-slot exponential retransmit backoff: rto << min(retry,4),
+ * clamped here so a long loss streak retries at ~this interval instead of
+ * growing without bound (and so tests can jump time deterministically). */
+#define NL_MAX_BACKOFF_MS 10000
+
 typedef struct {
     nl_delivery_t delivery;
     bool          in_use;
@@ -40,6 +45,11 @@ typedef struct {
     /* receive side */
     nl_recv_dedupe_t recv_dedupe; /* RELIABLE_* only: dedupe + ack bitfield source */
     bool          recv_dedupe_init;
+    /* Set when a reliable packet (even a duplicate -- the sender still
+     * needs the ack) has been received and no outgoing packet on this
+     * lane has piggybacked the ack since. connection.c flushes these as
+     * standalone NL_PKT_ACK packets when nothing is going the other way. */
+    bool          ack_dirty;
     nl_reorder_ring_t reorder_ring; /* RELIABLE_ORDERED only */
     bool          reorder_ring_init;
     uint16_t      seq_highest_seen;      /* UNRELIABLE_SEQUENCED only */
@@ -81,6 +91,33 @@ typedef void (*nl_channel_emit_fn)(void *ctx, const uint8_t *wire_payload, uint1
 nl_result_t nl_channel_send(nl_channel_t *chan, uint64_t now_ms, uint8_t channel_id, nl_delivery_t delivery,
                              const uint8_t *data, size_t len, uint16_t local_rwnd,
                              nl_channel_emit_fn emit, void *ctx);
+
+/* Send fragments [start_frag, start_frag+max_frags) of `data`/`len` on
+ * this channel -- the partial-send primitive behind connection.c's
+ * window gating. `start_frag` 0 begins (and, for a fragmented message,
+ * allocates) the message id; a continuation pass passes the id from the
+ * previous call via *io_message_id with start_frag > 0. max_frags of 0
+ * means "as many as remain". On return *out_sent_frags holds how many
+ * fragments actually went out (may be < requested if the send ring ran
+ * out of room mid-range), *out_message_id the message id used, and
+ * *out_frag_count the message's total fragment count. */
+nl_result_t nl_channel_send_range(nl_channel_t *chan, uint64_t now_ms, uint8_t channel_id,
+                                  nl_delivery_t delivery, const uint8_t *data, size_t len,
+                                  uint16_t local_rwnd, uint16_t start_frag, uint16_t max_frags,
+                                  uint16_t *io_message_id, nl_channel_emit_fn emit, void *ctx,
+                                  uint16_t *out_sent_frags, uint16_t *out_frag_count);
+
+/* Apply an (ack, ack_bits) pair from a standalone NL_PKT_ACK (or any
+ * other non-DATA source) to this channel's send side: marks newly-acked
+ * slots, feeds the RTT estimator, and fires fast retransmit -- the same
+ * work nl_channel_on_receive does for the piggybacked copy on DATA.
+ * `delivery` must be a reliable lane. Outputs match on_receive's. */
+void nl_channel_apply_ack(nl_channel_t *chan, uint64_t now_ms, uint8_t channel_id,
+                          nl_delivery_t delivery, uint16_t ack, uint32_t ack_bits,
+                          uint16_t local_rwnd,
+                          nl_channel_retransmit_fn retransmit, void *retransmit_ctx,
+                          bool *out_has_rtt_sample, uint32_t *out_rtt_sample_ms,
+                          uint32_t *out_newly_acked);
 
 /* Feed one received (already-decrypted) wire DATA payload in. Any
  * piggybacked ack/ack_bits are applied to this lane's send ring

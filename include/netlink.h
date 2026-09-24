@@ -50,8 +50,11 @@ extern "C" {
  *
  * v2: DATA cleartext headers carry a u16 receive window (flow control);
  * CONNECT_REQUEST / CONNECT_CHALLENGE carry a u32 capability bitmask
- * (negotiated as the bitwise AND of both peers' advertised sets). */
-#define NL_PROTOCOL_VERSION 2
+ * (negotiated as the bitwise AND of both peers' advertised sets).
+ * v3: new encrypted NL_PKT_ACK packet (reliable receivers send standalone
+ * acks when no reverse DATA exists to piggyback them on); discovery probe
+ * nonces are random rather than a counter. */
+#define NL_PROTOCOL_VERSION 3
 
 /* ----------------------------------------------------------------------- */
 /* Capabilities (exchanged during the handshake; negotiated = AND of both)  */
@@ -68,7 +71,7 @@ extern "C" {
 /* Bit 2: peer applies a sender-side rate limit when configured (reserved
  * for cross-implementation signalling; enforcement is always local). */
 #define NL_CAP_RATE_LIMIT    0x00000004u
-/* Default advertised set. NL_CAP_FLOW_CONTROL is always forced on for v2. */
+/* Default advertised set. NL_CAP_FLOW_CONTROL is always forced on. */
 #define NL_CAP_DEFAULT (NL_CAP_FLOW_CONTROL | NL_CAP_PRIORITY | NL_CAP_RATE_LIMIT)
 
 /* ----------------------------------------------------------------------- */
@@ -145,7 +148,8 @@ typedef enum {
 /* ----------------------------------------------------------------------- */
 
 typedef enum {
-    NL_AF_UNSPEC = 0, /* resolve automatically (prefers IPv6 if available) */
+    NL_AF_UNSPEC = 0, /* unspecified: getaddrinfo picks (IPv4 for the
+                        * default client socket, either family for bind) */
     NL_AF_INET   = 4,
     NL_AF_INET6  = 6,
 } nl_af_t;
@@ -204,7 +208,7 @@ typedef struct {
      * (32768), clamped to 65535 to fit the u16 wire field. */
     uint32_t       recv_window_bytes;
     /* Capability bits advertised in the handshake (0 = NL_CAP_DEFAULT).
-     * NL_CAP_FLOW_CONTROL is always forced on under protocol v2. */
+     * NL_CAP_FLOW_CONTROL is always forced on. */
     uint32_t       capabilities;
 } nl_config_t;
 
@@ -216,6 +220,12 @@ NL_API void nl_config_default(nl_config_t *cfg);
 
 typedef enum {
     NL_EVENT_NONE           = 0,
+    /* Fired once the handshake is confirmed for this endpoint: on the
+     * server when CONNECT_RESPONSE completes (before the client has
+     * necessarily seen CONNECT_ACCEPTED), on the client when
+     * CONNECT_ACCEPTED decrypts. The two sides can therefore observe
+     * CONNECTED at slightly different instants; treat it as "this peer
+     * exists and keys are live", not a barrier both sides hit together. */
     NL_EVENT_CONNECTED      = 1, /* peer field valid */
     NL_EVENT_DISCONNECTED   = 2, /* peer field valid, disconnect_reason valid */
     NL_EVENT_DATA           = 3, /* peer, channel, data, data_len valid */

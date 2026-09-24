@@ -42,12 +42,20 @@ typedef struct {
 
 /* One application message parked because the send window (congestion,
  * peer receive window) or the rate limiter wouldn't let it out yet.
- * Linked in descending priority order (stable FIFO within a priority). */
+ * Linked in descending priority order (stable FIFO within a priority).
+ * A message partially sent under window pressure parks here as a
+ * continuation: frag_start is the next fragment to emit, message_id the
+ * already-allocated fragment message id, and a continuation head is
+ * never displaced by later pushes (RELIABLE_ORDERED would otherwise see
+ * fragments interleave with other messages on the lane). */
 typedef struct nl_deferred_msg {
     uint8_t channel;
     uint8_t delivery; /* nl_delivery_t */
     uint8_t priority;
-    uint16_t len;
+    bool    continuation;
+    uint16_t frag_start;
+    uint16_t message_id;
+    uint32_t len;
     uint8_t *data;
     struct nl_deferred_msg *next;
 } nl_deferred_msg_t;
@@ -57,7 +65,10 @@ typedef struct nl_deferred_msg {
 #define NL_CWND_MAX_PACKETS 256       /* matches send-ring depth; above this
                                        * the ring itself becomes the limit */
 #define NL_DEFERRED_MAX_MSGS 128
-#define NL_DEFERRED_MAX_BYTES (64 * 1024)
+/* One max-size message must always be parkable (a 256 KiB send that only
+ * partially fit the window is a continuation, not an error), plus headroom
+ * for a burst of ordinary messages behind it. */
+#define NL_DEFERRED_MAX_BYTES (NL_MAX_MESSAGE_SIZE + 64 * 1024)
 /* NL_RECV_WINDOW_DEFAULT lives in protocol.h (shared with channel tests). */
 #define NL_RECV_WINDOW_MAX 65535u
 
@@ -125,8 +136,21 @@ typedef struct nl_connection {
     /* Flow control: peer's last advertised receive window (bytes of DATA
      * they'll still buffer), and our own receive-window accounting so we
      * can advertise accurately. peer_rwnd starts at the default until the
-     * first DATA from the peer carries a real value. */
+     * first DATA/ACK from the peer carries a real value.
+     *
+     * peer_rwnd is only valid relative to peer_window_in_flight: the
+     * advertisement describes free space as of when the peer sent it, so
+     * bytes we emit after it eat into that space until the next
+     * advertisement arrives (which resets the in-flight tally).
+     * peer_rwnd_capacity remembers the largest window ever advertised --
+     * a message bigger than that can never fit in one full window and is
+     * streamed fragment-by-fragment as space opens, while a message that
+     * would fit waits for the window to reach fit-size (so a mid-message
+     * stall can't strand reassembly for something the peer *could* take
+     * whole). */
     uint16_t peer_rwnd;
+    uint16_t peer_rwnd_capacity;
+    uint32_t peer_window_in_flight;
     uint32_t recv_window_size;  /* configured local window capacity (bytes) */
     uint32_t recv_window_used;  /* payload bytes currently queued for the app */
 
@@ -182,6 +206,13 @@ nl_result_t nl_connection_on_packet(nl_connection_t *conn, uint8_t type,
 /* Run retransmission scanning, idle-keepalive, and timeout checks. May
  * invoke cb->on_disconnected if the connection has timed out. Thread-safe. */
 void nl_connection_tick(nl_connection_t *conn, uint64_t now_ms, const nl_conn_callbacks_t *cb);
+
+/* Flush any lanes with a pending receive ack (ack_dirty) as standalone
+ * NL_PKT_ACK packets. Called by the endpoint after draining the socket
+ * (so acks for received DATA go out promptly even when the application
+ * has nothing to send) and by nl_connection_tick as a safety net.
+ * Thread-safe. */
+void nl_connection_flush_acks(nl_connection_t *conn, uint64_t now_ms, const nl_conn_callbacks_t *cb);
 
 /* Best-effort graceful close: sends a DISCONNECT notification. */
 void nl_connection_send_disconnect(nl_connection_t *conn, uint64_t now_ms, const nl_conn_callbacks_t *cb);

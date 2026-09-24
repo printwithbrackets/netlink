@@ -24,9 +24,38 @@ static bool is_reliable(nl_delivery_t d) {
 nl_result_t nl_channel_send(nl_channel_t *chan, uint64_t now_ms, uint8_t channel_id, nl_delivery_t delivery,
                              const uint8_t *data, size_t len, uint16_t local_rwnd,
                              nl_channel_emit_fn emit, void *ctx) {
+    uint16_t message_id = 0, sent = 0, frag_count = 0;
+    nl_result_t r = nl_channel_send_range(chan, now_ms, channel_id, delivery, data, len, local_rwnd,
+                                          /*start_frag*/ 0, /*max_frags*/ 0, &message_id,
+                                          emit, ctx, &sent, &frag_count);
+    /* max_frags 0 = unlimited, so a short count here means the send ring
+     * rejected a slot mid-message -- same failure the old monolithic loop
+     * returned NL_ERR_INTERNAL for (after emitting the earlier fragments,
+     * which this preserves). */
+    if (r == NL_OK && sent < frag_count) return NL_ERR_INTERNAL;
+    return r;
+}
+
+nl_result_t nl_channel_send_range(nl_channel_t *chan, uint64_t now_ms, uint8_t channel_id,
+                                  nl_delivery_t delivery, const uint8_t *data, size_t len,
+                                  uint16_t local_rwnd, uint16_t start_frag, uint16_t max_frags,
+                                  uint16_t *io_message_id, nl_channel_emit_fn emit, void *ctx,
+                                  uint16_t *out_sent_frags, uint16_t *out_frag_count) {
     if ((int)delivery < 0 || (int)delivery >= NL_LANES_PER_CHANNEL) return NL_ERR_INVALID_ARGUMENT;
     if (len > 0 && !data) return NL_ERR_INVALID_ARGUMENT;
     if (len > NL_MAX_MESSAGE_SIZE) return NL_ERR_MESSAGE_TOO_LARGE;
+    if (out_sent_frags) *out_sent_frags = 0;
+
+    uint16_t frag_count = 1;
+    if (len > NL_FRAGMENT_CHUNK_SIZE) {
+        frag_count = nl_fragment_count_needed(len);
+        if (frag_count == 0) return NL_ERR_MESSAGE_TOO_LARGE;
+    }
+    if (out_frag_count) *out_frag_count = frag_count;
+    if (start_frag >= frag_count) {
+        /* Continuation already complete (or bogus start): nothing to do. */
+        return NL_OK;
+    }
 
     nl_lane_t *lane = &chan->lanes[delivery];
     lane->delivery = delivery;
@@ -37,15 +66,23 @@ nl_result_t nl_channel_send(nl_channel_t *chan, uint64_t now_ms, uint8_t channel
         lane->send_ring_init = true;
     }
 
-    uint16_t frag_count = 1;
-    if (len > NL_FRAGMENT_CHUNK_SIZE) {
-        frag_count = nl_fragment_count_needed(len);
-        if (frag_count == 0) return NL_ERR_MESSAGE_TOO_LARGE;
-    }
     bool is_fragmented = frag_count > 1;
-    uint16_t message_id = is_fragmented ? lane->next_message_id++ : 0;
+    uint16_t message_id;
+    if (is_fragmented && start_frag == 0) {
+        message_id = lane->next_message_id++;
+    } else if (is_fragmented) {
+        message_id = io_message_id ? *io_message_id : 0;
+    } else {
+        message_id = 0;
+    }
+    if (io_message_id) *io_message_id = message_id;
 
-    for (uint16_t i = 0; i < frag_count; i++) {
+    uint16_t end_frag = frag_count;
+    if (max_frags != 0 && (uint32_t)start_frag + max_frags < end_frag) {
+        end_frag = (uint16_t)(start_frag + max_frags);
+    }
+
+    for (uint16_t i = start_frag; i < end_frag; i++) {
         const uint8_t *chunk_ptr;
         uint16_t chunk_len;
         if (is_fragmented) {
@@ -72,7 +109,12 @@ nl_result_t nl_channel_send(nl_channel_t *chan, uint64_t now_ms, uint8_t channel
         uint16_t seq;
         if (reliable) {
             if (!nl_send_ring_insert(&lane->send_ring, lane_payload, (uint16_t)lp_len, now_ms, &seq)) {
-                return NL_ERR_INTERNAL; /* unreachable: lp_len is always within NL_MAX_PACKET_SIZE */
+                /* Ring full of unacked slots: report the partial send.
+                 * Connection-level gating normally prevents this; the
+                 * refusal path keeps existing live slots intact (a
+                 * previously-sent-but-unacked packet must not be lost). */
+                if (out_sent_frags) *out_sent_frags = i;
+                return NL_OK;
             }
         } else {
             seq = lane->next_sequence++;
@@ -82,6 +124,7 @@ nl_result_t nl_channel_send(nl_channel_t *chan, uint64_t now_ms, uint8_t channel
         uint32_t ack_bits = 0;
         if (reliable && lane->recv_dedupe_init) {
             nl_recv_dedupe_build_ack(&lane->recv_dedupe, &ack, &ack_bits);
+            lane->ack_dirty = false; /* piggybacked on this DATA */
         }
 
         uint8_t wire[NL_MAX_PACKET_SIZE];
@@ -98,6 +141,7 @@ nl_result_t nl_channel_send(nl_channel_t *chan, uint64_t now_ms, uint8_t channel
         emit(ctx, wire, (uint16_t)off);
     }
 
+    if (out_sent_frags) *out_sent_frags = (uint16_t)(end_frag - start_frag);
     return NL_OK;
 }
 
@@ -130,7 +174,10 @@ static void emit_wire_for_slot(nl_lane_t *lane, uint8_t channel_id, uint8_t deli
                                 nl_channel_retransmit_fn retransmit, void *ctx) {
     uint16_t ack = 0;
     uint32_t ack_bits = 0;
-    if (lane->recv_dedupe_init) nl_recv_dedupe_build_ack(&lane->recv_dedupe, &ack, &ack_bits);
+    if (lane->recv_dedupe_init) {
+        nl_recv_dedupe_build_ack(&lane->recv_dedupe, &ack, &ack_bits);
+        lane->ack_dirty = false; /* this retransmit carries a fresh ack */
+    }
 
     uint8_t wire[NL_MAX_PACKET_SIZE];
     size_t off = 0;
@@ -163,6 +210,40 @@ static void fast_retransmit_bridge(void *ctx, uint16_t sequence) {
                        b->retransmit, b->retransmit_ctx);
 }
 
+void nl_channel_apply_ack(nl_channel_t *chan, uint64_t now_ms, uint8_t channel_id,
+                          nl_delivery_t delivery, uint16_t ack, uint32_t ack_bits,
+                          uint16_t local_rwnd,
+                          nl_channel_retransmit_fn retransmit, void *retransmit_ctx,
+                          bool *out_has_rtt_sample, uint32_t *out_rtt_sample_ms,
+                          uint32_t *out_newly_acked) {
+    if (out_has_rtt_sample) *out_has_rtt_sample = false;
+    if (out_newly_acked) *out_newly_acked = 0;
+    if ((int)delivery < 0 || (int)delivery >= NL_LANES_PER_CHANNEL) return;
+    if (!is_reliable(delivery)) return;
+
+    nl_lane_t *lane = &chan->lanes[delivery];
+    if (!lane->send_ring_init) {
+        if (nl_send_ring_init(&lane->send_ring) != 0) return;
+        lane->send_ring_init = true;
+    }
+    bool has_sample = false;
+    uint32_t sample_ms = 0;
+    uint32_t newly = 0;
+    nl_send_ring_ack(&lane->send_ring, ack, ack_bits, now_ms, &has_sample, &sample_ms, &newly);
+    if (out_newly_acked) *out_newly_acked = newly;
+    if (has_sample && out_has_rtt_sample) {
+        *out_has_rtt_sample = true;
+        *out_rtt_sample_ms = sample_ms;
+    }
+
+    if (retransmit) {
+        fast_retransmit_bridge_t bridge = { lane, channel_id, (uint8_t)delivery, local_rwnd,
+                                            retransmit, retransmit_ctx };
+        nl_send_ring_fast_retransmit(&lane->send_ring, ack, ack_bits, NL_FAST_RETRANSMIT_THRESHOLD,
+                                      now_ms, fast_retransmit_bridge, &bridge);
+    }
+}
+
 void nl_channel_on_receive(nl_channel_t *chan, uint64_t now_ms,
                             const uint8_t *wire_payload, uint16_t wire_len,
                             uint16_t local_rwnd,
@@ -193,26 +274,9 @@ void nl_channel_on_receive(nl_channel_t *chan, uint64_t now_ms,
     bool reliable = is_reliable(delivery);
 
     if (reliable) {
-        if (!lane->send_ring_init) {
-            if (nl_send_ring_init(&lane->send_ring) != 0) return;
-            lane->send_ring_init = true;
-        }
-        bool has_sample = false;
-        uint32_t sample_ms = 0;
-        uint32_t newly = 0;
-        nl_send_ring_ack(&lane->send_ring, ack, ack_bits, now_ms, &has_sample, &sample_ms, &newly);
-        if (out_newly_acked) *out_newly_acked = newly;
-        if (has_sample && out_has_rtt_sample) {
-            *out_has_rtt_sample = true;
-            *out_rtt_sample_ms = sample_ms;
-        }
-
-        if (retransmit) {
-            fast_retransmit_bridge_t bridge = { lane, channel_id, (uint8_t)delivery, local_rwnd,
-                                                retransmit, retransmit_ctx };
-            nl_send_ring_fast_retransmit(&lane->send_ring, ack, ack_bits, NL_FAST_RETRANSMIT_THRESHOLD,
-                                          now_ms, fast_retransmit_bridge, &bridge);
-        }
+        nl_channel_apply_ack(chan, now_ms, channel_id, delivery, ack, ack_bits, local_rwnd,
+                             retransmit, retransmit_ctx,
+                             out_has_rtt_sample, out_rtt_sample_ms, out_newly_acked);
     }
 
     uint16_t message_id = 0, frag_index = 0, frag_count = 1;
@@ -280,7 +344,12 @@ void nl_channel_on_receive(nl_channel_t *chan, uint64_t now_ms,
         if (nl_recv_dedupe_init(&lane->recv_dedupe) != 0) return;
         lane->recv_dedupe_init = true;
     }
-    if (!nl_recv_dedupe_insert(&lane->recv_dedupe, seq)) return; /* duplicate */
+    /* Even a duplicate needs an ack: the sender hasn't heard this
+     * sequence was received (that's why it retransmitted). Mark dirty
+     * before the dup check so the flush isn't skipped. */
+    bool is_new_seq = nl_recv_dedupe_insert(&lane->recv_dedupe, seq);
+    lane->ack_dirty = true;
+    if (!is_new_seq) return; /* duplicate payload: ack state updated, delivery skipped */
 
     if (delivery == NL_RELIABLE_UNORDERED) {
         deliver_or_reassemble(lane, now_ms, channel_id, delivery, is_fragment, message_id,
@@ -337,7 +406,13 @@ void nl_channel_tick(nl_channel_t *chan, uint8_t channel_id, uint64_t now_ms, ui
         for (int i = 0; i < NL_SEQ_RING_SIZE; i++) {
             nl_send_slot_t *slot = &ring->slots[i];
             if (!slot->valid || slot->acked) continue;
-            if (now_ms - slot->send_time_ms < rto_ms) continue;
+            /* Exponential backoff: double the base RTO per retry (capped
+             * at NL_MAX_BACKOFF_MS) so repeated loss doesn't retransmit
+             * the same slot on consecutive ticks. */
+            uint32_t shifts = slot->retry_count < 4 ? slot->retry_count : 4;
+            uint64_t backoff = (uint64_t)rto_ms << shifts;
+            if (backoff > NL_MAX_BACKOFF_MS) backoff = NL_MAX_BACKOFF_MS;
+            if (now_ms - slot->send_time_ms < backoff) continue;
 
             if (slot->retry_count >= max_retries) {
                 *out_give_up = true;

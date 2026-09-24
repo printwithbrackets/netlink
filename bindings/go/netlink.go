@@ -64,6 +64,34 @@ const (
 	AFInet6  AddressFamily = 6
 )
 
+// Priority constants mirror NL_PRIORITY_* (nl_send_ex).
+const (
+	PriorityLow      uint8 = 0
+	PriorityNormal   uint8 = 64
+	PriorityHigh     uint8 = 128
+	PriorityCritical uint8 = 192
+)
+
+// Capability bits mirror NL_CAP_*.
+const (
+	CapFlowControl uint32 = 0x00000001
+	CapPriority    uint32 = 0x00000002
+	CapRateLimit   uint32 = 0x00000004
+)
+
+// PeerStats mirrors nl_peer_stats_t.
+type PeerStats struct {
+	PacketsSent         uint64
+	PacketsReceived     uint64
+	BytesSent           uint64
+	BytesReceived       uint64
+	Retransmits         uint64
+	DuplicatesReceived  uint64
+	RTTMs               uint32
+	RTTVarMs            uint32
+	RtoMs               uint32
+}
+
 // PeerID mirrors nl_peer_id_t (a uint64 connection identifier).
 type PeerID uint64
 
@@ -191,6 +219,18 @@ func (e *Endpoint) Send(peer PeerID, channel uint8, delivery Delivery, data []by
 	return newError(res)
 }
 
+// SendEx is like Send with an explicit priority (0..255; see
+// PriorityNormal etc.). When the send window is closed, higher-priority
+// messages flush first as budget opens.
+func (e *Endpoint) SendEx(peer PeerID, channel uint8, delivery Delivery, data []byte, priority uint8) error {
+	var ptr *C.uint8_t
+	if len(data) > 0 {
+		ptr = (*C.uint8_t)(unsafe.Pointer(&data[0]))
+	}
+	res := C.nl_send_ex(e.handle, C.nl_peer_id_t(peer), C.uint8_t(channel), C.nl_delivery_t(delivery), ptr, C.size_t(len(data)), C.uint8_t(priority))
+	return newError(res)
+}
+
 // PollEvent waits up to timeout for the next event. A negative timeout
 // blocks forever; zero returns immediately if nothing is queued.
 func (e *Endpoint) PollEvent(timeout time.Duration) (Event, bool) {
@@ -219,6 +259,35 @@ func (e *Endpoint) PeerRTTMillis(peer PeerID) uint32 {
 // PeerCount returns the number of currently-established connections.
 func (e *Endpoint) PeerCount() uint32 {
 	return uint32(C.nl_peer_count(e.handle))
+}
+
+// PeerStats returns a snapshot of per-peer counters and RTT estimates.
+// The second result is false if peer is not a known connection.
+func (e *Endpoint) PeerStats(peer PeerID) (PeerStats, bool) {
+	var raw C.nl_peer_stats_t
+	ok := C.nl_peer_stats(e.handle, C.nl_peer_id_t(peer), &raw)
+	if !bool(ok) {
+		return PeerStats{}, false
+	}
+	return PeerStats{
+		PacketsSent:        uint64(raw.packets_sent),
+		PacketsReceived:    uint64(raw.packets_received),
+		BytesSent:          uint64(raw.bytes_sent),
+		BytesReceived:      uint64(raw.bytes_received),
+		Retransmits:        uint64(raw.retransmits),
+		DuplicatesReceived: uint64(raw.duplicates_received),
+		RTTMs:              uint32(raw.rtt_ms),
+		RTTVarMs:           uint32(raw.rtt_var_ms),
+		RtoMs:              uint32(raw.rto_ms),
+	}, true
+}
+
+// PeerCapabilities returns the NL_CAP_* bits negotiated with peer during
+// the handshake. The second result is false if peer is unknown.
+func (e *Endpoint) PeerCapabilities(peer PeerID) (uint32, bool) {
+	var caps C.uint32_t
+	ok := C.nl_peer_capabilities(e.handle, C.nl_peer_id_t(peer), &caps)
+	return uint32(caps), bool(ok)
 }
 
 // Close shuts down the endpoint's background threads and frees all

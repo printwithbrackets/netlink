@@ -60,7 +60,9 @@ typedef struct {
 int  nl_send_ring_init(nl_send_ring_t *ring);
 void nl_send_ring_free(nl_send_ring_t *ring);
 /* Insert data at `next_sequence`, return the sequence used, and advance.
- * Returns false if len exceeds the max slot size. */
+ * Returns false if len exceeds the max slot size, or if the target slot
+ * still holds a live unacked packet (never overwrite un-retransmittable
+ * state -- see seqbuf.c). */
 bool nl_send_ring_insert(nl_send_ring_t *ring, const uint8_t *data, uint16_t len,
                           uint64_t now_ms, uint16_t *out_seq);
 /* Mark `sequence` (and, per the ack-bitfield convention, the 32 preceding

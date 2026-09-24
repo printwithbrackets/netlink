@@ -409,17 +409,23 @@ TEST(test_give_up_after_max_retries) {
     capture_t cap = {0};
     nl_channel_send(&sender, 0, 0, NL_RELIABLE_ORDERED, (const uint8_t *)"x", 1, NL_RECV_WINDOW_DEFAULT, capture_emit, &cap);
 
+    /* Retransmit backoff doubles the base RTO per retry (capped at
+     * NL_MAX_BACKOFF_MS), so each retry must jump time by the slot's
+     * current backoff, not a flat rto. */
     bool give_up = false;
     capture_t retrans;
     uint64_t t = 0;
     for (uint32_t i = 0; i < 3; i++) {
-        t += 200;
+        t += (uint64_t)200 << i; /* rto=200, retry_count=i -> backoff = 200 << i */
         memset(&retrans, 0, sizeof(retrans));
         nl_channel_tick(&sender, 0, t, 200, /*max_retries*/ 3, NL_RECV_WINDOW_DEFAULT, capture_emit, &retrans, &give_up);
+        ASSERT_FALSE(give_up);
     }
-    ASSERT_FALSE(give_up); /* exactly at max_retries, still under the "give up" threshold */
+    ASSERT_EQ(retrans.count, 1); /* the third retry did fire before give-up */
 
-    t += 200;
+    /* retry_count==3 == max_retries: once the 200<<3=1600ms backoff
+     * elapses, the scan sees a due slot at the retry limit and gives up. */
+    t += (uint64_t)200 << 3;
     memset(&retrans, 0, sizeof(retrans));
     nl_channel_tick(&sender, 0, t, 200, 3, NL_RECV_WINDOW_DEFAULT, capture_emit, &retrans, &give_up);
     ASSERT_TRUE(give_up);

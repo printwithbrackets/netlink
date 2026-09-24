@@ -1,7 +1,9 @@
 #include "test_framework.h"
 #include "../src/connection.h"
 #include "../src/byteorder.h"
+#include "../src/fragment.h"
 #include <string.h>
+#include <stdlib.h>
 
 /* ---- test harness: two connections wired together, no real socket.
  *
@@ -32,7 +34,7 @@ typedef struct harness {
     struct harness   *peer_harness;
     uint64_t          now_ms;
 
-    uint8_t      last_data[4096];
+    uint8_t      last_data[NL_MAX_MESSAGE_SIZE];
     uint32_t     last_data_len;
     uint8_t      last_channel;
     nl_delivery_t last_delivery;
@@ -56,7 +58,10 @@ static void h_on_data(void *ctx, nl_peer_id_t peer, uint8_t channel, nl_delivery
                        const uint8_t *data, uint32_t len) {
     (void)peer;
     harness_t *h = (harness_t *)ctx;
-    ASSERT_TRUE(len <= sizeof(h->last_data));
+    /* Callback runs with the connection lock held: never longjmp out of
+     * here (that would leave the mutex locked). Record and clamp. */
+    CHECK_TRUE(len <= sizeof(h->last_data));
+    if (len > sizeof(h->last_data)) len = (uint32_t)sizeof(h->last_data);
     memcpy(h->last_data, data, len);
     h->last_data_len = len;
     h->last_channel = channel;
@@ -79,7 +84,7 @@ static void h_on_disconnected(void *ctx, nl_peer_id_t peer, nl_result_t reason) 
 /* ---- in-flight tracking + delivery queue (see comment above) ---- */
 
 #define MAX_IN_FLIGHT 8
-#define MAX_QUEUED 64
+#define MAX_QUEUED 512 /* a single flush can emit up to NL_MAX_FRAGMENTS (256) */
 #define MAX_QUEUED_PACKET_SIZE 2048
 
 typedef struct {
@@ -102,18 +107,24 @@ static bool is_in_flight(nl_connection_t *conn) {
     return false;
 }
 
-static void enter_in_flight(nl_connection_t *conn) {
-    ASSERT_TRUE(g_in_flight_count < MAX_IN_FLIGHT);
+/* Returns false if the table is full (recorded, not fatal): callers may
+ * be nested under a held connection lock, where longjmp would deadlock. */
+static bool enter_in_flight(nl_connection_t *conn) {
+    if (g_in_flight_count >= MAX_IN_FLIGHT) {
+        NL_FAIL("in-flight table full (MAX_IN_FLIGHT=%d)", MAX_IN_FLIGHT);
+        return false;
+    }
     g_in_flight[g_in_flight_count++] = conn;
+    return true;
 }
 
 static void exit_in_flight(void) {
-    g_in_flight_count--;
+    if (g_in_flight_count > 0) g_in_flight_count--;
 }
 
 static void deliver_one(nl_connection_t *conn, const uint8_t *packet, size_t len, uint64_t now_ms,
                          const nl_conn_callbacks_t *cb) {
-    enter_in_flight(conn);
+    if (!enter_in_flight(conn)) return;
     uint8_t type = packet[0];
     nl_connection_on_packet(conn, type, packet + 1, len - 1, now_ms, cb);
     exit_in_flight();
@@ -152,9 +163,17 @@ static void h_send_wire(void *ctx, nl_peer_id_t peer, const uint8_t *packet, siz
         /* The destination's lock is already held further up this same
          * call stack -- a real network could never deliver here
          * synchronously, so queue it for delivery right after the
-         * in-flight call unwinds, instead of re-entering now. */
-        ASSERT_TRUE(g_queue_count < MAX_QUEUED);
-        ASSERT_TRUE(len <= MAX_QUEUED_PACKET_SIZE);
+         * in-flight call unwinds, instead of re-entering now.
+         * Overflow/oversize here means a test bug: record and drop the
+         * packet rather than longjmp (locks are held) or write OOB. */
+        if (g_queue_count >= MAX_QUEUED) {
+            NL_FAIL("delivery queue full (MAX_QUEUED=%d)", MAX_QUEUED);
+            return;
+        }
+        if (len > MAX_QUEUED_PACKET_SIZE) {
+            NL_FAIL("packet too large for queue (%zu > %d)", len, MAX_QUEUED_PACKET_SIZE);
+            return;
+        }
         queued_packet_t *q = &g_queue[g_queue_count++];
         q->dest_conn = h->peer_conn;
         q->dest_cb = &h->peer_harness->cb;
@@ -185,7 +204,7 @@ static void harness_init(harness_t *h) {
 
 static nl_result_t harness_send(harness_t *h, nl_connection_t *conn, uint8_t channel, nl_delivery_t delivery,
                                  const uint8_t *data, size_t len, uint64_t now_ms) {
-    enter_in_flight(conn);
+    if (!enter_in_flight(conn)) return NL_ERR_INTERNAL;
     nl_result_t r = nl_connection_send(conn, channel, delivery, data, len, NL_PRIORITY_NORMAL, now_ms, &h->cb);
     exit_in_flight();
     drain_queue();
@@ -193,21 +212,21 @@ static nl_result_t harness_send(harness_t *h, nl_connection_t *conn, uint8_t cha
 }
 
 static void harness_tick(harness_t *h, nl_connection_t *conn, uint64_t now_ms) {
-    enter_in_flight(conn);
+    if (!enter_in_flight(conn)) return;
     nl_connection_tick(conn, now_ms, &h->cb);
     exit_in_flight();
     drain_queue();
 }
 
 static void harness_send_disconnect(harness_t *h, nl_connection_t *conn, uint64_t now_ms) {
-    enter_in_flight(conn);
+    if (!enter_in_flight(conn)) return;
     nl_connection_send_disconnect(conn, now_ms, &h->cb);
     exit_in_flight();
     drain_queue();
 }
 
 static void harness_send_handshake_complete(harness_t *h, nl_connection_t *conn, uint64_t now_ms, bool is_retry) {
-    enter_in_flight(conn);
+    if (!enter_in_flight(conn)) return;
     nl_connection_send_handshake_complete(conn, now_ms, is_retry, &h->cb);
     exit_in_flight();
     drain_queue();
@@ -673,7 +692,7 @@ TEST(test_priority_high_flushes_before_low) {
      * must sort ahead of low), then reopen and confirm flush order. */
     cc->peer_rwnd = 0;
 
-    enter_in_flight(cc);
+    if (!enter_in_flight(cc)) { nl_connection_destroy(cc); nl_connection_destroy(sc); return; }
     ASSERT_EQ(nl_connection_send(cc, 0, NL_UNRELIABLE, (const uint8_t *)"low", 3,
                                   NL_PRIORITY_LOW, 0, &ch.cb), NL_OK);
     ASSERT_EQ(nl_connection_send(cc, 0, NL_UNRELIABLE, (const uint8_t *)"high", 4,
@@ -703,7 +722,7 @@ TEST(test_send_queue_full_returns_error) {
     int accepted = 0;
     nl_result_t last = NL_OK;
     for (int i = 0; i < NL_DEFERRED_MAX_MSGS + 8; i++) {
-        enter_in_flight(cc);
+        if (!enter_in_flight(cc)) break;
         last = nl_connection_send(cc, 0, NL_UNRELIABLE, (const uint8_t *)"q", 1,
                                    NL_PRIORITY_NORMAL, 0, &ch.cb);
         exit_in_flight();
@@ -734,6 +753,185 @@ TEST(test_capabilities_stored_on_connection) {
     nl_connection_destroy(sc);
 }
 
+/* ---- large messages: continuation parking + ack-driven flush ---- */
+
+/* Alternate server/client ticks for up to max_iters passes: each server
+ * tick flushes standalone acks (applied synchronously on the client via
+ * the harness queue), each client tick flushes deferred continuations and
+ * runs the retransmit scan. */
+static void pump_until(harness_t *ch, nl_connection_t *cc, harness_t *sh,
+                       nl_connection_t *sc, uint64_t *t, int max_iters) {
+    for (int i = 0; i < max_iters; i++) {
+        harness_tick(sh, sc, *t);
+        *t += 50;
+        harness_tick(ch, cc, *t);
+        *t += 50;
+    }
+}
+
+TEST(test_large_reliable_message_40000) {
+    /* 40000 bytes = 40 fragments. Initial cwnd (10) can only take the
+     * first batch; the rest must park as a continuation and flush as the
+     * server's standalone acks reopen the window -- without ever being
+     * delivered half-assembled to the application. */
+    harness_t ch, sh;
+    nl_connection_t *cc, *sc;
+    make_pair(&ch, &sh, &cc, &sc, 100000, 100000);
+
+    size_t total = 40000;
+    uint8_t *big = (uint8_t *)malloc(total);
+    ASSERT_TRUE(big != NULL);
+    for (size_t i = 0; i < total; i++) big[i] = (uint8_t)((i * 17 + 3) & 0xFF);
+
+    ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED, big, total, 0), NL_OK);
+    /* Only the first cwnd-worth of fragments fit; nothing complete yet. */
+    ASSERT_EQ(sh.data_count, 0);
+    ASSERT_TRUE(ch.packets_sent > 0);
+    ASSERT_TRUE(ch.packets_sent <= NL_CWND_INITIAL_PACKETS);
+
+    uint64_t t = 0;
+    pump_until(&ch, cc, &sh, sc, &t, 50);
+
+    ASSERT_EQ(sh.data_count, 1);
+    ASSERT_EQ(sh.last_data_len, (uint32_t)total);
+    CHECK_MEM_EQ(sh.last_data, big, total);
+    ASSERT_EQ(ch.disconnect_count, 0);
+    ASSERT_EQ(sh.disconnect_count, 0);
+
+    free(big);
+    nl_connection_destroy(cc);
+    nl_connection_destroy(sc);
+}
+
+TEST(test_large_reliable_message_100000) {
+    /* 100000 bytes = 98 fragments, larger than any single peer receive
+     * window (capacity 32768) -- exercises the stream-while-avail rwnd
+     * rule (rem > capacity) rather than the "wait for a full window"
+     * rule, across multiple ack cycles. */
+    harness_t ch, sh;
+    nl_connection_t *cc, *sc;
+    make_pair(&ch, &sh, &cc, &sc, 200000, 200000);
+
+    size_t total = 100000;
+    uint8_t *big = (uint8_t *)malloc(total);
+    ASSERT_TRUE(big != NULL);
+    for (size_t i = 0; i < total; i++) big[i] = (uint8_t)((i * 31 + 7) & 0xFF);
+
+    ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED, big, total, 0), NL_OK);
+    ASSERT_EQ(sh.data_count, 0);
+    ASSERT_TRUE(ch.packets_sent <= NL_CWND_INITIAL_PACKETS);
+
+    uint64_t t = 0;
+    pump_until(&ch, cc, &sh, sc, &t, 80);
+
+    ASSERT_EQ(sh.data_count, 1);
+    ASSERT_EQ(sh.last_data_len, (uint32_t)total);
+    CHECK_MEM_EQ(sh.last_data, big, total);
+    ASSERT_EQ(ch.disconnect_count, 0);
+    ASSERT_EQ(sh.disconnect_count, 0);
+
+    free(big);
+    nl_connection_destroy(cc);
+    nl_connection_destroy(sc);
+}
+
+TEST(test_partial_ring_parks_continuation_without_overwriting) {
+    /* Fill the reliable send ring almost to capacity (9 unacked small
+     * messages leave only 1 cwnd slot), then start a 20-fragment message:
+     * exactly one fragment may leave, the rest must park as a
+     * continuation, and the already-queued slots 0..9 must remain intact
+     * (nl_send_ring_insert refuses to overwrite live unacked entries). */
+    harness_t ch, sh;
+    nl_connection_t *cc, *sc;
+    make_pair(&ch, &sh, &cc, &sc, 100000, 100000);
+
+    for (int i = 0; i < NL_CWND_INITIAL_PACKETS - 1; i++) {
+        ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED,
+                               (const uint8_t *)"x", 1, 0), NL_OK);
+    }
+    ASSERT_EQ(sh.data_count, NL_CWND_INITIAL_PACKETS - 1);
+    ASSERT_EQ(ch.packets_sent, NL_CWND_INITIAL_PACKETS - 1);
+
+    size_t total = NL_FRAGMENT_CHUNK_SIZE * 20; /* 20 fragments */
+    uint8_t *big = (uint8_t *)malloc(total);
+    ASSERT_TRUE(big != NULL);
+    memset(big, 'B', total);
+
+    ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED, big, total, 0), NL_OK);
+    /* Exactly one more packet left (the last cwnd slot); the other 19
+     * fragments are parked as a continuation, not emitted. */
+    ASSERT_EQ(ch.packets_sent, NL_CWND_INITIAL_PACKETS);
+    ASSERT_EQ(sh.data_count, NL_CWND_INITIAL_PACKETS - 1); /* big msg incomplete */
+
+    /* Ring must hold slots 0..9, all live and unacked -- the partial send
+     * must not have clobbered any of the nine small messages. */
+    nl_lane_t *lane = &cc->channels[0].lanes[NL_RELIABLE_ORDERED];
+    ASSERT_TRUE(lane->send_ring_init);
+    ASSERT_EQ(lane->send_ring.unacked_count, NL_CWND_INITIAL_PACKETS);
+    for (int i = 0; i < NL_CWND_INITIAL_PACKETS; i++) {
+        nl_send_slot_t *s = nl_send_ring_get(&lane->send_ring, (uint16_t)i);
+        ASSERT_TRUE(s != NULL);
+        ASSERT_FALSE(s->acked);
+        if (i < NL_CWND_INITIAL_PACKETS - 1) {
+            ASSERT_EQ(s->len, 2); /* lane payload: is_fragment(0) + 'x' */
+        } else {
+            ASSERT_TRUE(s->len > 2); /* fragment 0 of the big message */
+        }
+    }
+
+    /* Server's reply piggybacks an ack covering all 10 received packets;
+     * that reopens cwnd and the continuation flushes to completion. */
+    ASSERT_EQ(harness_send(&sh, sc, 0, NL_RELIABLE_ORDERED,
+                           (const uint8_t *)"ack", 3, 10), NL_OK);
+
+    ASSERT_EQ(sh.data_count, NL_CWND_INITIAL_PACKETS); /* 9 small + 1 big */
+    ASSERT_EQ(sh.last_data_len, (uint32_t)total);
+    CHECK_MEM_EQ(sh.last_data, big, total);
+
+    free(big);
+    nl_connection_destroy(cc);
+    nl_connection_destroy(sc);
+}
+
+TEST(test_one_way_reliable_acked_without_reverse_data) {
+    /* One-way traffic: the server never sends application data, so acks
+     * can only ride on standalone NL_PKT_ACK packets (flushed by tick).
+     * Without them the client would retransmit every message at RTO and
+     * eventually disconnect -- this is the H1/H2 regression case. */
+    harness_t ch, sh;
+    nl_connection_t *cc, *sc;
+    make_pair(&ch, &sh, &cc, &sc, 100000, 100000);
+
+    for (int i = 0; i < 5; i++) {
+        char msg[8];
+        snprintf(msg, sizeof(msg), "ow%d", i);
+        ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED,
+                               (const uint8_t *)msg, (size_t)strlen(msg), 0), NL_OK);
+    }
+    ASSERT_EQ(sh.data_count, 5);
+    ASSERT_EQ(ch.packets_sent, 5);
+
+    /* Server never app-sends; tick it so flush_acks_locked emits NL_PKT_ACK
+     * for the dirty lane. Delivery is synchronous through the harness. */
+    harness_tick(&sh, sc, 10);
+
+    /* Well past the default RTO (400ms initial) with no further server
+     * traffic: nothing may retransmit, and neither side may disconnect. */
+    harness_tick(&ch, cc, 5000);
+
+    nl_connection_stats_t stats;
+    nl_connection_get_stats(cc, &stats);
+    ASSERT_EQ(stats.retransmits, 0u);
+    ASSERT_EQ(ch.packets_sent, 5); /* no extra retransmit packets */
+    ASSERT_EQ(sh.data_count, 5);   /* no duplicate deliveries */
+    ASSERT_MEM_EQ(sh.last_data, "ow4", 3);
+    ASSERT_EQ(ch.disconnect_count, 0);
+    ASSERT_EQ(sh.disconnect_count, 0);
+
+    nl_connection_destroy(cc);
+    nl_connection_destroy(sc);
+}
+
 int main(void) {
     printf("=== connection tests ===\n");
     RUN_TEST(test_connection_send_and_receive_roundtrip);
@@ -754,5 +952,9 @@ int main(void) {
     RUN_TEST(test_priority_high_flushes_before_low);
     RUN_TEST(test_send_queue_full_returns_error);
     RUN_TEST(test_capabilities_stored_on_connection);
+    RUN_TEST(test_large_reliable_message_40000);
+    RUN_TEST(test_large_reliable_message_100000);
+    RUN_TEST(test_partial_ring_parks_continuation_without_overwriting);
+    RUN_TEST(test_one_way_reliable_acked_without_reverse_data);
     TEST_SUMMARY();
 }

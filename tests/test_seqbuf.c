@@ -67,6 +67,44 @@ TEST(test_send_ring_sequence_increments) {
     nl_send_ring_free(&ring);
 }
 
+TEST(test_send_ring_insert_refuses_unacked_overwrite) {
+    /* Fill every slot with a live unacked packet; the 257th insert must
+     * be refused (fail closed) rather than silently replacing sequence 0
+     * -- that original would never be retransmitted, leaving the receiver
+     * with an unfillable gap. After acking seq 0, a wrap-around insert at
+     * the same index must succeed (recycling acked slots is fine). */
+    nl_send_ring_t ring;
+    nl_send_ring_init(&ring);
+    uint16_t seq;
+
+    for (int i = 0; i < NL_SEQ_RING_SIZE; i++) {
+        uint8_t b = (uint8_t)i;
+        ASSERT_TRUE(nl_send_ring_insert(&ring, &b, 1, 0, &seq));
+        ASSERT_EQ(seq, (uint16_t)i);
+    }
+    ASSERT_EQ(ring.unacked_count, NL_SEQ_RING_SIZE);
+
+    uint8_t overflow = 0xFF;
+    ASSERT_FALSE(nl_send_ring_insert(&ring, &overflow, 1, 0, &seq));
+    ASSERT_EQ(ring.next_sequence, NL_SEQ_RING_SIZE); /* not advanced */
+    ASSERT_EQ(ring.unacked_count, NL_SEQ_RING_SIZE);
+
+    /* Slot 0's original payload must be untouched. */
+    nl_send_slot_t *s0 = nl_send_ring_get(&ring, 0);
+    ASSERT_TRUE(s0 != NULL);
+    ASSERT_EQ(s0->data[0], 0);
+    ASSERT_FALSE(s0->acked);
+
+    /* Ack seq 0 so its index becomes recyclable, then insert succeeds. */
+    bool has_sample; uint32_t sample_ms;
+    nl_send_ring_ack(&ring, 0, 0, 0, &has_sample, &sample_ms, NULL);
+    ASSERT_TRUE(nl_send_ring_insert(&ring, &overflow, 1, 0, &seq));
+    ASSERT_EQ(seq, NL_SEQ_RING_SIZE);
+    ASSERT_EQ(ring.unacked_count, NL_SEQ_RING_SIZE); /* 255 old + 1 new */
+
+    nl_send_ring_free(&ring);
+}
+
 TEST(test_send_ring_ack_marks_slot) {
     nl_send_ring_t ring;
     nl_send_ring_init(&ring);
@@ -390,6 +428,7 @@ int main(void) {
     RUN_TEST(test_seq_greater_than_wraparound);
     RUN_TEST(test_send_ring_insert_and_get);
     RUN_TEST(test_send_ring_sequence_increments);
+    RUN_TEST(test_send_ring_insert_refuses_unacked_overwrite);
     RUN_TEST(test_send_ring_ack_marks_slot);
     RUN_TEST(test_send_ring_ack_bitfield_marks_older);
     RUN_TEST(test_send_ring_ack_rtt_sample_clean);

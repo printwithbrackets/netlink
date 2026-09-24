@@ -38,6 +38,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <time.h>
 #include <netdb.h>
 
@@ -202,11 +203,15 @@ struct nl_endpoint {
 
     pthread_t io_thread;
     bool io_thread_started;
-    volatile bool running;
+    atomic_bool running;
 
+    /* Guards discovery_sock/discovery_port/discovery_expected_nonce and
+     * the discovery rate window: nl_discovery_enable/probe run on user
+     * threads while the IO thread reads the same fields. (The main sock
+     * is set once before the IO thread starts and never changes.) */
+    pthread_mutex_t discovery_lock;
     nl_socket_t discovery_sock;
     uint16_t discovery_port;
-    uint32_t discovery_probe_nonce;
     uint32_t discovery_expected_nonce; /* last probe's nonce; replies must echo it */
     uint64_t discovery_rate_window_start_ms;
     uint32_t discovery_rate_count;
@@ -473,8 +478,10 @@ static bool rate_limit_check(nl_endpoint_t *ep, uint64_t now) {
 
 /* Separate fixed-window counter for discovery responses. Shares neither
  * bucket nor budget with the handshake limiter so a discovery flood cannot
- * also starve legitimate CONNECT_REQUESTs (and vice versa). */
-static bool rate_limit_discovery(nl_endpoint_t *ep, uint64_t now) {
+ * also starve legitimate CONNECT_REQUESTs (and vice versa). Caller holds
+ * discovery_lock (the window is mutated from the IO thread while probes
+ * can run on a user thread). */
+static bool rate_limit_discovery_locked(nl_endpoint_t *ep, uint64_t now) {
     if (now - ep->discovery_rate_window_start_ms > NL_RATE_LIMIT_WINDOW_MS) {
         ep->discovery_rate_window_start_ms = now;
         ep->discovery_rate_count = 0;
@@ -595,10 +602,18 @@ static void handle_connect_request(nl_endpoint_t *ep, const uint8_t *buf, size_t
     memcpy(cookie_input + ci, client_pub, 32); ci += 32;
     memcpy(cookie_input + ci, client_nonce, 16); ci += 16;
     memcpy(cookie_input + ci, p->my_nonce, 16); ci += 16;
-    nl_crypto_hmac_sha256(ep->server_secret, 32, cookie_input, ci, p->cookie, 16);
+    if (!nl_crypto_hmac_sha256(ep->server_secret, 32, cookie_input, ci, p->cookie, 16)) {
+        release_pending_locked(p);
+        pthread_mutex_unlock(&ep->pending_lock);
+        return;
+    }
 
     uint8_t server_pub[32];
-    nl_keypair_public(p->my_keypair, server_pub);
+    if (!nl_keypair_public(p->my_keypair, server_pub)) {
+        release_pending_locked(p);
+        pthread_mutex_unlock(&ep->pending_lock);
+        return;
+    }
 
     /* Build and retain the CHALLENGE under pending_lock so a concurrent
      * retransmitted REQUEST can find it already armed for retry. */
@@ -619,6 +634,10 @@ static void handle_connect_response(nl_endpoint_t *ep, const uint8_t *buf, size_
                                      const struct sockaddr_storage *from, socklen_t from_len, uint64_t now) {
     (void)from_len; /* the pending entry's own stored addr_len is used instead, see below */
     if (len < NL_CONNECT_RESPONSE_SIZE) return;
+    /* Bounded processing cost per packet: RESPONSE does X25519+HKDF,
+     * so a flood of spoofed-but-plausible responses must not outrun the
+     * REQUEST limiter (shared budget: one handshake costs one of each). */
+    if (!rate_limit_check(ep, now)) return;
     size_t off = 1;
     uint8_t cookie[16]; memcpy(cookie, buf + off, 16); off += 16;
     uint8_t client_pub[32]; memcpy(client_pub, buf + off, 32); off += 32;
@@ -698,6 +717,10 @@ static void handle_connect_response(nl_endpoint_t *ep, const uint8_t *buf, size_
 static void handle_connect_challenge(nl_endpoint_t *ep, const uint8_t *buf, size_t len,
                                       const struct sockaddr_storage *from, socklen_t from_len, uint64_t now) {
     if (len < NL_CONNECT_CHALLENGE_SIZE) return;
+    /* Rate-limit before the pending lookup: the X25519 below consumes the
+     * server_pub straight off the wire, so an attacker-controlled packet
+     * must not be able to force unbounded key agreement per second. */
+    if (!rate_limit_check(ep, now)) return;
     size_t off = 1;
     uint8_t server_pub[32]; memcpy(server_pub, buf + off, 32); off += 32;
     uint8_t server_nonce[16]; memcpy(server_nonce, buf + off, 16); off += 16;
@@ -777,7 +800,14 @@ static void handle_connect_denied(nl_endpoint_t *ep, const uint8_t *buf, size_t 
         p = find_pending_by_addr_locked(ep, from, PENDING_CLIENT_AWAIT_ACCEPTED);
         if (p) was_accepted = true;
     }
-    if (p) { connid = p->connection_id; release_pending_locked(p); }
+    if (!p) {
+        /* No handshake in flight from this address: a spoofed/stale
+         * DENIED. Surface nothing rather than a CONNECT_FAILED(peer=0). */
+        pthread_mutex_unlock(&ep->pending_lock);
+        return;
+    }
+    connid = p->connection_id;
+    release_pending_locked(p);
     pthread_mutex_unlock(&ep->pending_lock);
 
     /* DENIED can arrive after the client already created a connection
@@ -815,7 +845,10 @@ static void process_discovery_packet(nl_endpoint_t *ep, const uint8_t *buf, size
         uint32_t nonce = nl_get_u32(buf + 5);
         /* Own budget so a discovery flood can't starve the handshake
          * rate limiter (and vice versa). */
-        if (!rate_limit_discovery(ep, now_ms())) return;
+        pthread_mutex_lock(&ep->discovery_lock);
+        bool allow = rate_limit_discovery_locked(ep, now_ms());
+        pthread_mutex_unlock(&ep->discovery_lock);
+        if (!allow) return;
 
         pthread_mutex_lock(&ep->connections_lock);
         uint32_t player_count = count_active_connections_locked(ep);
@@ -841,16 +874,37 @@ static void process_discovery_packet(nl_endpoint_t *ep, const uint8_t *buf, size
         out[o++] = (uint8_t)name_len;
         memcpy(out + o, name, name_len); o += name_len;
 
-        sendto(ep->discovery_sock, out, o, 0, (const struct sockaddr *)from, from_len);
+        /* Reply from the MAIN (game) socket so the datagram's source port
+         * is the advertised game port -- a prober that trusts the socket
+         * source (and only the source) to locate the server can then
+         * connect to it directly. Fall back to the discovery socket only
+         * if the main socket can't reach this address (e.g. an IPv6-only
+         * main socket replying to an IPv4 prober). */
+        if (sendto(ep->sock, out, o, 0, (const struct sockaddr *)from, from_len) < 0) {
+            pthread_mutex_lock(&ep->discovery_lock);
+            nl_socket_t dsock = ep->discovery_sock;
+            pthread_mutex_unlock(&ep->discovery_lock);
+            if (dsock != NL_INVALID_SOCKET) {
+                sendto(dsock, out, o, 0, (const struct sockaddr *)from, from_len);
+            }
+        }
     } else if (type == NL_PKT_DISCOVERY_RESPONSE && !ep->is_server) {
         if (len < NL_DISCOVERY_RESPONSE_MIN_SIZE) return;
         size_t off = 1;
         uint32_t nonce = nl_get_u32(buf + off); off += 4;
         /* Only the most recent probe's nonce is accepted: a delayed or
-         * spoofed reply from an earlier probe (or a forged one) is dropped
-         * rather than surfaced as a live discovery result. */
-        if (nonce != ep->discovery_expected_nonce) return;
-        uint16_t server_port = nl_get_u16(buf + off); off += 2;
+         * spoofed reply from an earlier probe (or a forged one, which
+         * would also have to race the random nonce) is dropped rather
+         * than surfaced as a live discovery result. */
+        pthread_mutex_lock(&ep->discovery_lock);
+        bool expected = nonce == ep->discovery_expected_nonce;
+        pthread_mutex_unlock(&ep->discovery_lock);
+        if (!expected) return;
+        /* Body's server_port is parsed for layout compatibility but NOT
+         * used for from_address: an attacker can put anything there.
+         * The socket source is the only trustworthy origin -- and with
+         * servers replying from the game socket, it IS the game port. */
+        off += 2; /* skip server_port */
         uint32_t player_count = nl_get_u32(buf + off); off += 4;
         uint32_t max_players = nl_get_u32(buf + off); off += 4;
         uint8_t name_len = buf[off++];
@@ -859,7 +913,6 @@ static void process_discovery_packet(nl_endpoint_t *ep, const uint8_t *buf, size
         nl_event_t ev; memset(&ev, 0, sizeof(ev));
         ev.event_type = NL_EVENT_DISCOVERY_REPLY;
         sockaddr_to_nl_address(from, from_len, &ev.from_address);
-        ev.from_address.port = server_port;
         ev.server_player_count = player_count;
         ev.server_max_players = max_players;
         size_t copy_len = name_len < NL_SERVER_NAME_MAX - 1 ? name_len : NL_SERVER_NAME_MAX - 1;
@@ -889,6 +942,7 @@ static void process_main_packet(nl_endpoint_t *ep, const uint8_t *buf, size_t le
             if (!ep->is_server) handle_connect_denied(ep, buf, len, from);
             break;
         case NL_PKT_DATA:
+        case NL_PKT_ACK:
         case NL_PKT_KEEPALIVE:
         case NL_PKT_DISCONNECT:
         case NL_PKT_CONNECT_ACCEPTED: {
@@ -924,38 +978,69 @@ static void tick_all_connections(nl_endpoint_t *ep, uint64_t now) {
     pthread_mutex_unlock(&ep->connections_lock);
 }
 
+/* Standalone-ack pass after a recv drain: every packet just processed may
+ * have set ack_dirty on a lane with no reverse traffic to piggyback on.
+ * Without this, a one-way sender would only ever learn of delivery via
+ * its own retransmissions (or the 1s keepalive cadence at best). */
+static void flush_all_acks(nl_endpoint_t *ep, uint64_t now) {
+    pthread_mutex_lock(&ep->connections_lock);
+    for (int i = 0; i < NL_MAX_CONNECTIONS_INTERNAL; i++) {
+        nl_connection_t *conn = ep->connections[i];
+        if (!conn) continue;
+        conn_ctx_t cctx = { ep, conn };
+        nl_conn_callbacks_t cb = make_callbacks(&cctx);
+        nl_connection_flush_acks(conn, now, &cb);
+    }
+    pthread_mutex_unlock(&ep->connections_lock);
+}
+
 /* ---- I/O thread ---- */
 
 static void *io_thread_main(void *arg) {
     nl_endpoint_t *ep = (nl_endpoint_t *)arg;
     uint8_t buf[NL_RECV_BUFFER_SIZE];
 
-    while (ep->running) {
+    while (atomic_load(&ep->running)) {
         struct pollfd fds[2];
         int nfds = 0;
         int main_idx = nfds;
         fds[nfds].fd = ep->sock; fds[nfds].events = POLLIN; fds[nfds].revents = 0; nfds++;
         int disc_idx = -1;
-        if (ep->discovery_sock != NL_INVALID_SOCKET) {
+        pthread_mutex_lock(&ep->discovery_lock);
+        nl_socket_t dsock = ep->discovery_sock;
+        pthread_mutex_unlock(&ep->discovery_lock);
+        if (dsock != NL_INVALID_SOCKET) {
             disc_idx = nfds;
-            fds[nfds].fd = ep->discovery_sock; fds[nfds].events = POLLIN; fds[nfds].revents = 0; nfds++;
+            fds[nfds].fd = dsock; fds[nfds].events = POLLIN; fds[nfds].revents = 0; nfds++;
         }
 
         int rc = poll(fds, (nfds_t)nfds, NL_IO_POLL_INTERVAL_MS);
+        bool got_packets = false;
         if (rc > 0) {
+            /* Drain each readable socket to EAGAIN (both are nonblocking):
+             * processing only one datagram per 50ms poll cycle would stall
+             * bursts behind the poll timeout. */
             if (fds[main_idx].revents & POLLIN) {
-                struct sockaddr_storage from; socklen_t from_len = sizeof(from);
-                memset(&from, 0, sizeof(from));
-                ssize_t n = recvfrom(ep->sock, buf, sizeof(buf), 0, (struct sockaddr *)&from, &from_len);
-                if (n > 0) process_main_packet(ep, buf, (size_t)n, &from, from_len, now_ms());
+                for (;;) {
+                    struct sockaddr_storage from; socklen_t from_len = sizeof(from);
+                    memset(&from, 0, sizeof(from));
+                    ssize_t n = recvfrom(ep->sock, buf, sizeof(buf), 0, (struct sockaddr *)&from, &from_len);
+                    if (n <= 0) break;
+                    process_main_packet(ep, buf, (size_t)n, &from, from_len, now_ms());
+                    got_packets = true;
+                }
             }
             if (disc_idx >= 0 && (fds[disc_idx].revents & POLLIN)) {
-                struct sockaddr_storage from; socklen_t from_len = sizeof(from);
-                memset(&from, 0, sizeof(from));
-                ssize_t n = recvfrom(ep->discovery_sock, buf, sizeof(buf), 0, (struct sockaddr *)&from, &from_len);
-                if (n > 0) process_discovery_packet(ep, buf, (size_t)n, &from, from_len);
+                for (;;) {
+                    struct sockaddr_storage from; socklen_t from_len = sizeof(from);
+                    memset(&from, 0, sizeof(from));
+                    ssize_t n = recvfrom(dsock, buf, sizeof(buf), 0, (struct sockaddr *)&from, &from_len);
+                    if (n <= 0) break;
+                    process_discovery_packet(ep, buf, (size_t)n, &from, from_len);
+                }
             }
         }
+        if (got_packets) flush_all_acks(ep, now_ms());
 
         uint64_t now = now_ms();
         tick_all_connections(ep, now);
@@ -996,18 +1081,20 @@ static nl_endpoint_t *endpoint_alloc(bool is_server, const nl_config_t *cfg) {
     }
     ep->sock = NL_INVALID_SOCKET;
     ep->discovery_sock = NL_INVALID_SOCKET;
+    atomic_init(&ep->running, false);
     nl_crypto_random(ep->server_secret, 32);
     pthread_mutex_init(&ep->pending_lock, NULL);
     pthread_mutex_init(&ep->connections_lock, NULL);
     pthread_mutex_init(&ep->queue_lock, NULL);
+    pthread_mutex_init(&ep->discovery_lock, NULL);
     pthread_cond_init(&ep->queue_cond, NULL);
     return ep;
 }
 
 static nl_result_t start_io_thread(nl_endpoint_t *ep) {
-    ep->running = true;
+    atomic_store(&ep->running, true);
     if (pthread_create(&ep->io_thread, NULL, io_thread_main, ep) != 0) {
-        ep->running = false;
+        atomic_store(&ep->running, false);
         return NL_ERR_INTERNAL;
     }
     ep->io_thread_started = true;
@@ -1035,6 +1122,7 @@ static void endpoint_free(nl_endpoint_t *ep) {
     pthread_mutex_destroy(&ep->pending_lock);
     pthread_mutex_destroy(&ep->connections_lock);
     pthread_mutex_destroy(&ep->queue_lock);
+    pthread_mutex_destroy(&ep->discovery_lock);
     pthread_cond_destroy(&ep->queue_cond);
 
     memset(ep->server_secret, 0, sizeof(ep->server_secret));
@@ -1177,9 +1265,17 @@ nl_result_t nl_connect(nl_endpoint_t *ep, const nl_address_t *server_addr, nl_pe
     memcpy(p->retry_packet, out, o);
     p->retry_packet_len = (uint16_t)o;
     p->last_retry_ms = p->created_ms;
+    /* Send while still holding pending_lock so a failure can release the
+     * entry atomically with its creation (no window where a concurrent
+     * retry_pending_handshakes could retransmit a packet that never
+     * actually left the socket). */
+    ssize_t sent = sendto(ep->sock, out, o, 0, (struct sockaddr *)&addr, addr_len);
+    if (sent < 0) {
+        release_pending_locked(p);
+        pthread_mutex_unlock(&ep->pending_lock);
+        return NL_ERR_SOCKET;
+    }
     pthread_mutex_unlock(&ep->pending_lock);
-
-    sendto(ep->sock, out, o, 0, (struct sockaddr *)&addr, addr_len);
 
     *out_peer = connid;
     return NL_OK;
@@ -1202,7 +1298,7 @@ nl_result_t nl_disconnect(nl_endpoint_t *ep, nl_peer_id_t peer) {
 
 void nl_endpoint_destroy(nl_endpoint_t *ep) {
     if (!ep) return;
-    ep->running = false;
+    atomic_store(&ep->running, false);
     /* pthread_join on a never-started thread is UB; construction-failure
      * paths free via endpoint_free without joining, and destroy only
      * reaches here after a successful start_io_thread. */
@@ -1304,10 +1400,15 @@ bool nl_poll_event(nl_endpoint_t *ep, nl_event_t *out, int timeout_ms) {
     if (node->payload) {
         out->data = node->payload;
         out->data_len = node->payload_len;
+        /* Book the borrowed payload under queue_lock: these fields are
+         * what the *next* nl_poll_event frees/consumes, so a concurrent
+         * poll must not observe a torn write. */
+        pthread_mutex_lock(&ep->queue_lock);
         ep->returned_owned_data = node->payload;
         ep->returned_owned_len = (uint32_t)node->payload_len;
         ep->returned_owned_is_data = (node->pub.event_type == NL_EVENT_DATA);
         ep->returned_owned_peer = node->pub.peer;
+        pthread_mutex_unlock(&ep->queue_lock);
     } else {
         out->data = NULL;
         out->data_len = 0;
@@ -1318,7 +1419,11 @@ bool nl_poll_event(nl_endpoint_t *ep, nl_event_t *out, int timeout_ms) {
 
 nl_result_t nl_discovery_enable(nl_endpoint_t *ep, uint16_t discovery_port) {
     if (!ep || !ep->is_server) return NL_ERR_INVALID_ARGUMENT;
-    if (ep->discovery_sock != NL_INVALID_SOCKET) return NL_OK; /* already enabled */
+    pthread_mutex_lock(&ep->discovery_lock);
+    if (ep->discovery_sock != NL_INVALID_SOCKET) {
+        pthread_mutex_unlock(&ep->discovery_lock);
+        return NL_OK; /* already enabled */
+    }
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -1327,7 +1432,10 @@ nl_result_t nl_discovery_enable(nl_endpoint_t *ep, uint16_t discovery_port) {
     addr.sin_port = htons(discovery_port);
 
     nl_socket_t sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock == NL_INVALID_SOCKET) return NL_ERR_SOCKET;
+    if (sock == NL_INVALID_SOCKET) {
+        pthread_mutex_unlock(&ep->discovery_lock);
+        return NL_ERR_SOCKET;
+    }
     int reuse = 1;
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
     int broadcast = 1;
@@ -1335,11 +1443,13 @@ nl_result_t nl_discovery_enable(nl_endpoint_t *ep, uint16_t discovery_port) {
 
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         nl_close_socket(sock);
+        pthread_mutex_unlock(&ep->discovery_lock);
         return NL_ERR_BIND_FAILED;
     }
     nl_socket_set_nonblocking(sock);
     ep->discovery_sock = sock;
     ep->discovery_port = discovery_port;
+    pthread_mutex_unlock(&ep->discovery_lock);
     return NL_OK;
 }
 
@@ -1347,10 +1457,15 @@ nl_result_t nl_discovery_probe(nl_endpoint_t *ep, uint16_t discovery_port, int t
     (void)timeout_ms; /* replies simply arrive as events over the following poll calls */
     if (!ep || ep->is_server) return NL_ERR_INVALID_ARGUMENT;
 
+    pthread_mutex_lock(&ep->discovery_lock);
+
     nl_socket_t sock = ep->discovery_sock;
     if (sock == NL_INVALID_SOCKET) {
         sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (sock == NL_INVALID_SOCKET) return NL_ERR_SOCKET;
+        if (sock == NL_INVALID_SOCKET) {
+            pthread_mutex_unlock(&ep->discovery_lock);
+            return NL_ERR_SOCKET;
+        }
         int broadcast = 1;
         setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
         nl_socket_set_nonblocking(sock);
@@ -1363,26 +1478,27 @@ nl_result_t nl_discovery_probe(nl_endpoint_t *ep, uint16_t discovery_port, int t
     bcast.sin_port = htons(discovery_port);
     bcast.sin_addr.s_addr = INADDR_BROADCAST;
 
-    uint32_t nonce = ++ep->discovery_probe_nonce;
+    /* Random nonce (never 0): matching it is required for a reply to be
+     * accepted, so an off-path forger can't win by guessing a counter.
+     * Written under discovery_lock -- the IO thread compares against it. */
+    uint32_t nonce = 0;
+    while (nonce == 0) nl_crypto_random((uint8_t *)&nonce, sizeof(nonce));
     ep->discovery_expected_nonce = nonce;
     uint8_t out[NL_DISCOVERY_REQUEST_SIZE];
     out[0] = NL_PKT_DISCOVERY_REQUEST;
     nl_put_u32(out + 1, NL_MAGIC);
     nl_put_u32(out + 5, nonce);
 
-    if (sendto(sock, out, sizeof(out), 0, (struct sockaddr *)&bcast, sizeof(bcast)) < 0) {
-        /* Broadcast can be unavailable (restricted network namespaces,
-         * some CI runners). Fall back to 127.0.0.1 so a local server is
-         * still discoverable and probe does not hard-fail. Use the
-         * numeric address: INADDR_LOOPBACK is BSD-only and hidden under
-         * strict _POSIX_C_SOURCE on Darwin (where this file compiles
-         * clean with -std=c11). */
-        struct sockaddr_in local = bcast;
-        local.sin_addr.s_addr = htonl(0x7F000001);
-        if (sendto(sock, out, sizeof(out), 0, (struct sockaddr *)&local, sizeof(local)) < 0) {
-            return NL_ERR_SOCKET;
-        }
-    }
+    /* Broadcast for real LAN servers, plus an unconditional loopback copy
+     * so a local server is always reachable (broadcast can silently go
+     * nowhere in restricted namespaces even when sendto succeeds, and
+     * tests need a deterministic path to capture the probe's nonce). */
+    sendto(sock, out, sizeof(out), 0, (struct sockaddr *)&bcast, sizeof(bcast));
+    struct sockaddr_in local = bcast;
+    local.sin_addr.s_addr = htonl(0x7F000001); /* INADDR_LOOPBACK is BSD-only under strict POSIX */
+    ssize_t sent = sendto(sock, out, sizeof(out), 0, (struct sockaddr *)&local, sizeof(local));
+    pthread_mutex_unlock(&ep->discovery_lock);
+    if (sent < 0) return NL_ERR_SOCKET;
     return NL_OK;
 }
 

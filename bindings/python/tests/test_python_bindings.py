@@ -141,6 +141,61 @@ def test_server_full_denies_connection():
         server.close()
 
 
+def test_send_ex_priority_and_peer_stats():
+    port = next_port()
+    server = netlink.Server("127.0.0.1", port)
+    client = netlink.Client()
+    try:
+        peer = client.connect("127.0.0.1", port)
+        wait_for(client, netlink.EventType.CONNECTED)
+        server_ev = wait_for(server, netlink.EventType.CONNECTED)
+
+        client.send_ex(peer, channel=0, data=b"urgent",
+                       delivery=netlink.Delivery.RELIABLE_ORDERED,
+                       priority=netlink.Priority.HIGH)
+        data_ev = wait_for(server, netlink.EventType.DATA)
+        assert data_ev.data == b"urgent"
+
+        stats = client.peer_stats(peer)
+        assert stats is not None
+        assert stats.packets_sent >= 1
+        assert isinstance(stats.rtt_ms, int)
+
+        # Wait for at least one DATA so the ack path has run, then check
+        # the server-side stats too (ack piggyback or standalone).
+        server.send(server_ev.peer, channel=0, data=b"ack-me",
+                    delivery=netlink.Delivery.RELIABLE_ORDERED)
+        wait_for(client, netlink.EventType.DATA)
+        sstats = server.peer_stats(server_ev.peer)
+        assert sstats is not None
+        assert sstats.packets_received >= 1
+
+        caps = client.peer_capabilities(peer)
+        assert caps is not None
+        assert caps & netlink.CapFlowControl  # always negotiated on
+
+        assert client.peer_stats(peer + 999) is None
+        assert client.peer_capabilities(peer + 999) is None
+    finally:
+        client.close()
+        server.close()
+
+
 if __name__ == "__main__":
-    import pytest
-    sys.exit(pytest.main([__file__, "-v"]))
+    # Self-contained runner: discovers test_* functions and runs them
+    # without requiring pytest (which may not be installed).
+    import traceback
+
+    failures = 0
+    tests = [(name, fn) for name, fn in sorted(globals().items())
+             if name.startswith("test_") and callable(fn)]
+    for name, fn in tests:
+        try:
+            fn()
+            print(f"  OK   {name}")
+        except Exception:
+            failures += 1
+            print(f"  FAIL {name}")
+            traceback.print_exc()
+    print(f"\n{len(tests)} run, {failures} failed")
+    sys.exit(1 if failures else 0)

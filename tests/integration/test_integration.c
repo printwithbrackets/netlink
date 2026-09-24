@@ -16,65 +16,6 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <poll.h>
-#include <dirent.h>
-
-/* Collect the local UDP ports of sockets owned by this process by matching
- * /proc/self/fd socket inodes against /proc/net/udp. Used to discover the
- * client's (unexposed) discovery socket port after nl_discovery_probe so a
- * test can inject raw responses without relying on broadcast delivery. */
-static int collect_process_udp_ports(uint16_t *out, int max) {
-    char inodes[64][64];
-    int inode_count = 0;
-    DIR *fd_dir = opendir("/proc/self/fd");
-    if (!fd_dir) return 0;
-    struct dirent *de;
-    while ((de = readdir(fd_dir)) != NULL && inode_count < 64) {
-        if (de->d_name[0] == '.') continue;
-        char path[320], link[128];
-        snprintf(path, sizeof(path), "/proc/self/fd/%s", de->d_name);
-        ssize_t n = readlink(path, link, sizeof(link) - 1);
-        if (n <= 0) continue;
-        link[n] = '\0';
-        unsigned long ino = 0;
-        if (sscanf(link, "socket:[%lu]", &ino) == 1)
-            snprintf(inodes[inode_count++], 64, "%lu", ino);
-    }
-    closedir(fd_dir);
-
-    FILE *f = fopen("/proc/net/udp", "r");
-    if (!f) return 0;
-    char line[256];
-    if (!fgets(line, sizeof(line), f)) { fclose(f); return 0; } /* header */
-    int count = 0;
-    while (fgets(line, sizeof(line), f) && count < max) {
-        /* /proc/net/udp columns (space-separated after "sl:"):
-         * local_address rem_address st tx:rx tr:tm retrnsmt uid timeout inode ...
-         * local_address is HEXADDR:HEXPORT. */
-        char local[32];
-        unsigned inode = 0;
-        if (sscanf(line, "%*d: %31s %*s %*s %*s %*s %*u %*u %*u %u",
-                   local, &inode) < 2)
-            continue;
-        char *colon = strrchr(local, ':');
-        if (!colon) continue;
-        unsigned local_port = (unsigned)strtoul(colon + 1, NULL, 16);
-        char inode_str[32];
-        snprintf(inode_str, sizeof(inode_str), "%u", inode);
-        for (int i = 0; i < inode_count; i++) {
-            if (strcmp(inodes[i], inode_str) == 0) {
-                out[count++] = (uint16_t)local_port;
-                break;
-            }
-        }
-    }
-    fclose(f);
-    return count;
-}
-
-static bool port_in_list(const uint16_t *ports, int n, uint16_t p) {
-    for (int i = 0; i < n; i++) if (ports[i] == p) return true;
-    return false;
-}
 
 static bool wait_for_event(nl_endpoint_t *ep, nl_event_type_t type, nl_event_t *out, int timeout_ms) {
     uint64_t deadline_iterations = (uint64_t)timeout_ms / 50 + 1;
@@ -219,6 +160,80 @@ TEST(test_fragmentation_over_real_sockets) {
     ASSERT_MEM_EQ(ev.data, big, big_len);
 
     free(big);
+    nl_endpoint_destroy(client);
+    nl_endpoint_destroy(server);
+}
+
+/* Large message over real sockets: 40000 bytes (40 fragments) exceeds the
+ * initial congestion window, so delivery depends on the endpoint's
+ * post-drain standalone-ack flush (NL_PKT_ACK) and continuation parking. */
+TEST(test_large_message_40000_over_real_sockets) {
+    nl_config_t cfg; nl_config_default(&cfg);
+    nl_endpoint_t *server = NULL, *client = NULL;
+    nl_address_t bind_addr = addr("127.0.0.1", 34715);
+    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+
+    nl_peer_id_t client_peer;
+    ASSERT_EQ(nl_connect(client, &bind_addr, &client_peer), NL_OK);
+    nl_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 3000));
+    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 3000));
+
+    size_t big_len = 40000;
+    uint8_t *big = (uint8_t *)malloc(big_len);
+    ASSERT_TRUE(big != NULL);
+    for (size_t i = 0; i < big_len; i++) big[i] = (uint8_t)((i * 17 + 3) & 0xFF);
+
+    ASSERT_EQ(nl_send(client, client_peer, 0, NL_RELIABLE_ORDERED, big, big_len), NL_OK);
+    ASSERT_TRUE(wait_for_event(server, NL_EVENT_DATA, &ev, 15000));
+    ASSERT_EQ(ev.data_len, big_len);
+    ASSERT_MEM_EQ(ev.data, big, big_len);
+
+    /* Server must still be connected (acks kept the client from giving up). */
+    nl_peer_stats_t cstats;
+    ASSERT_TRUE(nl_peer_stats(client, client_peer, &cstats));
+
+    free(big);
+    nl_endpoint_destroy(client);
+    nl_endpoint_destroy(server);
+}
+
+/* One-way reliable traffic: the server never sends application data, so
+ * every ack must ride on a standalone NL_PKT_ACK (endpoint flush after
+ * socket drain). Without those, the client would retransmit until give-up
+ * and the server would see duplicates/timeout. */
+TEST(test_one_way_reliable_over_real_sockets) {
+    nl_config_t cfg; nl_config_default(&cfg);
+    nl_endpoint_t *server = NULL, *client = NULL;
+    nl_address_t bind_addr = addr("127.0.0.1", 34716);
+    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+
+    nl_peer_id_t client_peer;
+    ASSERT_EQ(nl_connect(client, &bind_addr, &client_peer), NL_OK);
+    nl_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 3000));
+    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 3000));
+
+    for (int i = 0; i < 5; i++) {
+        char msg[8];
+        snprintf(msg, sizeof(msg), "ow%d", i);
+        ASSERT_EQ(nl_send(client, client_peer, 0, NL_RELIABLE_ORDERED,
+                          (const uint8_t *)msg, strlen(msg)), NL_OK);
+    }
+
+    for (int i = 0; i < 5; i++) {
+        ASSERT_TRUE(wait_for_event(server, NL_EVENT_DATA, &ev, 5000));
+        ASSERT_EQ(ev.channel, 0);
+    }
+
+    /* Let acks round-trip and any RTO fire: client stats must show no
+     * retransmits (acks arrived via NL_PKT_ACK before the first RTO). */
+    nl_peer_stats_t cstats;
+    ASSERT_TRUE(nl_peer_stats(client, client_peer, &cstats));
+    ASSERT_EQ(cstats.retransmits, 0u);
+
     nl_endpoint_destroy(client);
     nl_endpoint_destroy(server);
 }
@@ -528,82 +543,90 @@ TEST(test_server_name_copied_at_create_time) {
 
 /* Regression (finding 5): a DISCOVERY_RESPONSE whose nonce does not match
  * the most recent probe must be dropped, not surfaced as a live result.
- * Locates the client's discovery socket via /proc so the test works even
- * when broadcast is filtered (no need to observe the outgoing probe). */
+ * Probes now carry a random (never-zero) nonce, so the test binds to the
+ * loopback discovery port first, captures the outgoing probe, and echoes
+ * its real nonce for the positive case. Also checks that from_address
+ * comes from the packet's socket source, not the body's server_port. */
 TEST(test_discovery_wrong_nonce_ignored) {
     nl_config_t cfg; nl_config_default(&cfg);
     nl_endpoint_t *client = NULL;
 
-    uint16_t before[64];
-    int before_n = collect_process_udp_ports(before, 64);
+    /* Bind before probing so the client's unconditional loopback copy
+     * (127.0.0.1:34804) lands here and we can read the random nonce. */
+    int raw = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    ASSERT_TRUE(raw >= 0);
+    struct sockaddr_in bind_addr;
+    memset(&bind_addr, 0, sizeof(bind_addr));
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_port = htons(34804);
+    bind_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    ASSERT_EQ(bind(raw, (struct sockaddr *)&bind_addr, sizeof(bind_addr)), 0);
+
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 300000 };
+    setsockopt(raw, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
     nl_result_t probe = nl_discovery_probe(client, 34804, 500);
     if (probe != NL_OK) {
         printf("  SKIP test_discovery_wrong_nonce_ignored: nl_discovery_probe failed (%d)\n", probe);
+        close(raw);
         nl_endpoint_destroy(client);
         return;
     }
 
-    /* The probe creates a fresh discovery socket; find the new port.
-     * Uses /proc (Linux-only); on other platforms there is no portable
-     * way to locate the unexposed socket, so skip. */
-    uint16_t after[64];
-    int after_n = collect_process_udp_ports(after, 64);
-    uint16_t disc_port = 0;
-    for (int i = 0; i < after_n; i++) {
-        if (!port_in_list(before, before_n, after[i])) {
-            disc_port = after[i];
-            break;
-        }
-    }
-    if (disc_port == 0) {
-        printf("  SKIP test_discovery_wrong_nonce_ignored: cannot locate discovery socket\n");
+    /* Capture the outgoing DISCOVERY_REQUEST (loopback copy). */
+    uint8_t req[NL_DISCOVERY_REQUEST_SIZE + 16];
+    struct sockaddr_storage from;
+    socklen_t from_len = sizeof(from);
+    ssize_t n = recvfrom(raw, req, sizeof(req), 0, (struct sockaddr *)&from, &from_len);
+    if (n < (ssize_t)NL_DISCOVERY_REQUEST_SIZE || req[0] != NL_PKT_DISCOVERY_REQUEST) {
+        printf("  SKIP test_discovery_wrong_nonce_ignored: no probe captured on loopback\n");
+        close(raw);
         nl_endpoint_destroy(client);
         return;
     }
+    uint32_t real_nonce = nl_get_u32(req + 5);
+    ASSERT_TRUE(real_nonce != 0); /* probes are never zero so 0 is a guaranteed-wrong nonce */
 
-    int raw = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    ASSERT_TRUE(raw >= 0);
-    struct timeval tv = { .tv_sec = 0, .tv_usec = 300000 };
-    setsockopt(raw, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in reply_to;
+    memset(&reply_to, 0, sizeof(reply_to));
+    reply_to.sin_family = AF_INET;
+    reply_to.sin_port = ((struct sockaddr_in *)&from)->sin_port;
+    reply_to.sin_addr.s_addr = inet_addr("127.0.0.1");
 
-    struct sockaddr_in dest;
-    memset(&dest, 0, sizeof(dest));
-    dest.sin_family = AF_INET;
-    dest.sin_port = htons(disc_port);
-    dest.sin_addr.s_addr = inet_addr("127.0.0.1");
-
-    /* First probe used nonce 1 (discovery_probe_nonce starts at 0, pre-increment).
-     * Send a WRONG nonce first. */
+    /* Nonce 0: guaranteed wrong -- must not surface. Body claims port 9999
+     * so a buggy from_address (body-sourced) would be distinguishable. */
     uint8_t resp[NL_DISCOVERY_RESPONSE_MIN_SIZE + 16];
     size_t o = 0;
     resp[o++] = NL_PKT_DISCOVERY_RESPONSE;
-    nl_put_u32(resp + o, 9999); o += 4; /* wrong: real is 1 */
+    nl_put_u32(resp + o, 0); o += 4;
     nl_put_u16(resp + o, 9999); o += 2;
     nl_put_u32(resp + o, 0); o += 4;
     nl_put_u32(resp + o, 64); o += 4;
     resp[o++] = 4;
     memcpy(resp + o, "fake", 4); o += 4;
-    ASSERT_TRUE(sendto(raw, resp, o, 0, (struct sockaddr *)&dest, sizeof(dest)) >= 0);
+    ASSERT_TRUE(sendto(raw, resp, o, 0, (struct sockaddr *)&reply_to, sizeof(reply_to)) >= 0);
 
     nl_event_t ev;
     bool got_bad = wait_for_event(client, NL_EVENT_DISCOVERY_REPLY, &ev, 300);
     ASSERT_TRUE(!got_bad); /* wrong nonce must not surface */
 
-    /* Correct nonce (first probe → 1) must be accepted. */
+    /* Captured nonce must be accepted. Body still claims 9999; the event's
+     * from_address.port must be THIS socket's source (34804), proving the
+     * library used the socket source, not the attacker-controlled body. */
     o = 0;
     resp[o++] = NL_PKT_DISCOVERY_RESPONSE;
-    nl_put_u32(resp + o, 1); o += 4;
-    nl_put_u16(resp + o, 9999); o += 2;
+    nl_put_u32(resp + o, real_nonce); o += 4;
+    nl_put_u16(resp + o, 9999); o += 2; /* lie in the body */
     nl_put_u32(resp + o, 0); o += 4;
     nl_put_u32(resp + o, 64); o += 4;
     resp[o++] = 5;
     memcpy(resp + o, "valid", 5); o += 5;
-    ASSERT_TRUE(sendto(raw, resp, o, 0, (struct sockaddr *)&dest, sizeof(dest)) >= 0);
+    ASSERT_TRUE(sendto(raw, resp, o, 0, (struct sockaddr *)&reply_to, sizeof(reply_to)) >= 0);
 
     ASSERT_TRUE(wait_for_event(client, NL_EVENT_DISCOVERY_REPLY, &ev, 1000));
     ASSERT_TRUE(strcmp(ev.server_name, "valid") == 0);
+    ASSERT_EQ(ev.from_address.port, 34804u); /* socket source, not body's 9999 */
 
     close(raw);
     nl_endpoint_destroy(client);
@@ -679,6 +702,8 @@ int main(void) {
     RUN_TEST(test_capability_negotiation_intersects_both_sides);
     RUN_TEST(test_all_delivery_modes_over_real_sockets);
     RUN_TEST(test_fragmentation_over_real_sockets);
+    RUN_TEST(test_large_message_40000_over_real_sockets);
+    RUN_TEST(test_one_way_reliable_over_real_sockets);
     RUN_TEST(test_multiple_channels_dont_block_each_other);
     RUN_TEST(test_graceful_disconnect_over_real_sockets);
     RUN_TEST(test_ipv6_loopback);

@@ -122,7 +122,7 @@ nl_server_create(&addr, &cfg, &server);
 while (1) {
     nl_event_t ev;
     if (!nl_poll_event(server, &ev, 100)) continue;
-    if (ev.type == NL_EVENT_DATA) {
+    if (ev.event_type == NL_EVENT_DATA) {
         nl_send(server, ev.peer, ev.channel, NL_RELIABLE_ORDERED, ev.data, ev.data_len); // echo
     }
 }
@@ -265,11 +265,12 @@ environment** (a sandboxed Linux container with a C toolchain, OpenSSL,
 and Python, but no Go/Rust toolchain, no IPv6 support at the kernel
 level, and no network access to install either):
 
-- 122 test cases across unit tests (`tests/test_seqbuf.c`,
+- 129 test cases across unit tests (`tests/test_seqbuf.c`,
   `test_crypto.c`, `test_fragment.c`, `test_channel.c`,
-  `test_connection.c`, `test_network_simulation.c`) and real-socket
-  integration tests (`tests/integration/test_integration.c`), all clean
-  under AddressSanitizer + UndefinedBehaviorSanitizer -- no leaks, no UB.
+  `test_connection.c`, `test_network_simulation.c`: 110 cases) and
+  real-socket integration tests
+  (`tests/integration/test_integration.c`: 19 cases), all clean under
+  AddressSanitizer + UndefinedBehaviorSanitizer -- no leaks, no UB.
 - `test_network_simulation.c` specifically drives thousands of messages
   through a simulated bad network (configurable packet loss, jitter/
   reordering, duplication) and verifies `RELIABLE_ORDERED` delivery stays
@@ -279,11 +280,17 @@ level, and no network access to install either):
 - The integration tests spin up **real client and server endpoints
   communicating over actual loopback UDP sockets**, covering: the full
   encrypted handshake, capability negotiation, all four delivery modes,
-  fragmentation of a 5000-byte message, multiple independent channels,
-  graceful disconnect, LAN discovery, and server-full denial.
+  fragmentation of a 5000-byte and 40000-byte messages (the latter
+  exceeds the initial congestion window and exercises continuation
+  parking + standalone acks), one-way reliable traffic (server never
+  app-sends -- acks must ride on `NL_PKT_ACK`), multiple independent
+  channels, graceful disconnect, LAN discovery (including random-nonce
+  rejection and `from_address` taken from the socket source), and
+  server-full denial.
 - The **Python bindings**, tested the same way (real `Server` + `Client`
-  over real sockets, plus a manual run against the compiled C example
-  binaries as separate OS processes) -- 5/5 passing.
+  over real sockets, covering echo, all delivery modes, fragmentation,
+  priority/`send_ex`, peer stats/capabilities, disconnect, and
+  server-full denial) -- 7/7 passing.
 - The **example C programs** (`echo_server`/`echo_client`), run as two
   independent OS processes exchanging messages across three channels and
   delivery modes.
@@ -380,11 +387,22 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 First stable release. Library version is **1.0.0**
 (`NL_VERSION_MAJOR/MINOR/PATCH`, `nl_version_string()`, Python
 `__version__` / `version()`, `Cargo.toml`, `pyproject.toml`). Wire
-protocol is **`NL_PROTOCOL_VERSION` 2**.
+protocol is **`NL_PROTOCOL_VERSION` 3**.
 
 Code review pass over the 0.1.0 core; all findings fixed with regression
 tests (`make` warning-free, `make test` green under ASan/UBSan). Wire
-format changed: **`NL_PROTOCOL_VERSION` bumped to 2** (see below).
+format changed: **`NL_PROTOCOL_VERSION` bumped to 3** (see below).
+
+Second review pass (same day): fixed one-way-reliable delivery (no
+standalone acks -- receiver had nothing to piggyback on), peer-rwnd
+accounting for in-flight bytes, send-ring overwrite of unacked slots,
+backoff overflow on long give-up paths, discovery random nonces +
+`from_address` provenance, handshake/discovery flood rate limits, and
+several smaller correctness/docs gaps. Protocol bumped **2 → 3**. New
+regression tests: large reliable messages (40 KB / 100 KB), continuation
+parking under ring pressure, one-way reliable over simulated and real
+sockets, send-ring overwrite refusal, discovery nonce capture over a
+real loopback probe, and Python `send_ex`/peer-stats coverage.
 
 Core transport slice: congestion control, flow control, per-connection
 rate limiting, priority/QoS per send, and handshake capability
@@ -413,8 +431,14 @@ negotiation -- each with regression tests.
 - **Capability negotiation.** REQUEST and CHALLENGE carry a u32
   `NL_CAP_*` bitmask (`NL_CAP_FLOW_CONTROL`, `NL_CAP_PRIORITY`,
   `NL_CAP_RATE_LIMIT`); both sides store the intersection and expose it
-  via `nl_peer_capabilities`. `NL_CAP_FLOW_CONTROL` is always forced on
-  under v2. Wire sizes: REQUEST 64 → 68 bytes, CHALLENGE 67 → 69.
+  via `nl_peer_capabilities`. `NL_CAP_FLOW_CONTROL` is always forced on.
+  Wire sizes: REQUEST 64 → 68 bytes, CHALLENGE 67 → 69.
+- **Standalone ACKs (protocol v3).** New encrypted `NL_PKT_ACK` packet so
+  reliable traffic flowing one way (client → server with no reverse
+  application data) still gets acks without waiting for a piggyback
+  opportunity. Discovery probe nonces are now random (never zero) rather
+  than a counter, so an off-path guesser can't forge a valid reply.
+  **`NL_PROTOCOL_VERSION` bumped 2 → 3** for these wire changes.
 - **Handshake retransmission.** `CONNECT_REQUEST`, `CONNECT_CHALLENGE`,
   and `CONNECT_ACCEPTED` are now retried on a 250 ms timer with a finite
   budget (`NL_ACCEPT_RETRIES` for the final accept), instead of a single
@@ -435,9 +459,13 @@ negotiation -- each with regression tests.
   `nl_server_create`/`nl_client_create` return `NL_ERR_UNSUPPORTED`
   rather than silently encrypting (or shipping a protocol hole).
 - **Discovery hardening.** Replies must echo the most recent probe's
-  nonce (delayed/forged replies are dropped). Discovery has its own
-  rate-limit budget (200/s/endpoint), separate from the handshake
-  limiter, so a flood of probes can't starve connect attempts.
+  random nonce (delayed/forged replies are dropped); the event's
+  `from_address` comes from the packet's socket source, not the
+  attacker-controlled body. Discovery has its own rate-limit budget
+  (200/s/endpoint), separate from the handshake limiter, so a flood of
+  probes can't starve connect attempts. Handshake and discovery
+  processing are rate-limited so response floods can't spin the I/O
+  thread.
 - **`max_connections` clamped** to the hard internal cap (512) at
   endpoint create, so discovery advertises the real limit instead of a
   value that would pass REQUEST-time checks and then fail silently at

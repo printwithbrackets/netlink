@@ -35,10 +35,26 @@ from typing import Iterator, Optional
 __version__ = "1.0.0"
 
 __all__ = [
-    "Delivery", "EventType", "AddressFamily", "Transport",
+    "Delivery", "EventType", "AddressFamily", "Transport", "Priority",
     "NetLinkError", "Event", "Config", "Endpoint", "Server", "Client",
-    "version", "__version__",
+    "PeerStats", "version", "__version__",
 ]
+
+# --------------------------------------------------------------------------
+# Priority constants (mirrors include/netlink.h -- keep in sync)
+# --------------------------------------------------------------------------
+
+class Priority:
+    LOW = 0
+    NORMAL = 64
+    HIGH = 128
+    CRITICAL = 192
+
+
+# Capability bits (mirrors NL_CAP_* -- keep in sync).
+CapFlowControl = 0x00000001
+CapPriority = 0x00000002
+CapRateLimit = 0x00000004
 
 # --------------------------------------------------------------------------
 # Library loading
@@ -165,6 +181,20 @@ class _Event(ctypes.Structure):
     ]
 
 
+class _PeerStats(ctypes.Structure):
+    _fields_ = [
+        ("packets_sent", ctypes.c_uint64),
+        ("packets_received", ctypes.c_uint64),
+        ("bytes_sent", ctypes.c_uint64),
+        ("bytes_received", ctypes.c_uint64),
+        ("retransmits", ctypes.c_uint64),
+        ("duplicates_received", ctypes.c_uint64),
+        ("rtt_ms", ctypes.c_uint32),
+        ("rtt_var_ms", ctypes.c_uint32),
+        ("rto_ms", ctypes.c_uint32),
+    ]
+
+
 # --------------------------------------------------------------------------
 # Function signatures
 # --------------------------------------------------------------------------
@@ -197,6 +227,10 @@ _lib.nl_send.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint8, ctype
                          ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t]
 _lib.nl_send.restype = ctypes.c_int
 
+_lib.nl_send_ex.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint8, ctypes.c_int,
+                            ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.c_uint8]
+_lib.nl_send_ex.restype = ctypes.c_int
+
 _lib.nl_poll_event.argtypes = [ctypes.c_void_p, ctypes.POINTER(_Event), ctypes.c_int]
 _lib.nl_poll_event.restype = ctypes.c_bool
 
@@ -211,6 +245,12 @@ _lib.nl_peer_rtt_ms.restype = ctypes.c_uint32
 
 _lib.nl_peer_count.argtypes = [ctypes.c_void_p]
 _lib.nl_peer_count.restype = ctypes.c_uint32
+
+_lib.nl_peer_stats.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(_PeerStats)]
+_lib.nl_peer_stats.restype = ctypes.c_bool
+
+_lib.nl_peer_capabilities.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint32)]
+_lib.nl_peer_capabilities.restype = ctypes.c_bool
 
 
 def _check(code: int) -> None:
@@ -262,6 +302,20 @@ class Event:
 
 
 @dataclass
+class PeerStats:
+    """Snapshot of per-peer counters and RTT estimates (nl_peer_stats)."""
+    packets_sent: int
+    packets_received: int
+    bytes_sent: int
+    bytes_received: int
+    retransmits: int
+    duplicates_received: int
+    rtt_ms: int
+    rtt_var_ms: int
+    rto_ms: int
+
+
+@dataclass
 class Config:
     channel_count: int = 4
     max_connections: int = 64
@@ -303,6 +357,12 @@ class Endpoint:
         buf = (ctypes.c_uint8 * len(data)).from_buffer_copy(data)
         _check(_lib.nl_send(self._handle, peer, channel, int(delivery), buf, len(data)))
 
+    def send_ex(self, peer: int, channel: int, data: bytes, delivery: Delivery = Delivery.RELIABLE_ORDERED,
+                priority: int = Priority.NORMAL) -> None:
+        """Like send(), with an explicit priority (0..255; see Priority)."""
+        buf = (ctypes.c_uint8 * len(data)).from_buffer_copy(data)
+        _check(_lib.nl_send_ex(self._handle, peer, channel, int(delivery), buf, len(data), priority))
+
     def disconnect(self, peer: int) -> None:
         _check(_lib.nl_disconnect(self._handle, peer))
 
@@ -330,6 +390,30 @@ class Endpoint:
 
     def peer_count(self) -> int:
         return _lib.nl_peer_count(self._handle)
+
+    def peer_stats(self, peer: int) -> Optional[PeerStats]:
+        """Snapshot of per-peer counters/RTT estimates, or None if unknown."""
+        raw = _PeerStats()
+        if not _lib.nl_peer_stats(self._handle, peer, ctypes.byref(raw)):
+            return None
+        return PeerStats(
+            packets_sent=raw.packets_sent,
+            packets_received=raw.packets_received,
+            bytes_sent=raw.bytes_sent,
+            bytes_received=raw.bytes_received,
+            retransmits=raw.retransmits,
+            duplicates_received=raw.duplicates_received,
+            rtt_ms=raw.rtt_ms,
+            rtt_var_ms=raw.rtt_var_ms,
+            rto_ms=raw.rto_ms,
+        )
+
+    def peer_capabilities(self, peer: int) -> Optional[int]:
+        """Negotiated NL_CAP_* bitmask with this peer, or None if unknown."""
+        caps = ctypes.c_uint32(0)
+        if not _lib.nl_peer_capabilities(self._handle, peer, ctypes.byref(caps)):
+            return None
+        return caps.value
 
     def close(self) -> None:
         if self._handle:

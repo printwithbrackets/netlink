@@ -22,12 +22,15 @@ bool nl_send_ring_insert(nl_send_ring_t *ring, const uint8_t *data, uint16_t len
     if (len > NL_MAX_PACKET_SIZE_INTERNAL) return false;
     uint16_t seq = ring->next_sequence;
     nl_send_slot_t *slot = &ring->slots[seq & NL_SEQ_RING_MASK];
-    /* A slot re-entered after a 65536-sequence wrap must not leave a
-     * stale unacked_count bump from the previous life of this index. */
-    if (slot->valid && !slot->acked && slot->sequence == seq &&
-        ring->unacked_count > 0) {
-        ring->unacked_count--;
-    }
+    /* Refuse to overwrite a live (valid, unacked) slot: that packet has
+     * never been acked, so silently replacing it would strand the
+     * receiver with a gap it can never fill (the original would never be
+     * retransmitted). Callers gate on unacked_count/ring room before
+     * inserting; this is the fail-closed backstop if they ever don't.
+     * An acked (or stale previous-wrap) slot at this index is safe to
+     * recycle -- acked slots don't participate in unacked_count, so the
+     * decrement the old overwrite path needed is gone with the refusal. */
+    if (slot->valid && !slot->acked) return false;
     slot->sequence = seq;
     slot->valid = true;
     slot->acked = false;
