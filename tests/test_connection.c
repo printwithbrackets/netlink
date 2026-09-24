@@ -37,6 +37,11 @@ typedef struct harness {
     uint8_t      last_channel;
     nl_delivery_t last_delivery;
     int          data_count;
+    /* First few payloads, so tests can assert flush order not just the
+     * most recent delivery (priority reordering). */
+    uint8_t      order[8][64];
+    int          order_len[8];
+    int          order_count;
 
     int          disconnect_count;
     nl_result_t  last_disconnect_reason;
@@ -57,6 +62,11 @@ static void h_on_data(void *ctx, nl_peer_id_t peer, uint8_t channel, nl_delivery
     h->last_channel = channel;
     h->last_delivery = delivery;
     h->data_count++;
+    if (h->order_count < 8 && len <= 64) {
+        memcpy(h->order[h->order_count], data, len);
+        h->order_len[h->order_count] = (int)len;
+        h->order_count++;
+    }
 }
 
 static void h_on_disconnected(void *ctx, nl_peer_id_t peer, nl_result_t reason) {
@@ -176,7 +186,7 @@ static void harness_init(harness_t *h) {
 static nl_result_t harness_send(harness_t *h, nl_connection_t *conn, uint8_t channel, nl_delivery_t delivery,
                                  const uint8_t *data, size_t len, uint64_t now_ms) {
     enter_in_flight(conn);
-    nl_result_t r = nl_connection_send(conn, channel, delivery, data, len, now_ms, &h->cb);
+    nl_result_t r = nl_connection_send(conn, channel, delivery, data, len, NL_PRIORITY_NORMAL, now_ms, &h->cb);
     exit_in_flight();
     drain_queue();
     return r;
@@ -519,6 +529,211 @@ TEST(test_connection_replay_attack_rejected) {
     nl_connection_destroy(sc);
 }
 
+/* ---- congestion control ---- */
+
+TEST(test_congestion_window_gates_reliable_sends) {
+    harness_t ch, sh;
+    nl_connection_t *cc, *sc;
+    make_pair(&ch, &sh, &cc, &sc, 10000, 100000);
+
+    /* Initial cwnd is NL_CWND_INITIAL_PACKETS (10). Fill it with
+     * unacked reliable sends; the next must park (still NL_OK), and the
+     * peer must not see an 11th packet until acks open the window. */
+    const char *msg = "x";
+    for (int i = 0; i < NL_CWND_INITIAL_PACKETS; i++) {
+        ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED, (const uint8_t *)msg, 1, 0), NL_OK);
+    }
+    ASSERT_EQ(sh.data_count, NL_CWND_INITIAL_PACKETS);
+    int sent_at_cap = ch.packets_sent;
+
+    /* 11th: window full -> deferred, not emitted yet. */
+    ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED, (const uint8_t *)msg, 1, 0), NL_OK);
+    ASSERT_EQ(ch.packets_sent, sent_at_cap); /* nothing new on the wire */
+    ASSERT_EQ(sh.data_count, NL_CWND_INITIAL_PACKETS);
+
+    /* Peer replies: its DATA carries an ack covering everything received,
+     * which opens the window and flushes the deferred message. */
+    ASSERT_EQ(harness_send(&sh, sc, 0, NL_RELIABLE_ORDERED, (const uint8_t *)"a", 1, 10), NL_OK);
+    ASSERT_TRUE(sh.data_count >= NL_CWND_INITIAL_PACKETS + 1);
+    ASSERT_TRUE(ch.packets_sent > sent_at_cap);
+
+    nl_connection_destroy(cc);
+    nl_connection_destroy(sc);
+}
+
+TEST(test_congestion_loss_shrinks_window) {
+    harness_t ch, sh;
+    nl_connection_t *cc, *sc;
+    make_pair(&ch, &sh, &cc, &sc, 10000, 100000);
+
+    /* Drive a few reliable sends so cwnd has data, then force an RTO
+     * retransmit (loss signal) and confirm cwnd collapsed to 1. */
+    const char *msg = "y";
+    for (int i = 0; i < 5; i++) {
+        ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED, (const uint8_t *)msg, 1, 0), NL_OK);
+    }
+    /* Drop the peer's reply so the client's packets stay unacked. */
+    sh.drop_next_send = true;
+    harness_tick(&ch, cc, 5000); /* past RTO -> retransmit -> cc_on_loss(fast=false) */
+    ASSERT_TRUE(ch.packets_sent >= 6);
+
+    /* With cwnd==1 after RTO loss, only one more reliable packet goes out
+     * before parking (the unacked ones from before still occupy the ring
+     * but window is 1 and some may already be in flight). Read cwnd via
+     * the gate: send a burst of 5; at most a small number emit. */
+    int before = ch.packets_sent;
+    for (int i = 0; i < 5; i++) {
+        harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED, (const uint8_t *)msg, 1, 6000);
+    }
+    /* cwnd was reset to 1 on RTO; retransmits of old slots don't count as
+     * new in-flight for the gate beyond what's still unacked. The key
+     * observable: we cannot blast 5 brand-new packets past a collapsed
+     * window without acks. At least one of the 5 must have deferred. */
+    ASSERT_TRUE(sh.data_count < 5 + NL_CWND_INITIAL_PACKETS + 1 ||
+                ch.packets_sent - before <= 5);
+    /* Stronger check: after RTO, ssthresh/cwnd are small, so total NEW
+     * emissions in this burst are strictly fewer than 5 without peer acks
+     * of the new data. The peer did not reply (drop was only one shot on
+     * the earlier tick), so at most a tiny number leave. */
+    ASSERT_TRUE(ch.packets_sent - before < 5);
+
+    nl_connection_destroy(cc);
+    nl_connection_destroy(sc);
+}
+
+/* ---- flow control (peer receive window) ---- */
+
+TEST(test_flow_control_parks_when_peer_window_zero) {
+    harness_t ch, sh;
+    nl_connection_t *cc, *sc;
+    make_pair(&ch, &sh, &cc, &sc, 10000, 100000);
+
+    /* Force the client's view of the peer's rwnd to 0, then send: must
+     * park (NL_OK) without emitting. */
+    cc->peer_rwnd = 0;
+    int before = ch.packets_sent;
+    ASSERT_EQ(harness_send(&ch, cc, 0, NL_UNRELIABLE, (const uint8_t *)"blocked", 7, 0), NL_OK);
+    ASSERT_EQ(ch.packets_sent, before);
+    ASSERT_EQ(sh.data_count, 0);
+
+    /* Open the window and tick: deferred send flushes. */
+    cc->peer_rwnd = NL_RECV_WINDOW_DEFAULT;
+    harness_tick(&ch, cc, 100);
+    ASSERT_EQ(sh.data_count, 1);
+    ASSERT_MEM_EQ(sh.last_data, "blocked", 7);
+
+    nl_connection_destroy(cc);
+    nl_connection_destroy(sc);
+}
+
+/* ---- per-connection rate limiting ---- */
+
+TEST(test_rate_limit_defers_burst_then_recovers) {
+    harness_t ch, sh;
+    nl_connection_t *cc, *sc;
+    make_pair(&ch, &sh, &cc, &sc, 10000, 100000);
+
+    /* 100 bytes/sec with a full 1s bucket at t=0. An 80-byte payload
+     * leaves only 20 tokens; a second 40-byte payload in the same
+     * instant must park until the bucket refills. */
+    cc->rate_bps = 100;
+    cc->rate_tokens = 100.0;
+    cc->rate_last_refill_ms = 0;
+
+    uint8_t big[80];
+    memset(big, 'A', sizeof(big));
+    ASSERT_EQ(harness_send(&ch, cc, 0, NL_UNRELIABLE, big, sizeof(big), 0), NL_OK);
+    ASSERT_EQ(sh.data_count, 1);
+
+    int after_first = ch.packets_sent;
+    uint8_t small[40];
+    memset(small, 'B', sizeof(small));
+    ASSERT_EQ(harness_send(&ch, cc, 0, NL_UNRELIABLE, small, sizeof(small), 0), NL_OK);
+    ASSERT_EQ(ch.packets_sent, after_first); /* rate starved -> parked */
+    ASSERT_EQ(sh.data_count, 1);
+
+    /* Advance ~1s so the bucket refills, tick to flush. */
+    harness_tick(&ch, cc, 1000);
+    ASSERT_EQ(sh.data_count, 2);
+    ASSERT_EQ(sh.last_data_len, 40u);
+    ASSERT_EQ(sh.last_data[0], 'B');
+
+    nl_connection_destroy(cc);
+    nl_connection_destroy(sc);
+}
+
+/* ---- priority / deferred queue ---- */
+
+TEST(test_priority_high_flushes_before_low) {
+    harness_t ch, sh;
+    nl_connection_t *cc, *sc;
+    make_pair(&ch, &sh, &cc, &sc, 10000, 100000);
+
+    /* Close the peer window so both park (high is enqueued second but
+     * must sort ahead of low), then reopen and confirm flush order. */
+    cc->peer_rwnd = 0;
+
+    enter_in_flight(cc);
+    ASSERT_EQ(nl_connection_send(cc, 0, NL_UNRELIABLE, (const uint8_t *)"low", 3,
+                                  NL_PRIORITY_LOW, 0, &ch.cb), NL_OK);
+    ASSERT_EQ(nl_connection_send(cc, 0, NL_UNRELIABLE, (const uint8_t *)"high", 4,
+                                  NL_PRIORITY_HIGH, 0, &ch.cb), NL_OK);
+    exit_in_flight();
+    drain_queue();
+    ASSERT_EQ(sh.data_count, 0); /* both parked on zero rwnd */
+
+    cc->peer_rwnd = NL_RECV_WINDOW_DEFAULT;
+    harness_tick(&ch, cc, 100);
+    ASSERT_EQ(sh.data_count, 2);
+    ASSERT_EQ(sh.order_count, 2);
+    /* High was enqueued second but must flush first (descending priority). */
+    ASSERT_MEM_EQ(sh.order[0], "high", 4);
+    ASSERT_MEM_EQ(sh.order[1], "low", 3);
+
+    nl_connection_destroy(cc);
+    nl_connection_destroy(sc);
+}
+
+TEST(test_send_queue_full_returns_error) {
+    harness_t ch, sh;
+    nl_connection_t *cc, *sc;
+    make_pair(&ch, &sh, &cc, &sc, 10000, 100000);
+
+    cc->peer_rwnd = 0;
+    int accepted = 0;
+    nl_result_t last = NL_OK;
+    for (int i = 0; i < NL_DEFERRED_MAX_MSGS + 8; i++) {
+        enter_in_flight(cc);
+        last = nl_connection_send(cc, 0, NL_UNRELIABLE, (const uint8_t *)"q", 1,
+                                   NL_PRIORITY_NORMAL, 0, &ch.cb);
+        exit_in_flight();
+        drain_queue();
+        if (last == NL_OK) accepted++;
+        else break;
+    }
+    ASSERT_EQ(last, NL_ERR_QUEUE_FULL);
+    ASSERT_EQ(accepted, NL_DEFERRED_MAX_MSGS);
+
+    nl_connection_destroy(cc);
+    nl_connection_destroy(sc);
+}
+
+/* ---- capability negotiation helpers (connection-level store) ---- */
+
+TEST(test_capabilities_stored_on_connection) {
+    harness_t ch, sh;
+    nl_connection_t *cc, *sc;
+    make_pair(&ch, &sh, &cc, &sc, 10000, 1000);
+    /* endpoint.c stores the negotiated (AND of both peers') set after create;
+     * mirror that here. */
+    cc->capabilities = NL_CAP_FLOW_CONTROL | NL_CAP_PRIORITY;
+    sc->capabilities = NL_CAP_FLOW_CONTROL;
+    ASSERT_EQ(nl_connection_capabilities(cc), NL_CAP_FLOW_CONTROL | NL_CAP_PRIORITY);
+    ASSERT_EQ(nl_connection_capabilities(sc), NL_CAP_FLOW_CONTROL);
+    nl_connection_destroy(cc);
+    nl_connection_destroy(sc);
+}
+
 int main(void) {
     printf("=== connection tests ===\n");
     RUN_TEST(test_connection_send_and_receive_roundtrip);
@@ -532,5 +747,12 @@ int main(void) {
     RUN_TEST(test_connection_rtt_measured_from_real_roundtrip);
     RUN_TEST(test_connection_fast_retransmit_faster_than_rto);
     RUN_TEST(test_connection_replay_attack_rejected);
+    RUN_TEST(test_congestion_window_gates_reliable_sends);
+    RUN_TEST(test_congestion_loss_shrinks_window);
+    RUN_TEST(test_flow_control_parks_when_peer_window_zero);
+    RUN_TEST(test_rate_limit_defers_burst_then_recovers);
+    RUN_TEST(test_priority_high_flushes_before_low);
+    RUN_TEST(test_send_queue_full_returns_error);
+    RUN_TEST(test_capabilities_stored_on_connection);
     TEST_SUMMARY();
 }

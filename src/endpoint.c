@@ -154,6 +154,7 @@ typedef struct {
     uint8_t cookie[16];
     uint64_t connection_id;
     uint8_t channel_count;
+    uint32_t peer_caps;      /* client's advertised NL_CAP_* from REQUEST */
     uint64_t created_ms;
     /* Last cleartext handshake datagram we put on the wire for this entry
      * (REQUEST / CHALLENGE / RESPONSE), retained so the IO thread can
@@ -192,6 +193,12 @@ struct nl_endpoint {
     pthread_mutex_t queue_lock;
     pthread_cond_t queue_cond;
     uint8_t *returned_owned_data;
+    /* Metadata for the payload currently borrowed by the app via
+     * nl_poll_event, so its receive-window charge can be released when
+     * the next poll frees it (flow control's "app consumed" signal). */
+    nl_peer_id_t returned_owned_peer;
+    uint32_t returned_owned_len;
+    bool returned_owned_is_data;
 
     pthread_t io_thread;
     bool io_thread_started;
@@ -515,19 +522,24 @@ static bool derive_session_keys(const uint8_t shared[32], const uint8_t client_n
 
 static void handle_connect_request(nl_endpoint_t *ep, const uint8_t *buf, size_t len,
                                     const struct sockaddr_storage *from, socklen_t from_len, uint64_t now) {
-    if (len < NL_CONNECT_REQUEST_SIZE) return;
+    /* v1 clients send a 64-byte REQUEST without capabilities and with
+     * version==1; parse the stable prefix first so they get an explicit
+     * PROTOCOL_MISMATCH deny instead of a silent drop. */
+    if (len < NL_CONNECT_REQUEST_SIZE - 4) return;
     size_t off = 1;
     uint32_t magic = nl_get_u32(buf + off); off += 4;
     uint16_t version = nl_get_u16(buf + off); off += 2;
-    uint8_t req_channels = buf[off]; off += 1;
-    uint64_t client_connid = nl_get_u64(buf + off); off += 8;
-    uint8_t client_pub[32]; memcpy(client_pub, buf + off, 32); off += 32;
-    uint8_t client_nonce[16]; memcpy(client_nonce, buf + off, 16); off += 16;
-
     if (magic != NL_MAGIC || version != NL_PROTOCOL_VERSION) {
         send_denied(ep, from, from_len, NL_DENY_PROTOCOL_MISMATCH);
         return;
     }
+    if (len < NL_CONNECT_REQUEST_SIZE) return; /* truncated v2 */
+    uint8_t req_channels = buf[off]; off += 1;
+    uint64_t client_connid = nl_get_u64(buf + off); off += 8;
+    uint8_t client_pub[32]; memcpy(client_pub, buf + off, 32); off += 32;
+    uint8_t client_nonce[16]; memcpy(client_nonce, buf + off, 16); off += 16;
+    uint32_t client_caps = nl_get_u32(buf + off); off += 4;
+
     if (!rate_limit_check(ep, now)) return; /* silently drop under flood, don't amplify */
 
     pthread_mutex_lock(&ep->connections_lock);
@@ -572,6 +584,7 @@ static void handle_connect_request(nl_endpoint_t *ep, const uint8_t *buf, size_t
     memcpy(p->peer_nonce, client_nonce, 16);
     p->connection_id = client_connid;
     p->channel_count = channel_count;
+    p->peer_caps = client_caps;
     p->created_ms = now;
 
     uint8_t addr_bytes[19];
@@ -595,6 +608,7 @@ static void handle_connect_request(nl_endpoint_t *ep, const uint8_t *buf, size_t
     memcpy(out + o, server_pub, 32); o += 32;
     memcpy(out + o, p->my_nonce, 16); o += 16;
     memcpy(out + o, p->cookie, 16); o += 16;
+    nl_put_u32(out + o, ep->config.capabilities); o += 4;
     p->retry_packet_len = (uint16_t)o;
     p->last_retry_ms = now;
     sendto(ep->sock, out, o, 0, (const struct sockaddr *)from, from_len);
@@ -626,6 +640,7 @@ static void handle_connect_response(nl_endpoint_t *ep, const uint8_t *buf, size_
 
     uint64_t connid = p->connection_id;
     uint8_t channel_count = p->channel_count;
+    uint32_t negotiated_caps = p->peer_caps & ep->config.capabilities;
     struct sockaddr_storage paddr = p->addr;
     socklen_t paddr_len = p->addr_len;
     release_pending_locked(p);
@@ -643,6 +658,15 @@ static void handle_connect_response(nl_endpoint_t *ep, const uint8_t *buf, size_
                                                   now);
     memset(&keys, 0, sizeof(keys));
     if (!conn) { pthread_mutex_unlock(&ep->connections_lock); return; }
+    conn->capabilities = negotiated_caps;
+    conn->rate_bps = ep->config.max_send_bytes_per_sec;
+    conn->rate_tokens = conn->rate_bps ? (double)conn->rate_bps : 0.0;
+    conn->rate_last_refill_ms = now;
+    if (ep->config.recv_window_bytes) {
+        uint32_t rw = ep->config.recv_window_bytes;
+        if (rw > NL_RECV_WINDOW_MAX) rw = NL_RECV_WINDOW_MAX;
+        conn->recv_window_size = rw;
+    }
     int slot = find_free_connection_slot_locked(ep);
     if (slot < 0) {
         /* Table filled past max_connections between the REQUEST-time check
@@ -678,6 +702,7 @@ static void handle_connect_challenge(nl_endpoint_t *ep, const uint8_t *buf, size
     uint8_t server_pub[32]; memcpy(server_pub, buf + off, 32); off += 32;
     uint8_t server_nonce[16]; memcpy(server_nonce, buf + off, 16); off += 16;
     uint8_t cookie[16]; memcpy(cookie, buf + off, 16); off += 16;
+    uint32_t server_caps = nl_get_u32(buf + off); off += 4;
 
     pthread_mutex_lock(&ep->pending_lock);
     pending_t *p = find_pending_by_addr_locked(ep, from, PENDING_CLIENT_AWAIT_CHALLENGE);
@@ -692,6 +717,7 @@ static void handle_connect_challenge(nl_endpoint_t *ep, const uint8_t *buf, size
 
     uint64_t connid = p->connection_id;
     uint8_t channel_count = p->channel_count;
+    uint32_t negotiated_caps = ep->config.capabilities & server_caps;
     uint8_t client_pub[32]; nl_keypair_public(p->my_keypair, client_pub);
 
     /* Keep the pending entry as AWAIT_ACCEPTED with the RESPONSE armed for
@@ -718,6 +744,15 @@ static void handle_connect_challenge(nl_endpoint_t *ep, const uint8_t *buf, size
                                                        ep->config.connection_timeout_ms,
                                                        ep->config.keepalive_interval_ms, now);
         if (conn) {
+            conn->capabilities = negotiated_caps;
+            conn->rate_bps = ep->config.max_send_bytes_per_sec;
+            conn->rate_tokens = conn->rate_bps ? (double)conn->rate_bps : 0.0;
+            conn->rate_last_refill_ms = now;
+            if (ep->config.recv_window_bytes) {
+                uint32_t rw = ep->config.recv_window_bytes;
+                if (rw > NL_RECV_WINDOW_MAX) rw = NL_RECV_WINDOW_MAX;
+                conn->recv_window_size = rw;
+            }
             int slot = find_free_connection_slot_locked(ep);
             if (slot >= 0) ep->connections[slot] = conn; else nl_connection_destroy(conn);
         }
@@ -947,6 +982,11 @@ static nl_endpoint_t *endpoint_alloc(bool is_server, const nl_config_t *cfg) {
         ep->config.max_connections = NL_MAX_CONNECTIONS_INTERNAL;
     if (ep->config.connection_timeout_ms == 0) ep->config.connection_timeout_ms = 10000;
     if (ep->config.keepalive_interval_ms == 0) ep->config.keepalive_interval_ms = 1000;
+    if (ep->config.capabilities == 0) ep->config.capabilities = NL_CAP_DEFAULT;
+    /* v2 DATA always carries rwnd: never allow the flow-control bit off. */
+    ep->config.capabilities |= NL_CAP_FLOW_CONTROL;
+    if (ep->config.recv_window_bytes > NL_RECV_WINDOW_MAX)
+        ep->config.recv_window_bytes = NL_RECV_WINDOW_MAX;
     if (cfg->server_name) {
         strncpy(ep->server_name_buf, cfg->server_name, NL_SERVER_NAME_MAX - 1);
         ep->server_name_buf[NL_SERVER_NAME_MAX - 1] = '\0';
@@ -1115,6 +1155,7 @@ nl_result_t nl_connect(nl_endpoint_t *ep, const nl_address_t *server_addr, nl_pe
     nl_put_u64(out + o, connid); o += 8;
     memcpy(out + o, pub, 32); o += 32;
     memcpy(out + o, nonce, 16); o += 16;
+    nl_put_u32(out + o, ep->config.capabilities); o += 4;
 
     pthread_mutex_lock(&ep->pending_lock);
     if (find_pending_by_addr_locked(ep, &addr, PENDING_CLIENT_AWAIT_CHALLENGE) ||
@@ -1171,13 +1212,18 @@ void nl_endpoint_destroy(nl_endpoint_t *ep) {
 
 nl_result_t nl_send(nl_endpoint_t *ep, nl_peer_id_t peer, uint8_t channel, nl_delivery_t delivery,
                      const uint8_t *data, size_t len) {
+    return nl_send_ex(ep, peer, channel, delivery, data, len, NL_PRIORITY_NORMAL);
+}
+
+nl_result_t nl_send_ex(nl_endpoint_t *ep, nl_peer_id_t peer, uint8_t channel, nl_delivery_t delivery,
+                       const uint8_t *data, size_t len, uint8_t priority) {
     if (!ep || (len > 0 && !data)) return NL_ERR_INVALID_ARGUMENT;
     pthread_mutex_lock(&ep->connections_lock);
     nl_connection_t *conn = find_connection_locked(ep, peer);
     if (!conn) { pthread_mutex_unlock(&ep->connections_lock); return NL_ERR_PEER_NOT_FOUND; }
     conn_ctx_t cctx = { ep, conn };
     nl_conn_callbacks_t cb = make_callbacks(&cctx);
-    nl_result_t r = nl_connection_send(conn, channel, delivery, data, len, now_ms(), &cb);
+    nl_result_t r = nl_connection_send(conn, channel, delivery, data, len, priority, now_ms(), &cb);
     pthread_mutex_unlock(&ep->connections_lock);
     return r;
 }
@@ -1185,13 +1231,34 @@ nl_result_t nl_send(nl_endpoint_t *ep, nl_peer_id_t peer, uint8_t channel, nl_de
 bool nl_poll_event(nl_endpoint_t *ep, nl_event_t *out, int timeout_ms) {
     if (!ep || !out) return false;
 
+    nl_peer_id_t consume_peer = NL_INVALID_PEER;
+    uint32_t consume_len = 0;
+    bool do_consume = false;
+
     pthread_mutex_lock(&ep->queue_lock);
-    if (ep->returned_owned_data) { free(ep->returned_owned_data); ep->returned_owned_data = NULL; }
+    if (ep->returned_owned_data) {
+        /* App is done with the previous payload: free it and release the
+         * connection's receive-window charge so the peer can send more.
+         * Defer the charge release until after queue_lock is dropped to
+         * preserve lock order (connections_lock/conn->lock -> queue_lock). */
+        if (ep->returned_owned_is_data && ep->returned_owned_len > 0) {
+            do_consume = true;
+            consume_peer = ep->returned_owned_peer;
+            consume_len = ep->returned_owned_len;
+        }
+        free(ep->returned_owned_data);
+        ep->returned_owned_data = NULL;
+        ep->returned_owned_is_data = false;
+        ep->returned_owned_len = 0;
+        ep->returned_owned_peer = NL_INVALID_PEER;
+    }
 
     if (!ep->queue_head) {
-        if (timeout_ms == 0) { pthread_mutex_unlock(&ep->queue_lock); return false; }
-        if (timeout_ms < 0) {
+        if (timeout_ms == 0) {
+            pthread_mutex_unlock(&ep->queue_lock);
+        } else if (timeout_ms < 0) {
             while (!ep->queue_head) pthread_cond_wait(&ep->queue_cond, &ep->queue_lock);
+            /* still holding queue_lock; fall through to dequeue below */
         } else {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
@@ -1201,8 +1268,24 @@ bool nl_poll_event(nl_endpoint_t *ep, nl_event_t *out, int timeout_ms) {
             while (!ep->queue_head) {
                 if (pthread_cond_timedwait(&ep->queue_cond, &ep->queue_lock, &ts) != 0) break;
             }
+            /* still holding queue_lock if an event arrived; unlock if not */
+            if (!ep->queue_head) pthread_mutex_unlock(&ep->queue_lock);
         }
-        if (!ep->queue_head) { pthread_mutex_unlock(&ep->queue_lock); return false; }
+
+        if (!ep->queue_head) {
+            /* Timed out / non-blocking empty: still release the previous
+             * payload's window charge -- the app finished with it by
+             * calling poll. connections_lock may nest under nothing here
+             * (queue_lock already dropped). */
+            if (do_consume) {
+                pthread_mutex_lock(&ep->connections_lock);
+                nl_connection_t *c = find_connection_locked(ep, consume_peer);
+                if (c) nl_connection_consume_window(c, consume_len);
+                pthread_mutex_unlock(&ep->connections_lock);
+            }
+            return false;
+        }
+        /* Event arrived while waiting: still hold queue_lock, dequeued below. */
     }
 
     event_node_t *node = ep->queue_head;
@@ -1210,11 +1293,21 @@ bool nl_poll_event(nl_endpoint_t *ep, nl_event_t *out, int timeout_ms) {
     if (!ep->queue_head) ep->queue_tail = NULL;
     pthread_mutex_unlock(&ep->queue_lock);
 
+    if (do_consume) {
+        pthread_mutex_lock(&ep->connections_lock);
+        nl_connection_t *c = find_connection_locked(ep, consume_peer);
+        if (c) nl_connection_consume_window(c, consume_len);
+        pthread_mutex_unlock(&ep->connections_lock);
+    }
+
     *out = node->pub;
     if (node->payload) {
         out->data = node->payload;
         out->data_len = node->payload_len;
         ep->returned_owned_data = node->payload;
+        ep->returned_owned_len = (uint32_t)node->payload_len;
+        ep->returned_owned_is_data = (node->pub.event_type == NL_EVENT_DATA);
+        ep->returned_owned_peer = node->pub.peer;
     } else {
         out->data = NULL;
         out->data_len = 0;
@@ -1339,6 +1432,16 @@ bool nl_peer_stats(nl_endpoint_t *ep, nl_peer_id_t peer, nl_peer_stats_t *out) {
         out->rtt_var_ms = cstats.rtt_var_ms;
         out->rto_ms = cstats.rto_ms;
     }
+    pthread_mutex_unlock(&ep->connections_lock);
+    return found;
+}
+
+bool nl_peer_capabilities(nl_endpoint_t *ep, nl_peer_id_t peer, uint32_t *out_caps) {
+    if (!ep || !out_caps) return false;
+    pthread_mutex_lock(&ep->connections_lock);
+    nl_connection_t *conn = find_connection_locked(ep, peer);
+    bool found = conn != NULL;
+    if (found) *out_caps = nl_connection_capabilities(conn);
     pthread_mutex_unlock(&ep->connections_lock);
     return found;
 }

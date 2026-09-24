@@ -39,4 +39,7 @@ void nl_config_default(nl_config_t *cfg) {
     cfg->keepalive_interval_ms = 1000;
     cfg->encryption_enabled = true;
     cfg->server_name = NULL;
+    cfg->max_send_bytes_per_sec = 0; /* unlimited */
+    cfg->recv_window_bytes = 32768;
+    cfg->capabilities = NL_CAP_DEFAULT;
 }

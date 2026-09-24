@@ -108,7 +108,7 @@ static void sim_network_deliver_ready(sim_network_t *net, uint32_t now_tick, nl_
 
         sim_packet_t *p = &net->packets[idx];
         p->active = false;
-        nl_channel_on_receive(receiver, now_tick, p->data, p->len, deliver, deliver_ctx, NULL, NULL, NULL, NULL);
+        nl_channel_on_receive(receiver, now_tick, p->data, p->len, NL_RECV_WINDOW_DEFAULT, deliver, deliver_ctx, NULL, NULL, NULL, NULL, NULL, NULL);
     }
 
     /* Compact out inactive entries occasionally to bound memory over a
@@ -180,7 +180,7 @@ static void run_reliability_stress_test(const char *name, uint32_t seed, int mes
             uint32_t payload = (uint32_t)next_to_send;
             nl_result_t r = nl_channel_send(&sender, now_tick, /*channel_id*/ 0, NL_RELIABLE_ORDERED,
                                              (const uint8_t *)&payload, sizeof(payload),
-                                             emit_to_network, &ectx);
+                                             NL_RECV_WINDOW_DEFAULT, emit_to_network, &ectx);
             ASSERT_EQ(r, NL_OK);
             next_to_send++;
         }
@@ -189,8 +189,7 @@ static void run_reliability_stress_test(const char *name, uint32_t seed, int mes
 
         /* Retransmission scan, using a fixed small RTO in virtual ticks. */
         bool give_up = false;
-        nl_channel_tick(&sender, /*channel_id*/ 0, now_tick, rto_ticks, /*max_retries*/ 1000,
-                         emit_to_network, &ectx, &give_up);
+        nl_channel_tick(&sender, /*channel_id*/ 0, now_tick, rto_ticks, /*max_retries*/ 1000, NL_RECV_WINDOW_DEFAULT, emit_to_network, &ectx, &give_up);
         ASSERT_FALSE(give_up); /* must never give up within this test's bounds */
 
         if (next_to_send >= message_count && log.count >= message_count) {

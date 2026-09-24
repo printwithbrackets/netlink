@@ -22,7 +22,7 @@ static bool is_reliable(nl_delivery_t d) {
 }
 
 nl_result_t nl_channel_send(nl_channel_t *chan, uint64_t now_ms, uint8_t channel_id, nl_delivery_t delivery,
-                             const uint8_t *data, size_t len,
+                             const uint8_t *data, size_t len, uint16_t local_rwnd,
                              nl_channel_emit_fn emit, void *ctx) {
     if ((int)delivery < 0 || (int)delivery >= NL_LANES_PER_CHANNEL) return NL_ERR_INVALID_ARGUMENT;
     if (len > 0 && !data) return NL_ERR_INVALID_ARGUMENT;
@@ -91,6 +91,7 @@ nl_result_t nl_channel_send(nl_channel_t *chan, uint64_t now_ms, uint8_t channel
         nl_put_u16(wire + off, seq); off += 2;
         nl_put_u16(wire + off, ack); off += 2;
         nl_put_u32(wire + off, ack_bits); off += 4;
+        nl_put_u16(wire + off, local_rwnd); off += 2;
         memcpy(wire + off, lane_payload, lp_len);
         off += lp_len;
 
@@ -125,7 +126,8 @@ static void deliver_or_reassemble(nl_lane_t *lane, uint64_t now_ms, uint8_t chan
 }
 
 static void emit_wire_for_slot(nl_lane_t *lane, uint8_t channel_id, uint8_t delivery,
-                                nl_send_slot_t *slot, nl_channel_retransmit_fn retransmit, void *ctx) {
+                                nl_send_slot_t *slot, uint16_t local_rwnd,
+                                nl_channel_retransmit_fn retransmit, void *ctx) {
     uint16_t ack = 0;
     uint32_t ack_bits = 0;
     if (lane->recv_dedupe_init) nl_recv_dedupe_build_ack(&lane->recv_dedupe, &ack, &ack_bits);
@@ -137,6 +139,7 @@ static void emit_wire_for_slot(nl_lane_t *lane, uint8_t channel_id, uint8_t deli
     nl_put_u16(wire + off, slot->sequence); off += 2;
     nl_put_u16(wire + off, ack); off += 2;
     nl_put_u32(wire + off, ack_bits); off += 4;
+    nl_put_u16(wire + off, local_rwnd); off += 2;
     memcpy(wire + off, slot->data, slot->len);
     off += slot->len;
 
@@ -147,6 +150,7 @@ typedef struct {
     nl_lane_t *lane;
     uint8_t channel_id;
     uint8_t delivery;
+    uint16_t local_rwnd;
     nl_channel_retransmit_fn retransmit;
     void *retransmit_ctx;
 } fast_retransmit_bridge_t;
@@ -155,15 +159,19 @@ static void fast_retransmit_bridge(void *ctx, uint16_t sequence) {
     fast_retransmit_bridge_t *b = (fast_retransmit_bridge_t *)ctx;
     nl_send_slot_t *slot = nl_send_ring_get(&b->lane->send_ring, sequence);
     if (!slot) return; /* shouldn't happen: fast_retransmit only reports slots it found itself */
-    emit_wire_for_slot(b->lane, b->channel_id, b->delivery, slot, b->retransmit, b->retransmit_ctx);
+    emit_wire_for_slot(b->lane, b->channel_id, b->delivery, slot, b->local_rwnd,
+                       b->retransmit, b->retransmit_ctx);
 }
 
 void nl_channel_on_receive(nl_channel_t *chan, uint64_t now_ms,
                             const uint8_t *wire_payload, uint16_t wire_len,
+                            uint16_t local_rwnd,
                             nl_channel_deliver_fn deliver, void *deliver_ctx,
                             nl_channel_retransmit_fn retransmit, void *retransmit_ctx,
-                            bool *out_has_rtt_sample, uint32_t *out_rtt_sample_ms) {
+                            bool *out_has_rtt_sample, uint32_t *out_rtt_sample_ms,
+                            uint32_t *out_newly_acked, uint16_t *out_rwnd) {
     if (out_has_rtt_sample) *out_has_rtt_sample = false;
+    if (out_newly_acked) *out_newly_acked = 0;
     if (wire_len < NL_DATA_HEADER_SIZE) return; /* malformed, drop */
 
     size_t off = 0;
@@ -174,6 +182,8 @@ void nl_channel_on_receive(nl_channel_t *chan, uint64_t now_ms,
     uint16_t seq = nl_get_u16(wire_payload + off); off += 2;
     uint16_t ack = nl_get_u16(wire_payload + off); off += 2;
     uint32_t ack_bits = nl_get_u32(wire_payload + off); off += 4;
+    uint16_t peer_rwnd = nl_get_u16(wire_payload + off); off += 2;
+    if (out_rwnd) *out_rwnd = peer_rwnd;
     uint8_t is_fragment = wire_payload[off++];
     if (is_fragment > 1) return;
 
@@ -189,14 +199,17 @@ void nl_channel_on_receive(nl_channel_t *chan, uint64_t now_ms,
         }
         bool has_sample = false;
         uint32_t sample_ms = 0;
-        nl_send_ring_ack(&lane->send_ring, ack, ack_bits, now_ms, &has_sample, &sample_ms);
+        uint32_t newly = 0;
+        nl_send_ring_ack(&lane->send_ring, ack, ack_bits, now_ms, &has_sample, &sample_ms, &newly);
+        if (out_newly_acked) *out_newly_acked = newly;
         if (has_sample && out_has_rtt_sample) {
             *out_has_rtt_sample = true;
             *out_rtt_sample_ms = sample_ms;
         }
 
         if (retransmit) {
-            fast_retransmit_bridge_t bridge = { lane, channel_id, (uint8_t)delivery, retransmit, retransmit_ctx };
+            fast_retransmit_bridge_t bridge = { lane, channel_id, (uint8_t)delivery, local_rwnd,
+                                                retransmit, retransmit_ctx };
             nl_send_ring_fast_retransmit(&lane->send_ring, ack, ack_bits, NL_FAST_RETRANSMIT_THRESHOLD,
                                           now_ms, fast_retransmit_bridge, &bridge);
         }
@@ -304,7 +317,8 @@ void nl_channel_on_receive(nl_channel_t *chan, uint64_t now_ms,
 }
 
 void nl_channel_tick(nl_channel_t *chan, uint8_t channel_id, uint64_t now_ms, uint32_t rto_ms,
-                      uint32_t max_retries, nl_channel_retransmit_fn retransmit, void *ctx,
+                      uint32_t max_retries, uint16_t local_rwnd,
+                      nl_channel_retransmit_fn retransmit, void *ctx,
                       bool *out_give_up) {
     *out_give_up = false;
     /* Reclaim stale reassembly slots every tick (fragment.h documents this
@@ -330,7 +344,7 @@ void nl_channel_tick(nl_channel_t *chan, uint8_t channel_id, uint64_t now_ms, ui
                 continue;
             }
 
-            emit_wire_for_slot(lane, channel_id, (uint8_t)d, slot, retransmit, ctx);
+            emit_wire_for_slot(lane, channel_id, (uint8_t)d, slot, local_rwnd, retransmit, ctx);
 
             /* Reset the retransmit clock -- without this the same slot
              * would look "due" again on the very next tick and we'd fire

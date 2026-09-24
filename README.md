@@ -72,6 +72,25 @@ reimplementations that happen to agree today.
   received, retransmit count, duplicate/replayed packets rejected,
   smoothed RTT, RTT variance, and current RTO -- useful for in-game
   diagnostics or server-side monitoring.
+- **Congestion control (packet-based Reno)** on reliable sends: a
+  congestion window grows under acks (slow start, then congestion
+  avoidance), collapses on loss (RTO or fast-retransmit signal), and
+  parks further sends until budget reopens -- so multiple clients
+  sharing a link don't all blast at once.
+- **Flow control.** Every DATA header carries a u16 receive window; a
+  sender defers when the peer's window is full and resumes as the peer
+  consumes queued events (distinct from congestion control, which asks
+  what the *network* can handle).
+- **Per-connection rate limiting.** Optional token-bucket limit on
+  payload bytes/second (`config.max_send_bytes_per_sec`); retransmits
+  and keepalives are exempt so loss recovery is never starved.
+- **Priority/QoS per send.** `nl_send_ex(..., priority)` parks messages
+  when the send window is closed and flushes highest-priority first as
+  budget opens (stable FIFO within a priority).
+- **Protocol capability negotiation in the handshake.** Peers advertise
+  an `NL_CAP_*` bitmask in REQUEST/CHALLENGE; the negotiated set is the
+  intersection of both sides' sets (`nl_peer_capabilities`), so future
+  optional features don't require moving every peer in lockstep.
 
 ### Deliberately not included (see [Roadmap](#roadmap--known-limitations))
 
@@ -246,7 +265,7 @@ environment** (a sandboxed Linux container with a C toolchain, OpenSSL,
 and Python, but no Go/Rust toolchain, no IPv6 support at the kernel
 level, and no network access to install either):
 
-- 112 test cases across unit tests (`tests/test_seqbuf.c`,
+- 121 test cases across unit tests (`tests/test_seqbuf.c`,
   `test_crypto.c`, `test_fragment.c`, `test_channel.c`,
   `test_connection.c`, `test_network_simulation.c`) and real-socket
   integration tests (`tests/integration/test_integration.c`), all clean
@@ -259,9 +278,9 @@ level, and no network access to install either):
   localhost conditions.
 - The integration tests spin up **real client and server endpoints
   communicating over actual loopback UDP sockets**, covering: the full
-  encrypted handshake, all four delivery modes, fragmentation of a
-  5000-byte message, multiple independent channels, graceful disconnect,
-  LAN discovery, and server-full denial.
+  encrypted handshake, capability negotiation, all four delivery modes,
+  fragmentation of a 5000-byte message, multiple independent channels,
+  graceful disconnect, LAN discovery, and server-full denial.
 - The **Python bindings**, tested the same way (real `Server` + `Client`
   over real sockets, plus a manual run against the compiled C example
   binaries as separate OS processes) -- 5/5 passing.
@@ -315,38 +334,28 @@ genuinely valuable contribution.
 
 An external review of this project suggested a substantial list of
 additions to move NetLink from "capable UDP library" toward something
-closer to a full modern transport (congestion control, connection
-migration, flow control, priority/QoS, an RPC layer, built-in
-serialization, compression, protocol capability negotiation, and more --
-plus infrastructure like CMake, fuzzing, and multi-OS CI). It's good
-feedback and most of it is a genuine gap, not a nitpick. Implementing all
-of it to the same tested standard as the rest of this project is
-realistically a much larger effort than one pass; RTT-based adaptive
-retransmission, fast retransmit, per-peer stats, and a randomized
-network-condition test harness (see Testing above) have been implemented
-and tested as a first slice. Roughly in priority order for what's left:
+closer to a full modern transport (connection migration, an RPC layer,
+built-in serialization, compression, and more -- plus infrastructure
+like CMake, fuzzing, and multi-OS CI). It's good feedback and most of it
+is a genuine gap, not a nitpick. Implementing all of it to the same
+tested standard as the rest of this project is realistically a much
+larger effort than one pass. RTT-based adaptive retransmission, fast
+retransmit, per-peer stats, a randomized network-condition test harness
+(see Testing above), and the core transport slice (congestion control,
+flow control, per-connection rate limiting, priority/QoS, capability
+negotiation) have been implemented and tested. What's left, roughly in
+priority order:
 
-1. **Congestion control** -- RTT/loss-based send-rate adaptation
-   (something closer to slow-start + congestion avoidance than the
-   current fixed-window reliable sending), important once multiple
-   clients share a server's bandwidth.
-2. **Connection migration** -- `PATH_CHALLENGE`/`PATH_RESPONSE` so a
+1. **Connection migration** -- `PATH_CHALLENGE`/`PATH_RESPONSE` so a
    client changing networks (mobile Wi-Fi <-> cellular, NAT rebind)
    doesn't need a full reconnect, QUIC-style.
-3. **Flow control** -- a receive window bounding how much a fast sender
-   can have outstanding against a slow receiver, distinct from congestion
-   control (which asks what the *network* can handle; flow control asks
-   what the *receiver* can handle).
-4. **Expanded/range-based ACKs** -- the current 32-bit ack bitmap works
+2. **Expanded/range-based ACKs** -- the current 32-bit ack bitmap works
    well for the loss patterns tested above, but wider bitmaps or explicit
    ranges would help on very high-latency/lossy links.
-5. **Priority/QoS per send**, **per-connection rate limiting**, **an
-   optional RPC layer with request/response semantics**, **built-in
-   (optional, separate-from-core) serialization**, **compression**
-   (compress-then-encrypt, never the reverse), **protocol capability
-   negotiation during the handshake** (so future versions don't require
-   moving in lockstep), and the **WebSocket transport** already reserved
-   in the API.
+3. **An optional RPC layer** with request/response semantics, and
+   **built-in (optional, separate-from-core) serialization**.
+4. **Compression** (compress-then-encrypt, never the reverse).
+5. **WebSocket transport**, already reserved in the API.
 6. Smaller infrastructure: a C++ RAII wrapper, CMake alongside the
    Makefile, a pkg-config `.pc` file, fuzzing (libFuzzer/AFL++) on the
    packet-parsing paths, Windows/macOS/Go/Rust CI, and benchmarks.
@@ -370,8 +379,37 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Code review pass over the 0.1.0 core; all findings fixed with regression
 tests (`make` warning-free, `make test` green under ASan/UBSan). Wire
-format and `NL_PROTOCOL_VERSION` unchanged.
+format changed: **`NL_PROTOCOL_VERSION` bumped to 2** (see below).
 
+Core transport slice: congestion control, flow control, per-connection
+rate limiting, priority/QoS per send, and handshake capability
+negotiation -- each with regression tests.
+
+- **Congestion control (packet-based Reno).** Reliable sends are gated
+  by a congestion window (initial 10 packets) that grows on acks and
+  collapses on loss (RTO → cwnd=1; fast-retransmit → cwnd=ssthresh).
+  Sends that exceed the window park in the deferred queue and flush when
+  budget reopens.
+- **Flow control.** DATA headers now carry a u16 receive window (wire
+  format: `NL_DATA_HEADER_SIZE` 11 → 13). A sender defers when
+  `peer_rwnd` is exhausted; the receiver releases the charge as the
+  application consumes events via `nl_poll_event`. `nl_channel_*` and
+  `nl_send_ring_ack` gained out-params for the newly-acked count and
+  advertised window.
+- **Per-connection rate limiting.** `config.max_send_bytes_per_sec`
+  (0 = unlimited) drives a token bucket with a 1 s burst cap; failed
+  window checks never steal tokens; retransmits/keepalives bypass the
+  limiter.
+- **Priority/QoS.** New `nl_send_ex(..., priority)` (and
+  `NL_PRIORITY_*` constants). Deferred messages are sorted descending by
+  priority (stable FIFO within a priority) and flushed highest-first as
+  window/rate budget opens. Bounds: 128 messages / 64 KB per connection;
+  overflow returns `NL_ERR_QUEUE_FULL`.
+- **Capability negotiation.** REQUEST and CHALLENGE carry a u32
+  `NL_CAP_*` bitmask (`NL_CAP_FLOW_CONTROL`, `NL_CAP_PRIORITY`,
+  `NL_CAP_RATE_LIMIT`); both sides store the intersection and expose it
+  via `nl_peer_capabilities`. `NL_CAP_FLOW_CONTROL` is always forced on
+  under v2. Wire sizes: REQUEST 64 → 68 bytes, CHALLENGE 67 → 69.
 - **Handshake retransmission.** `CONNECT_REQUEST`, `CONNECT_CHALLENGE`,
   and `CONNECT_ACCEPTED` are now retried on a 250 ms timer with a finite
   budget (`NL_ACCEPT_RETRIES` for the final accept), instead of a single
@@ -418,4 +456,8 @@ format and `NL_PROTOCOL_VERSION` unchanged.
   channel-tick reassembly expiry, ACCEPTED retransmit budget,
   `encryption_enabled` rejection, duplicate connect, discovery wrong
   nonce + rate limit (raw-socket injection, works without broadcast),
-  `max_connections` clamp, and `server_name` copy.
+  `max_connections` clamp, `server_name` copy, congestion-window gating
+  and loss collapse, peer-window park/resume, rwnd wire round-trip,
+  rate-limit defer + recovery, priority flush order, deferred-queue
+  full, capability store, and handshake capability intersection
+  (integration, real sockets).

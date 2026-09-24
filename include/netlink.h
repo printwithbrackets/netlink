@@ -46,8 +46,39 @@ extern "C" {
 
 /* Wire protocol version. Bumped whenever the on-the-wire packet format
  * changes in an incompatible way. Peers with different values refuse to
- * connect to each other rather than risk misinterpreting bytes. */
-#define NL_PROTOCOL_VERSION 1
+ * connect to each other rather than risk misinterpreting bytes.
+ *
+ * v2: DATA cleartext headers carry a u16 receive window (flow control);
+ * CONNECT_REQUEST / CONNECT_CHALLENGE carry a u32 capability bitmask
+ * (negotiated as the bitwise AND of both peers' advertised sets). */
+#define NL_PROTOCOL_VERSION 2
+
+/* ----------------------------------------------------------------------- */
+/* Capabilities (exchanged during the handshake; negotiated = AND of both)  */
+/* ----------------------------------------------------------------------- */
+
+/* Bit 0: peer includes a u16 receive window in every DATA header and will
+ * defer sends when the advertised window is full. Implied by protocol v2
+ * (the field is always present); the bit is still advertised so future
+ * optional features can use the same mechanism without another version bump. */
+#define NL_CAP_FLOW_CONTROL  0x00000001u
+/* Bit 1: peer understands priority-tagged sends (reserved for when
+ * priority is reflected on the wire rather than only in the local queue). */
+#define NL_CAP_PRIORITY      0x00000002u
+/* Bit 2: peer applies a sender-side rate limit when configured (reserved
+ * for cross-implementation signalling; enforcement is always local). */
+#define NL_CAP_RATE_LIMIT    0x00000004u
+/* Default advertised set. NL_CAP_FLOW_CONTROL is always forced on for v2. */
+#define NL_CAP_DEFAULT (NL_CAP_FLOW_CONTROL | NL_CAP_PRIORITY | NL_CAP_RATE_LIMIT)
+
+/* ----------------------------------------------------------------------- */
+/* Send priorities (nl_send_ex; nl_send uses NL_PRIORITY_NORMAL)           */
+/* ----------------------------------------------------------------------- */
+
+#define NL_PRIORITY_LOW        0
+#define NL_PRIORITY_NORMAL     64
+#define NL_PRIORITY_HIGH       128
+#define NL_PRIORITY_CRITICAL   192
 
 NL_API const char *nl_version_string(void);
 
@@ -164,6 +195,17 @@ typedef struct {
     bool           encryption_enabled;  /* must be true (the default). false returns NL_ERR_UNSUPPORTED
                                            from nl_server_create/nl_client_create -- there is no cleartext mode. */
     const char    *server_name;         /* used in discovery responses, optional; copied by the library */
+    /* Per-connection sender rate limit, payload bytes/second (0 = unlimited).
+     * Applies to newly emitted DATA only; retransmits and keepalives are
+     * exempt so recovery traffic is never starved by the limiter. */
+    uint32_t       max_send_bytes_per_sec;
+    /* Receive window advertised to peers (bytes of unconsumed DATA events
+     * the endpoint will buffer before telling them to stop). 0 = default
+     * (32768), clamped to 65535 to fit the u16 wire field. */
+    uint32_t       recv_window_bytes;
+    /* Capability bits advertised in the handshake (0 = NL_CAP_DEFAULT).
+     * NL_CAP_FLOW_CONTROL is always forced on under protocol v2. */
+    uint32_t       capabilities;
 } nl_config_t;
 
 NL_API void nl_config_default(nl_config_t *cfg);
@@ -231,9 +273,21 @@ NL_API void nl_endpoint_destroy(nl_endpoint_t *ep);
 /* Enqueue `len` bytes for delivery to `peer` on `channel` using `delivery`.
  * Thread-safe: may be called concurrently from multiple threads, including
  * concurrently with nl_poll_event(). Copies `data` internally; the caller's
- * buffer may be reused/freed immediately after this returns. */
+ * buffer may be reused/freed immediately after this returns.
+ *
+ * Equivalent to nl_send_ex(..., NL_PRIORITY_NORMAL). The send may be
+ * deferred internally (congestion window, peer receive window, or rate
+ * limit) and still return NL_OK -- NL_ERR_QUEUE_FULL is only returned
+ * when the per-connection deferred queue itself is full. */
 NL_API nl_result_t nl_send(nl_endpoint_t *ep, nl_peer_id_t peer, uint8_t channel,
                             nl_delivery_t delivery, const uint8_t *data, size_t len);
+
+/* Like nl_send, with an explicit priority (0..255, higher = more urgent).
+ * When the connection's send window is closed, messages are queued and
+ * flushed highest-priority-first as window/rate budget opens. */
+NL_API nl_result_t nl_send_ex(nl_endpoint_t *ep, nl_peer_id_t peer, uint8_t channel,
+                              nl_delivery_t delivery, const uint8_t *data, size_t len,
+                              uint8_t priority);
 
 /* Pop the next event, waiting up to timeout_ms for one to arrive (0 = don't
  * block, -1 = block forever). Returns true if an event was written to *out.
@@ -282,6 +336,11 @@ typedef struct {
 /* Copy out a snapshot of `peer`'s counters and RTT estimates. Returns
  * false if `peer` is not a currently-known connection. Thread-safe. */
 NL_API bool nl_peer_stats(nl_endpoint_t *ep, nl_peer_id_t peer, nl_peer_stats_t *out);
+
+/* Copy out the capability bits negotiated with `peer` during the
+ * handshake (bitwise AND of both peers' advertised sets). Returns false
+ * if `peer` is not a currently-known connection. Thread-safe. */
+NL_API bool nl_peer_capabilities(nl_endpoint_t *ep, nl_peer_id_t peer, uint32_t *out_caps);
 
 #ifdef __cplusplus
 }

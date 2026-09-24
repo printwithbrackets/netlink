@@ -130,6 +130,45 @@ TEST(test_connect_and_reliable_ordered_data) {
     nl_endpoint_destroy(server);
 }
 
+TEST(test_capability_negotiation_intersects_both_sides) {
+    /* Server advertises flow-control + rate-limit only; client advertises
+     * flow-control + priority only. Negotiated set on both sides must be
+     * the intersection (flow-control alone), never the local full set. */
+    nl_config_t scfg, ccfg;
+    nl_config_default(&scfg);
+    nl_config_default(&ccfg);
+    scfg.capabilities = NL_CAP_FLOW_CONTROL | NL_CAP_RATE_LIMIT;
+    ccfg.capabilities = NL_CAP_FLOW_CONTROL | NL_CAP_PRIORITY;
+
+    nl_endpoint_t *server = NULL, *client = NULL;
+    nl_address_t bind_addr = addr("127.0.0.1", 34717);
+    ASSERT_EQ(nl_server_create(&bind_addr, &scfg, &server), NL_OK);
+    ASSERT_EQ(nl_client_create(&ccfg, &client), NL_OK);
+
+    nl_peer_id_t client_peer;
+    ASSERT_EQ(nl_connect(client, &bind_addr, &client_peer), NL_OK);
+
+    nl_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 3000));
+    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 3000));
+    nl_peer_id_t server_side_peer = ev.peer;
+
+    uint32_t client_caps = 0, server_caps = 0;
+    ASSERT_TRUE(nl_peer_capabilities(client, client_peer, &client_caps));
+    ASSERT_TRUE(nl_peer_capabilities(server, server_side_peer, &server_caps));
+    ASSERT_EQ(client_caps, NL_CAP_FLOW_CONTROL);
+    ASSERT_EQ(server_caps, NL_CAP_FLOW_CONTROL);
+
+    const char *msg = "negotiated";
+    ASSERT_EQ(nl_send(client, client_peer, 0, NL_RELIABLE_ORDERED,
+                      (const uint8_t *)msg, strlen(msg)), NL_OK);
+    ASSERT_TRUE(wait_for_event(server, NL_EVENT_DATA, &ev, 3000));
+    ASSERT_MEM_EQ(ev.data, msg, strlen(msg));
+
+    nl_endpoint_destroy(client);
+    nl_endpoint_destroy(server);
+}
+
 TEST(test_all_delivery_modes_over_real_sockets) {
     nl_config_t cfg; nl_config_default(&cfg);
     nl_endpoint_t *server = NULL, *client = NULL;
@@ -627,6 +666,7 @@ TEST(test_discovery_rate_limited) {
 int main(void) {
     printf("=== integration tests (real UDP sockets) ===\n");
     RUN_TEST(test_connect_and_reliable_ordered_data);
+    RUN_TEST(test_capability_negotiation_intersects_both_sides);
     RUN_TEST(test_all_delivery_modes_over_real_sockets);
     RUN_TEST(test_fragmentation_over_real_sockets);
     RUN_TEST(test_multiple_channels_dont_block_each_other);

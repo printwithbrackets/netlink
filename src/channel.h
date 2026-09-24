@@ -67,16 +67,19 @@ void nl_channel_free(nl_channel_t *chan);
  * reconstructed wire payload (fresh piggybacked ack/ack_bits). */
 typedef void (*nl_channel_retransmit_fn)(void *ctx, const uint8_t *wire_payload, uint16_t len);
 void nl_channel_tick(nl_channel_t *chan, uint8_t channel_id, uint64_t now_ms, uint32_t rto_ms,
-                      uint32_t max_retries, nl_channel_retransmit_fn retransmit, void *ctx,
+                      uint32_t max_retries, uint16_t local_rwnd,
+                      nl_channel_retransmit_fn retransmit, void *ctx,
                       bool *out_give_up);
 
 /* Encode and hand off (via `emit`) one or more wire DATA payloads carrying
  * `data`/`len` on `channel_id` using `delivery`. Splits into fragments
  * automatically if the message is too large for one packet. `emit` is
- * called once per resulting wire packet, in order. */
+ * called once per resulting wire packet, in order. `local_rwnd` is the
+ * sender's currently advertised receive window (bytes), stamped into each
+ * packet's DATA header for the peer's flow control. */
 typedef void (*nl_channel_emit_fn)(void *ctx, const uint8_t *wire_payload, uint16_t len);
 nl_result_t nl_channel_send(nl_channel_t *chan, uint64_t now_ms, uint8_t channel_id, nl_delivery_t delivery,
-                             const uint8_t *data, size_t len,
+                             const uint8_t *data, size_t len, uint16_t local_rwnd,
                              nl_channel_emit_fn emit, void *ctx);
 
 /* Feed one received (already-decrypted) wire DATA payload in. Any
@@ -93,6 +96,14 @@ nl_result_t nl_channel_send(nl_channel_t *chan, uint64_t now_ms, uint8_t channel
  * doc comment on Karn's algorithm), *out_has_rtt_sample is set true and
  * *out_rtt_sample_ms holds it; both may be NULL if the caller doesn't need this.
  *
+ * *out_newly_acked (optional) receives how many of this lane's send-ring
+ * slots the piggybacked ack transitioned to acked -- the congestion
+ * controller's window-growth signal. *out_rwnd (optional) receives the
+ * peer's advertised receive window parsed from the DATA header.
+ *
+ * `local_rwnd` is stamped into fast-retransmit rebuilds so recovery
+ * packets carry a current flow-control advertisement.
+ *
  * Any fully-formed application message(s) that become deliverable as a
  * result (immediately, or released from the reorder buffer) are handed
  * to `deliver`, in delivery order. */
@@ -101,8 +112,10 @@ typedef void (*nl_channel_deliver_fn)(void *ctx, uint8_t channel_id, nl_delivery
 #define NL_FAST_RETRANSMIT_THRESHOLD 3 /* matches TCP's conventional "3 duplicate acks" */
 void nl_channel_on_receive(nl_channel_t *chan, uint64_t now_ms,
                             const uint8_t *wire_payload, uint16_t wire_len,
+                            uint16_t local_rwnd,
                             nl_channel_deliver_fn deliver, void *deliver_ctx,
                             nl_channel_retransmit_fn retransmit, void *retransmit_ctx,
-                            bool *out_has_rtt_sample, uint32_t *out_rtt_sample_ms);
+                            bool *out_has_rtt_sample, uint32_t *out_rtt_sample_ms,
+                            uint32_t *out_newly_acked, uint16_t *out_rwnd);
 
 #endif /* NETLINK_CHANNEL_H */

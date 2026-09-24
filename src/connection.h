@@ -40,6 +40,27 @@ typedef struct {
     uint32_t rto_ms;              /* current retransmission timeout, derived from the above */
 } nl_connection_stats_t;
 
+/* One application message parked because the send window (congestion,
+ * peer receive window) or the rate limiter wouldn't let it out yet.
+ * Linked in descending priority order (stable FIFO within a priority). */
+typedef struct nl_deferred_msg {
+    uint8_t channel;
+    uint8_t delivery; /* nl_delivery_t */
+    uint8_t priority;
+    uint16_t len;
+    uint8_t *data;
+    struct nl_deferred_msg *next;
+} nl_deferred_msg_t;
+
+#define NL_CWND_INITIAL_PACKETS 10    /* RFC 6928-style initial window */
+#define NL_SSTHRESH_INITIAL_PACKETS 64
+#define NL_CWND_MAX_PACKETS 256       /* matches send-ring depth; above this
+                                       * the ring itself becomes the limit */
+#define NL_DEFERRED_MAX_MSGS 128
+#define NL_DEFERRED_MAX_BYTES (64 * 1024)
+/* NL_RECV_WINDOW_DEFAULT lives in protocol.h (shared with channel tests). */
+#define NL_RECV_WINDOW_MAX 65535u
+
 /* A generic sink for events/packets a connection needs to hand back up to
  * the endpoint (queueing an event, or sending bytes on the wire). Kept as
  * function pointers + a context so connection.c has zero dependency on
@@ -94,6 +115,35 @@ typedef struct nl_connection {
     uint32_t connection_timeout_ms;
     uint32_t keepalive_interval_ms;
 
+    /* Congestion control (packet-based Reno): cwnd/ssthresh count reliable
+     * packets in flight across all channels' send rings. Unreliable traffic
+     * does not consume cwnd (it has no ack clock to ride). */
+    uint32_t cwnd;
+    uint32_t ssthresh;
+    uint32_t cwnd_ack_accum; /* congestion-avoidance: +1 cwnd per full window of acks */
+
+    /* Flow control: peer's last advertised receive window (bytes of DATA
+     * they'll still buffer), and our own receive-window accounting so we
+     * can advertise accurately. peer_rwnd starts at the default until the
+     * first DATA from the peer carries a real value. */
+    uint16_t peer_rwnd;
+    uint32_t recv_window_size;  /* configured local window capacity (bytes) */
+    uint32_t recv_window_used;  /* payload bytes currently queued for the app */
+
+    /* Sender-side rate limit (payload bytes/sec; 0 = off). Token bucket;
+     * retransmits and keepalives bypass it so loss recovery is never starved. */
+    uint32_t rate_bps;
+    double   rate_tokens;
+    uint64_t rate_last_refill_ms;
+
+    /* Deferred sends waiting for window/rate budget, priority-sorted. */
+    nl_deferred_msg_t *deferred_head;
+    uint32_t deferred_count;
+    uint32_t deferred_bytes;
+
+    /* Negotiated handshake capabilities (AND of both peers' advertised sets). */
+    uint32_t capabilities;
+
     bool handshake_confirmed; /* client-side: has CONNECT_ACCEPTED been seen yet */
     /* Server-side: CONNECT_ACCEPTED retransmission bookkeeping. The client
      * may silently drop the single ACCEPTED datagram; until it confirms by
@@ -112,10 +162,14 @@ nl_connection_t *nl_connection_create(nl_peer_id_t id, const struct sockaddr_sto
                                        uint64_t now_ms);
 void nl_connection_destroy(nl_connection_t *conn);
 
-/* Encrypt and emit `data`/`len` on `channel`/`delivery`. Thread-safe. */
+/* Encrypt and emit `data`/`len` on `channel`/`delivery` with `priority`.
+ * Thread-safe. May defer internally when the congestion window, the peer's
+ * receive window, or the rate limiter is exhausted (still returns NL_OK);
+ * returns NL_ERR_QUEUE_FULL only if the deferred queue bounds are hit.
+ * `now_ms` is required (used for rate-limit refill). */
 nl_result_t nl_connection_send(nl_connection_t *conn, uint8_t channel, nl_delivery_t delivery,
-                                const uint8_t *data, size_t len, uint64_t now_ms,
-                                const nl_conn_callbacks_t *cb);
+                                const uint8_t *data, size_t len, uint8_t priority,
+                                uint64_t now_ms, const nl_conn_callbacks_t *cb);
 
 /* Decrypt and process one received encrypted packet (DATA, KEEPALIVE, or
  * DISCONNECT -- `type` already parsed from the cleartext byte 0 by the
@@ -152,5 +206,17 @@ uint32_t nl_connection_rtt_ms(nl_connection_t *conn);
 /* Copy out a snapshot of this connection's counters and RTT estimates.
  * Thread-safe. */
 void nl_connection_get_stats(nl_connection_t *conn, nl_connection_stats_t *out);
+
+/* Negotiated capability bits (see NL_CAP_* in netlink.h). Thread-safe. */
+uint32_t nl_connection_capabilities(nl_connection_t *conn);
+
+/* Current receive window we should advertise to the peer (bytes still
+ * available under recv_window_size). Caller must hold conn->lock (or be
+ * the sole user before the connection is published). */
+uint16_t nl_connection_adv_window(nl_connection_t *conn);
+
+/* Apply endpoint-level receive-window accounting when the app consumes a
+ * DATA event (called from nl_poll_event). Thread-safe. */
+void nl_connection_consume_window(nl_connection_t *conn, uint32_t bytes);
 
 #endif /* NETLINK_CONNECTION_H */

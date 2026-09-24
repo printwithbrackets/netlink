@@ -54,6 +54,9 @@ typedef enum {
  *                              note below)
  *   u8  client_pubkey[32]
  *   u8  client_nonce[16]
+ *   u32 capabilities          (NL_CAP_* bitmask the client supports;
+ *                              server stores it and replies with its own
+ *                              set in CONNECT_CHALLENGE; negotiated = AND)
  *
  * The connection_id is chosen by the client (a random 64-bit value, via
  * the same CSPRNG used for keys) rather than assigned by the server. This
@@ -66,15 +69,18 @@ typedef enum {
  * check) if it happens to match an existing connection, which a random
  * 64-bit value practically never does.
  */
-#define NL_CONNECT_REQUEST_SIZE (1 + 4 + 2 + 1 + 8 + 32 + 16)
+#define NL_CONNECT_REQUEST_SIZE (1 + 4 + 2 + 1 + 8 + 32 + 16 + 4)
 
 /* CONNECT_CHALLENGE:
  *   u8  type
  *   u8  server_pubkey[32]
  *   u8  server_nonce[16]
  *   u8  cookie[16]
+ *   u32 capabilities          (server's advertised NL_CAP_* set; the
+ *                              client ANDs this with its own to get the
+ *                              negotiated set for the connection)
  */
-#define NL_CONNECT_CHALLENGE_SIZE (1 + 32 + 16 + 16)
+#define NL_CONNECT_CHALLENGE_SIZE (1 + 32 + 16 + 16 + 4)
 
 /* CONNECT_RESPONSE:
  *   u8  type
@@ -109,6 +115,11 @@ typedef enum {
  *   u16 sequence
  *   u16 ack
  *   u32 ack_bits
+ *   u16 rwnd                  (sender's receive window in bytes: how much
+ *                               more unconsumed payload the sender is
+ *                               willing to buffer -- flow control, distinct
+ *                               from congestion control which bounds what
+ *                               the *network* can carry)
  *   u8  is_fragment           (0 or 1)
  *   -- if is_fragment --
  *     u16 message_id
@@ -116,8 +127,15 @@ typedef enum {
  *     u16 fragment_count
  *   -- payload bytes follow to end of plaintext --
  */
-#define NL_DATA_HEADER_SIZE (1 + 1 + 2 + 2 + 4 + 1)
+#define NL_DATA_HEADER_SIZE (1 + 1 + 2 + 2 + 4 + 2 + 1)
 #define NL_FRAGMENT_HEADER_SIZE (2 + 2 + 2)
+
+/* Default receive window (bytes) advertised when nothing better is known.
+ * Lives here so channel-level tests can stamp it without pulling in
+ * connection.h; connection.c uses the same value as its initial capacity. */
+#ifndef NL_RECV_WINDOW_DEFAULT
+#define NL_RECV_WINDOW_DEFAULT 32768u
+#endif
 
 /* ---- KEEPALIVE plaintext: empty, or 1 byte flag (0=ping,1=pong) + u32 echo ---- */
 #define NL_KEEPALIVE_SIZE (1 + 4)

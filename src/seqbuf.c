@@ -8,6 +8,7 @@ int nl_send_ring_init(nl_send_ring_t *ring) {
     ring->slots = (nl_send_slot_t *)calloc(NL_SEQ_RING_SIZE, sizeof(nl_send_slot_t));
     if (!ring->slots) return -1;
     ring->next_sequence = 0;
+    ring->unacked_count = 0;
     return 0;
 }
 
@@ -21,6 +22,12 @@ bool nl_send_ring_insert(nl_send_ring_t *ring, const uint8_t *data, uint16_t len
     if (len > NL_MAX_PACKET_SIZE_INTERNAL) return false;
     uint16_t seq = ring->next_sequence;
     nl_send_slot_t *slot = &ring->slots[seq & NL_SEQ_RING_MASK];
+    /* A slot re-entered after a 65536-sequence wrap must not leave a
+     * stale unacked_count bump from the previous life of this index. */
+    if (slot->valid && !slot->acked && slot->sequence == seq &&
+        ring->unacked_count > 0) {
+        ring->unacked_count--;
+    }
     slot->sequence = seq;
     slot->valid = true;
     slot->acked = false;
@@ -28,21 +35,27 @@ bool nl_send_ring_insert(nl_send_ring_t *ring, const uint8_t *data, uint16_t len
     slot->send_time_ms = now_ms;
     slot->retry_count = 0;
     memcpy(slot->data, data, len);
+    ring->unacked_count++;
     ring->next_sequence = (uint16_t)(seq + 1);
     if (out_seq) *out_seq = seq;
     return true;
 }
 
-static void ack_one(nl_send_ring_t *ring, uint16_t seq) {
+static bool ack_one(nl_send_ring_t *ring, uint16_t seq) {
     nl_send_slot_t *slot = &ring->slots[seq & NL_SEQ_RING_MASK];
-    if (slot->valid && slot->sequence == seq) {
+    if (slot->valid && slot->sequence == seq && !slot->acked) {
         slot->acked = true;
+        if (ring->unacked_count > 0) ring->unacked_count--;
+        return true;
     }
+    return false;
 }
 
 void nl_send_ring_ack(nl_send_ring_t *ring, uint16_t ack, uint32_t ack_bits, uint64_t now_ms,
-                       bool *out_has_rtt_sample, uint32_t *out_rtt_sample_ms) {
+                       bool *out_has_rtt_sample, uint32_t *out_rtt_sample_ms,
+                       uint32_t *out_newly_acked) {
     *out_has_rtt_sample = false;
+    uint32_t newly = 0;
 
     nl_send_slot_t *ack_slot = &ring->slots[ack & NL_SEQ_RING_MASK];
     if (ack_slot->valid && ack_slot->sequence == ack && !ack_slot->acked && ack_slot->retry_count == 0) {
@@ -54,13 +67,14 @@ void nl_send_ring_ack(nl_send_ring_t *ring, uint16_t ack, uint32_t ack_bits, uin
         *out_rtt_sample_ms = (uint32_t)elapsed;
     }
 
-    ack_one(ring, ack);
+    if (ack_one(ring, ack)) newly++;
     for (int i = 0; i < 32; i++) {
         if (ack_bits & (1u << i)) {
             uint16_t seq = (uint16_t)(ack - (i + 1));
-            ack_one(ring, seq);
+            if (ack_one(ring, seq)) newly++;
         }
     }
+    if (out_newly_acked) *out_newly_acked = newly;
 }
 
 void nl_send_ring_fast_retransmit(nl_send_ring_t *ring, uint16_t ack, uint32_t ack_bits,

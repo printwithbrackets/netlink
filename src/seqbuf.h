@@ -52,6 +52,9 @@ typedef struct {
 typedef struct {
     nl_send_slot_t *slots; /* heap allocated, NL_SEQ_RING_SIZE entries */
     uint16_t next_sequence;
+    uint16_t unacked_count; /* valid && !acked slots; maintained by insert/ack
+                             * so congestion control can gate on in-flight
+                             * packets without rescanning the ring */
 } nl_send_ring_t;
 
 int  nl_send_ring_init(nl_send_ring_t *ring);
@@ -74,9 +77,14 @@ bool nl_send_ring_insert(nl_send_ring_t *ring, const uint8_t *data, uint16_t len
  * the estimate, typically making it falsely low after a loss episode.
  * Older sequences newly-acked via the bitfield are never used as samples
  * for the same reason -- their delivery timing relative to `now_ms` says
- * as much about queueing/loss as about the path RTT. */
+ * as much about queueing/loss as about the path RTT.
+ *
+ * *out_newly_acked (optional) receives how many slots transitioned from
+ * unacked to acked by this call -- the congestion controller's growth
+ * signal. */
 void nl_send_ring_ack(nl_send_ring_t *ring, uint16_t ack, uint32_t ack_bits, uint64_t now_ms,
-                       bool *out_has_rtt_sample, uint32_t *out_rtt_sample_ms);
+                       bool *out_has_rtt_sample, uint32_t *out_rtt_sample_ms,
+                       uint32_t *out_newly_acked);
 
 /* Fast retransmit: scan for unacked slots that are almost certainly lost
  * rather than merely delayed/reordered, using the same signal TCP's

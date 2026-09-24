@@ -39,6 +39,118 @@ static void update_rtt(nl_connection_t *conn, uint32_t sample_ms) {
     conn->rtt_ms = (uint32_t)conn->srtt_ms;
 }
 
+/* ---- congestion control (packet Reno, reliable traffic only) ---- */
+
+static uint32_t reliable_in_flight(nl_connection_t *conn) {
+    uint32_t n = 0;
+    for (uint8_t c = 0; c < conn->channel_count; c++) {
+        for (int d = NL_RELIABLE_UNORDERED; d <= NL_RELIABLE_ORDERED; d++) {
+            nl_lane_t *lane = &conn->channels[c].lanes[d];
+            if (lane->send_ring_init) n += lane->send_ring.unacked_count;
+        }
+    }
+    return n;
+}
+
+static void cc_on_acks(nl_connection_t *conn, uint32_t newly_acked) {
+    for (uint32_t i = 0; i < newly_acked; i++) {
+        if (conn->cwnd < conn->ssthresh) {
+            conn->cwnd++; /* slow start: +1 per ack */
+        } else {
+            /* Congestion avoidance: +1 per full window of acks (~1 per RTT). */
+            conn->cwnd_ack_accum++;
+            if (conn->cwnd_ack_accum >= conn->cwnd) {
+                conn->cwnd_ack_accum = 0;
+                if (conn->cwnd < NL_CWND_MAX_PACKETS) conn->cwnd++;
+            }
+        }
+        if (conn->cwnd > NL_CWND_MAX_PACKETS) conn->cwnd = NL_CWND_MAX_PACKETS;
+    }
+}
+
+/* Loss signal: RTO resets cwnd to 1 (slow start); fast retransmit enters
+ * recovery at half window (ssthresh). `fast` selects which. */
+static void cc_on_loss(nl_connection_t *conn, bool fast) {
+    uint32_t half = conn->cwnd / 2;
+    if (half < 2) half = 2;
+    conn->ssthresh = half;
+    conn->cwnd_ack_accum = 0;
+    conn->cwnd = fast ? half : 1;
+    if (conn->cwnd > NL_CWND_MAX_PACKETS) conn->cwnd = NL_CWND_MAX_PACKETS;
+}
+
+/* ---- rate limiting (token bucket over payload bytes) ---- */
+
+static void rate_refill(nl_connection_t *conn, uint64_t now_ms) {
+    if (conn->rate_bps == 0) return;
+    if (now_ms < conn->rate_last_refill_ms) conn->rate_last_refill_ms = now_ms;
+    double elapsed_s = (double)(now_ms - conn->rate_last_refill_ms) / 1000.0;
+    if (elapsed_s <= 0.0) return;
+    conn->rate_tokens += elapsed_s * (double)conn->rate_bps;
+    if (conn->rate_tokens > (double)conn->rate_bps) {
+        conn->rate_tokens = (double)conn->rate_bps; /* 1s burst cap */
+    }
+    conn->rate_last_refill_ms = now_ms;
+}
+
+/* ---- deferred send queue (priority-sorted) ---- */
+
+static void deferred_free_all(nl_connection_t *conn) {
+    nl_deferred_msg_t *m = conn->deferred_head;
+    while (m) {
+        nl_deferred_msg_t *next = m->next;
+        free(m->data);
+        free(m);
+        m = next;
+    }
+    conn->deferred_head = NULL;
+    conn->deferred_count = 0;
+    conn->deferred_bytes = 0;
+}
+
+/* Insert keeping descending priority (higher number first); stable FIFO
+ * within equal priority by inserting after all strictly-greater entries. */
+static bool deferred_push(nl_connection_t *conn, uint8_t channel, nl_delivery_t delivery,
+                          uint8_t priority, const uint8_t *data, size_t len) {
+    if (conn->deferred_count >= NL_DEFERRED_MAX_MSGS) return false;
+    if (conn->deferred_bytes + len > NL_DEFERRED_MAX_BYTES) return false;
+    if (len > UINT16_MAX) return false;
+
+    nl_deferred_msg_t *m = (nl_deferred_msg_t *)calloc(1, sizeof(*m));
+    if (!m) return false;
+    m->data = (uint8_t *)malloc(len ? len : 1);
+    if (!m->data) { free(m); return false; }
+    if (len) memcpy(m->data, data, len);
+    m->channel = channel;
+    m->delivery = (uint8_t)delivery;
+    m->priority = priority;
+    m->len = (uint16_t)len;
+    m->next = NULL;
+
+    if (!conn->deferred_head || conn->deferred_head->priority < priority) {
+        m->next = conn->deferred_head;
+        conn->deferred_head = m;
+    } else {
+        nl_deferred_msg_t *cur = conn->deferred_head;
+        while (cur->next && cur->next->priority >= priority) cur = cur->next;
+        m->next = cur->next;
+        cur->next = m;
+    }
+    conn->deferred_count++;
+    conn->deferred_bytes += (uint32_t)len;
+    return true;
+}
+
+static nl_deferred_msg_t *deferred_pop(nl_connection_t *conn) {
+    nl_deferred_msg_t *m = conn->deferred_head;
+    if (!m) return NULL;
+    conn->deferred_head = m->next;
+    conn->deferred_count--;
+    conn->deferred_bytes -= m->len;
+    m->next = NULL;
+    return m;
+}
+
 nl_connection_t *nl_connection_create(nl_peer_id_t id, const struct sockaddr_storage *addr, socklen_t addr_len,
                                        bool is_client_side, uint8_t channel_count,
                                        const uint8_t send_key[NL_KEY_SIZE], const uint8_t recv_key[NL_KEY_SIZE],
@@ -77,6 +189,20 @@ nl_connection_t *nl_connection_create(nl_peer_id_t id, const struct sockaddr_sto
     conn->connection_timeout_ms = connection_timeout_ms;
     conn->keepalive_interval_ms = keepalive_interval_ms;
 
+    conn->cwnd = NL_CWND_INITIAL_PACKETS;
+    conn->ssthresh = NL_SSTHRESH_INITIAL_PACKETS;
+    conn->cwnd_ack_accum = 0;
+    conn->peer_rwnd = (uint16_t)NL_RECV_WINDOW_DEFAULT;
+    conn->recv_window_size = NL_RECV_WINDOW_DEFAULT;
+    conn->recv_window_used = 0;
+    conn->rate_bps = 0;
+    conn->rate_tokens = 0.0;
+    conn->rate_last_refill_ms = now_ms;
+    conn->deferred_head = NULL;
+    conn->deferred_count = 0;
+    conn->deferred_bytes = 0;
+    conn->capabilities = 0;
+
     if (pthread_mutex_init(&conn->lock, NULL) != 0) {
         free(conn->channels);
         free(conn);
@@ -90,6 +216,7 @@ void nl_connection_destroy(nl_connection_t *conn) {
     if (!conn) return;
     for (uint8_t i = 0; i < conn->channel_count; i++) nl_channel_free(&conn->channels[i]);
     free(conn->channels);
+    deferred_free_all(conn);
     pthread_mutex_destroy(&conn->lock);
     /* Best-effort zeroing of key material before freeing. */
     memset(conn->send_key, 0, sizeof(conn->send_key));
@@ -151,33 +278,152 @@ static void on_channel_retransmit(void *ctx, const uint8_t *wire_payload, uint16
     encrypt_and_emit(r->conn, NL_PKT_DATA, wire_payload, len, /*is_retransmit*/ true, r->cb);
 }
 
+/* ---- send gating + deferred flush (caller must hold conn->lock) ---- */
+
+typedef struct {
+    nl_connection_t *conn;
+    uint8_t channel;
+    nl_delivery_t delivery;
+    const uint8_t *data;
+    size_t len;
+    uint64_t now_ms;
+    const nl_conn_callbacks_t *cb;
+} send_attempt_t;
+
+static bool is_reliable_mode(nl_delivery_t d) {
+    return d == NL_RELIABLE_UNORDERED || d == NL_RELIABLE_ORDERED;
+}
+
+/* May this payload leave now? Congestion window gates reliable only (no
+ * ack clock for unreliable); peer rwnd gates both. Does NOT consume rate
+ * tokens -- call rate_consume only once emit is actually committed, so a
+ * failed window check never steals budget. */
+static bool send_window_open(nl_connection_t *conn, const send_attempt_t *a) {
+    if (is_reliable_mode(a->delivery) && reliable_in_flight(conn) >= conn->cwnd) {
+        return false;
+    }
+    if ((uint32_t)a->len > (uint32_t)conn->peer_rwnd) return false;
+    if (conn->rate_bps != 0) {
+        rate_refill(conn, a->now_ms);
+        if (conn->rate_tokens < (double)a->len) return false;
+    }
+    return true;
+}
+
+static void rate_consume(nl_connection_t *conn, size_t bytes) {
+    if (conn->rate_bps != 0) conn->rate_tokens -= (double)bytes;
+}
+
+static nl_result_t do_channel_send(nl_connection_t *conn, const send_attempt_t *a) {
+    rate_consume(conn, a->len);
+    emit_ctx_t ectx = { conn, a->cb };
+    uint16_t rwnd = nl_connection_adv_window(conn);
+    nl_result_t r = nl_channel_send(&conn->channels[a->channel], a->now_ms, a->channel, a->delivery,
+                                     a->data, a->len, rwnd, on_channel_emit, &ectx);
+    if (r == NL_OK) conn->last_send_time_ms = a->now_ms;
+    return r;
+}
+
+/* Called with the lock held after any event that may have opened budget
+ * (acks, tick/refill, peer rwnd update). Only the head is tried so
+ * priority order is never violated by a lower-priority tail sneaking past
+ * a blocked head. */
+static void flush_deferred(nl_connection_t *conn, uint64_t now_ms, const nl_conn_callbacks_t *cb) {
+    while (conn->deferred_head) {
+        nl_deferred_msg_t *head = conn->deferred_head;
+        send_attempt_t a = {
+            .conn = conn,
+            .channel = head->channel,
+            .delivery = (nl_delivery_t)head->delivery,
+            .data = head->data,
+            .len = head->len,
+            .now_ms = now_ms,
+            .cb = cb,
+        };
+        if (!send_window_open(conn, &a)) break;
+        rate_consume(conn, head->len);
+        emit_ctx_t ectx = { conn, cb };
+        uint16_t rwnd = nl_connection_adv_window(conn);
+        nl_result_t r = nl_channel_send(&conn->channels[head->channel], now_ms, head->channel,
+                                         (nl_delivery_t)head->delivery, head->data, head->len,
+                                         rwnd, on_channel_emit, &ectx);
+        if (r != NL_OK) break; /* channel-level reject: leave head parked */
+        conn->last_send_time_ms = now_ms;
+        deferred_pop(conn);
+        free(head->data);
+        free(head);
+    }
+}
+
 nl_result_t nl_connection_send(nl_connection_t *conn, uint8_t channel, nl_delivery_t delivery,
-                                const uint8_t *data, size_t len, uint64_t now_ms,
-                                const nl_conn_callbacks_t *cb) {
+                                const uint8_t *data, size_t len, uint8_t priority,
+                                uint64_t now_ms, const nl_conn_callbacks_t *cb) {
     if (channel >= conn->channel_count) return NL_ERR_CHANNEL_OUT_OF_RANGE;
+    if ((int)delivery < 0 || (int)delivery >= NL_LANES_PER_CHANNEL) return NL_ERR_INVALID_ARGUMENT;
+    if (len > 0 && !data) return NL_ERR_INVALID_ARGUMENT;
+    if (len > NL_MAX_MESSAGE_SIZE) return NL_ERR_MESSAGE_TOO_LARGE;
 
     pthread_mutex_lock(&conn->lock);
     if (conn->state != NL_CONN_CONNECTED) {
         pthread_mutex_unlock(&conn->lock);
         return NL_ERR_NOT_CONNECTED;
     }
-    emit_ctx_t ectx = { conn, cb };
-    nl_result_t r = nl_channel_send(&conn->channels[channel], now_ms, channel, delivery, data, len,
-                                     on_channel_emit, &ectx);
-    if (r == NL_OK) conn->last_send_time_ms = now_ms;
+
+    send_attempt_t a = {
+        .conn = conn, .channel = channel, .delivery = delivery,
+        .data = data, .len = len, .now_ms = now_ms, .cb = cb,
+    };
+
+    /* Anything already parked must go out first: always enqueue behind it
+     * so priority/FIFO order is never violated by a later immediate send. */
+    if (conn->deferred_head != NULL) {
+        if (!deferred_push(conn, channel, delivery, priority, data, len)) {
+            pthread_mutex_unlock(&conn->lock);
+            return NL_ERR_QUEUE_FULL;
+        }
+        flush_deferred(conn, now_ms, cb);
+        pthread_mutex_unlock(&conn->lock);
+        return NL_OK;
+    }
+
+    if (send_window_open(conn, &a)) {
+        nl_result_t r = do_channel_send(conn, &a);
+        if (r == NL_OK) {
+            pthread_mutex_unlock(&conn->lock);
+            return NL_OK;
+        }
+        /* Permanent channel-level failure (bad size etc.) -- do not defer. */
+        pthread_mutex_unlock(&conn->lock);
+        return r;
+    }
+
+    /* Window/rate closed: park until budget opens (tick/ack/rwnd update). */
+    if (!deferred_push(conn, channel, delivery, priority, data, len)) {
+        pthread_mutex_unlock(&conn->lock);
+        return NL_ERR_QUEUE_FULL;
+    }
     pthread_mutex_unlock(&conn->lock);
-    return r;
+    return NL_OK;
 }
 
 typedef struct {
     nl_peer_id_t peer;
     const nl_conn_callbacks_t *cb;
+    nl_connection_t *conn;
 } deliver_ctx_t;
 
 static void on_channel_deliver(void *ctx, uint8_t channel_id, nl_delivery_t delivery,
                                 const uint8_t *data, uint32_t len) {
     deliver_ctx_t *d = (deliver_ctx_t *)ctx;
     d->cb->on_data(d->cb->ctx, d->peer, channel_id, delivery, data, len);
+    /* Flow control: bytes handed to the event queue occupy local window
+     * until nl_poll_event returns them to the app (nl_connection_consume_window).
+     * Called from on_packet with conn->lock already held. */
+    nl_connection_t *conn = d->conn;
+    if (conn->recv_window_size > conn->recv_window_used) {
+        uint32_t room = conn->recv_window_size - conn->recv_window_used;
+        conn->recv_window_used += (len < room ? len : room);
+    }
 }
 
 nl_result_t nl_connection_on_packet(nl_connection_t *conn, uint8_t type,
@@ -237,9 +483,14 @@ nl_result_t nl_connection_on_packet(nl_connection_t *conn, uint8_t type,
 
     nl_result_t result = NL_OK;
     bool just_confirmed = false;
+    bool became_disconnected = false;
+    uint32_t total_newly_acked = 0;
+    bool fast_loss = false;
+    uint64_t retx_before = conn->stats.retransmits;
+
     switch (type) {
         case NL_PKT_DATA: {
-            deliver_ctx_t dctx = { conn->id, cb };
+            deliver_ctx_t dctx = { conn->id, cb, conn };
             /* Route by the channel_id embedded in the plaintext (byte 0
              * of the DATA payload) into that channel's state. */
             if (ct_len < 1) { result = NL_ERR_PROTOCOL_MISMATCH; break; }
@@ -248,11 +499,19 @@ nl_result_t nl_connection_on_packet(nl_connection_t *conn, uint8_t type,
             retransmit_ctx_t rctx = { conn, cb };
             bool has_rtt_sample = false;
             uint32_t rtt_sample_ms = 0;
+            uint32_t newly_acked = 0;
+            uint16_t peer_rwnd = conn->peer_rwnd;
+            uint16_t adv = nl_connection_adv_window(conn);
+
             nl_channel_on_receive(&conn->channels[channel_id], now_ms, plaintext, (uint16_t)ct_len,
-                                   on_channel_deliver, &dctx,
+                                   adv, on_channel_deliver, &dctx,
                                    on_channel_retransmit, &rctx,
-                                   &has_rtt_sample, &rtt_sample_ms);
+                                   &has_rtt_sample, &rtt_sample_ms,
+                                   &newly_acked, &peer_rwnd);
+            conn->peer_rwnd = peer_rwnd;
+            total_newly_acked += newly_acked;
             if (has_rtt_sample) update_rtt(conn, rtt_sample_ms);
+            if (conn->stats.retransmits > retx_before) fast_loss = true;
             break;
         }
         case NL_PKT_KEEPALIVE:
@@ -272,13 +531,19 @@ nl_result_t nl_connection_on_packet(nl_connection_t *conn, uint8_t type,
             break;
         case NL_PKT_DISCONNECT:
             conn->state = NL_CONN_DISCONNECTED;
+            became_disconnected = true;
             break;
         default:
             result = NL_ERR_PROTOCOL_MISMATCH;
             break;
     }
 
-    bool became_disconnected = (conn->state == NL_CONN_DISCONNECTED);
+    if (total_newly_acked > 0) cc_on_acks(conn, total_newly_acked);
+    if (fast_loss) cc_on_loss(conn, /*fast*/ true);
+
+    /* Acks (and the peer's new rwnd) open budget for deferred sends. */
+    if (conn->deferred_head) flush_deferred(conn, now_ms, cb);
+
     pthread_mutex_unlock(&conn->lock);
 
     if (just_confirmed && cb->on_connected) {
@@ -290,8 +555,6 @@ nl_result_t nl_connection_on_packet(nl_connection_t *conn, uint8_t type,
 
     return result;
 }
-
-
 
 void nl_connection_tick(nl_connection_t *conn, uint64_t now_ms, const nl_conn_callbacks_t *cb) {
     pthread_mutex_lock(&conn->lock);
@@ -329,11 +592,20 @@ void nl_connection_tick(nl_connection_t *conn, uint64_t now_ms, const nl_conn_ca
     /* Retransmission scan across every channel's reliable lanes. */
     retransmit_ctx_t rctx = { conn, cb };
     bool any_gave_up = false;
+    uint64_t retx_before = conn->stats.retransmits;
+    uint16_t adv = nl_connection_adv_window(conn);
     for (uint8_t c = 0; c < conn->channel_count; c++) {
         bool give_up = false;
-        nl_channel_tick(&conn->channels[c], c, now_ms, conn->rto_ms, NL_MAX_RETRIES,
+        nl_channel_tick(&conn->channels[c], c, now_ms, conn->rto_ms, NL_MAX_RETRIES, adv,
                          on_channel_retransmit, &rctx, &give_up);
         any_gave_up = any_gave_up || give_up;
+    }
+    if (conn->stats.retransmits > retx_before) cc_on_loss(conn, /*fast*/ false);
+
+    /* Rate tokens refill with wall time; re-check deferred queue. */
+    if (conn->deferred_head) {
+        rate_refill(conn, now_ms);
+        flush_deferred(conn, now_ms, cb);
     }
 
     /* Idle keepalive so a channel with no application traffic still gets
@@ -395,4 +667,32 @@ void nl_connection_get_stats(nl_connection_t *conn, nl_connection_stats_t *out) 
     out->rtt_var_ms = (uint32_t)conn->rttvar_ms;
     out->rto_ms = conn->rto_ms;
     pthread_mutex_unlock(&conn->lock);
+}
+
+uint32_t nl_connection_capabilities(nl_connection_t *conn) {
+    pthread_mutex_lock(&conn->lock);
+    uint32_t caps = conn->capabilities;
+    pthread_mutex_unlock(&conn->lock);
+    return caps;
+}
+
+uint16_t nl_connection_adv_window(nl_connection_t *conn) {
+    /* Assumes conn->lock is held (or the connection is not yet published):
+     * every mutator of recv_window_used runs under that lock. */
+    if (conn->recv_window_used >= conn->recv_window_size) return 0;
+    uint32_t avail = conn->recv_window_size - conn->recv_window_used;
+    if (avail > NL_RECV_WINDOW_MAX) avail = NL_RECV_WINDOW_MAX;
+    return (uint16_t)avail;
+}
+
+void nl_connection_consume_window(nl_connection_t *conn, uint32_t bytes) {
+    if (!conn) return;
+    pthread_mutex_lock(&conn->lock);
+    if (bytes >= conn->recv_window_used) conn->recv_window_used = 0;
+    else conn->recv_window_used -= bytes;
+    pthread_mutex_unlock(&conn->lock);
+    /* Window just opened: a deferred send may fit now. We cannot flush
+     * here without the callbacks (and must not take the endpoint lock from
+     * poll's queue section); the next tick (<=50ms) or inbound packet
+     * flushes. Tests that need immediate flush call the connection tick. */
 }

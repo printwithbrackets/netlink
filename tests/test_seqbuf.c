@@ -75,7 +75,7 @@ TEST(test_send_ring_ack_marks_slot) {
     nl_send_ring_insert(&ring, payload, 1, 0, &seq);
     ASSERT_FALSE(nl_send_ring_get(&ring, seq)->acked);
     bool has_sample; uint32_t sample_ms;
-    nl_send_ring_ack(&ring, seq, 0, 0, &has_sample, &sample_ms);
+    nl_send_ring_ack(&ring, seq, 0, 0, &has_sample, &sample_ms, NULL);
     ASSERT_TRUE(nl_send_ring_get(&ring, seq)->acked);
     nl_send_ring_free(&ring);
 }
@@ -89,7 +89,7 @@ TEST(test_send_ring_ack_bitfield_marks_older) {
     /* seqs = 0,1,2,3,4. Ack seq=4 with bit0 set (=seq 3) and bit2 set (=seq 1). */
     uint32_t ack_bits = (1u << 0) | (1u << 2);
     bool has_sample; uint32_t sample_ms;
-    nl_send_ring_ack(&ring, 4, ack_bits, 0, &has_sample, &sample_ms);
+    nl_send_ring_ack(&ring, 4, ack_bits, 0, &has_sample, &sample_ms, NULL);
     ASSERT_TRUE(nl_send_ring_get(&ring, 4)->acked);
     ASSERT_TRUE(nl_send_ring_get(&ring, 3)->acked);  /* bit 0 */
     ASSERT_FALSE(nl_send_ring_get(&ring, 2)->acked); /* not set */
@@ -106,7 +106,7 @@ TEST(test_send_ring_ack_rtt_sample_clean) {
     nl_send_ring_insert(&ring, payload, 1, /*send_time_ms*/ 1000, &seq);
 
     bool has_sample; uint32_t sample_ms;
-    nl_send_ring_ack(&ring, seq, 0, /*now_ms*/ 1075, &has_sample, &sample_ms);
+    nl_send_ring_ack(&ring, seq, 0, /*now_ms*/ 1075, &has_sample, &sample_ms, NULL);
     ASSERT_TRUE(has_sample);
     ASSERT_EQ(sample_ms, 75);
     nl_send_ring_free(&ring);
@@ -122,10 +122,10 @@ TEST(test_send_ring_ack_no_rtt_sample_if_already_acked) {
     nl_send_ring_insert(&ring, payload, 1, 1000, &seq);
 
     bool has_sample; uint32_t sample_ms;
-    nl_send_ring_ack(&ring, seq, 0, 1050, &has_sample, &sample_ms);
+    nl_send_ring_ack(&ring, seq, 0, 1050, &has_sample, &sample_ms, NULL);
     ASSERT_TRUE(has_sample);
 
-    nl_send_ring_ack(&ring, seq, 0, 1200, &has_sample, &sample_ms); /* duplicate ack */
+    nl_send_ring_ack(&ring, seq, 0, 1200, &has_sample, &sample_ms, NULL); /* duplicate ack */
     ASSERT_FALSE(has_sample);
     nl_send_ring_free(&ring);
 }
@@ -139,7 +139,7 @@ TEST(test_send_ring_ack_no_rtt_sample_for_retransmitted) {
     nl_send_ring_get(&ring, seq)->retry_count = 1; /* simulate: this slot was retransmitted */
 
     bool has_sample; uint32_t sample_ms;
-    nl_send_ring_ack(&ring, seq, 0, 1050, &has_sample, &sample_ms);
+    nl_send_ring_ack(&ring, seq, 0, 1050, &has_sample, &sample_ms, NULL);
     ASSERT_FALSE(has_sample);
     nl_send_ring_free(&ring);
 }
@@ -158,7 +158,7 @@ TEST(test_send_ring_ack_no_rtt_sample_from_bitfield_entries) {
 
     bool has_sample; uint32_t sample_ms;
     /* Ack seq1 directly (produces a sample) and seq0 via bit 0. */
-    nl_send_ring_ack(&ring, seq1, 1u << 0, 1100, &has_sample, &sample_ms);
+    nl_send_ring_ack(&ring, seq1, 1u << 0, 1100, &has_sample, &sample_ms, NULL);
     ASSERT_TRUE(has_sample);       /* from seq1, the `ack` field itself */
     ASSERT_EQ(sample_ms, 90);      /* 1100 - 1010 */
     ASSERT_TRUE(nl_send_ring_get(&ring, seq0)->acked); /* seq0 acked too, via bitfield */
@@ -180,7 +180,7 @@ TEST(test_fast_retransmit_triggers_past_threshold) {
      * correctly excluded from the scan. */
     uint32_t ack_bits = (1u << 0) | (1u << 1) | (1u << 2);
     bool has_sample; uint32_t sample_ms;
-    nl_send_ring_ack(&ring, 4, ack_bits, 0, &has_sample, &sample_ms);
+    nl_send_ring_ack(&ring, 4, ack_bits, 0, &has_sample, &sample_ms, NULL);
 
     fast_retransmit_capture_reset();
     nl_send_ring_fast_retransmit(&ring, 4, ack_bits, 3, 100, fast_retransmit_capture, NULL);
@@ -223,7 +223,7 @@ TEST(test_fast_retransmit_skips_already_acked) {
     uint16_t seqs[5];
     for (int i = 0; i < 5; i++) nl_send_ring_insert(&ring, payload, 1, 0, &seqs[i]);
     bool has_sample; uint32_t sample_ms;
-    nl_send_ring_ack(&ring, 4, (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3), 0, &has_sample, &sample_ms);
+    nl_send_ring_ack(&ring, 4, (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3), 0, &has_sample, &sample_ms, NULL);
 
     /* everything acked now -- nothing should fast-retransmit */
     fast_retransmit_capture_reset();
