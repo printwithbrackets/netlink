@@ -55,6 +55,10 @@ mod raw {
         pub keepalive_interval_ms: u32,
         pub encryption_enabled: bool,
         pub server_name: *const c_char,
+        // Fields added with protocol v2 (keep in sync with nl_config_t).
+        pub max_send_bytes_per_sec: u32,
+        pub recv_window_bytes: u32,
+        pub capabilities: u32,
     }
 
     #[repr(C)]

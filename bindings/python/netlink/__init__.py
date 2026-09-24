@@ -140,6 +140,10 @@ class _Config(ctypes.Structure):
         ("keepalive_interval_ms", ctypes.c_uint32),
         ("encryption_enabled", ctypes.c_bool),
         ("server_name", ctypes.c_char_p),
+        # Fields added with protocol v2 (keep in sync with nl_config_t).
+        ("max_send_bytes_per_sec", ctypes.c_uint32),
+        ("recv_window_bytes", ctypes.c_uint32),
+        ("capabilities", ctypes.c_uint32),
     ]
 
 

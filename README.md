@@ -452,6 +452,12 @@ negotiation -- each with regression tests.
   released/teardown correctly on confirm, deny, and expiry (including
   destroying half-open client connections so `CONNECT_FAILED` is not
   delivered twice).
+- **Binding ABI fix.** Python's `_Config` and Rust's `nl_config_t`
+  mirror were missing the three new `nl_config_t` fields added above,
+  so `nl_config_default` wrote past the end of the binding's struct
+  (stack corruption / SIGSEGV at teardown in the Python CI job). Both
+  mirrors now match C's layout (56 bytes); Go uses the real C header
+  via cgo and was unaffected.
 - **Regression tests** for the above: sequenced out-of-order fragments,
   channel-tick reassembly expiry, ACCEPTED retransmit budget,
   `encryption_enabled` rejection, duplicate connect, discovery wrong
