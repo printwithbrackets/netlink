@@ -31,6 +31,11 @@ def wait_for(client_or_server, event_type, timeout=3.0):
     raise TimeoutError(f"timed out waiting for {event_type}")
 
 
+def test_version_matches_package():
+    assert netlink.__version__ == "1.0.0"
+    assert netlink.version() == netlink.__version__
+
+
 def test_connect_and_echo():
     port = next_port()
     server = netlink.Server("127.0.0.1", port)

@@ -37,7 +37,7 @@ __version__ = "1.0.0"
 __all__ = [
     "Delivery", "EventType", "AddressFamily", "Transport",
     "NetLinkError", "Event", "Config", "Endpoint", "Server", "Client",
-    "__version__",
+    "version", "__version__",
 ]
 
 # --------------------------------------------------------------------------
@@ -172,6 +172,9 @@ class _Event(ctypes.Structure):
 _lib.nl_error_string.argtypes = [ctypes.c_int]
 _lib.nl_error_string.restype = ctypes.c_char_p
 
+_lib.nl_version_string.argtypes = []
+_lib.nl_version_string.restype = ctypes.c_char_p
+
 _lib.nl_config_default.argtypes = [ctypes.POINTER(_Config)]
 _lib.nl_config_default.restype = None
 
@@ -213,6 +216,12 @@ _lib.nl_peer_count.restype = ctypes.c_uint32
 def _check(code: int) -> None:
     if code != 0:
         raise NetLinkError(code)
+
+
+def version() -> str:
+    """Return the loaded C library's version string (e.g. "1.0.0")."""
+    raw = _lib.nl_version_string()
+    return raw.decode("utf-8") if raw else ""
 
 
 # --------------------------------------------------------------------------
