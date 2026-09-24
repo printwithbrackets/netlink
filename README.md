@@ -379,8 +379,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 First stable release. Library version is **1.0.0**
 (`NL_VERSION_MAJOR/MINOR/PATCH`, `nl_version_string()`, Python
-`__version__`, `Cargo.toml`, `pyproject.toml`). Wire protocol is
-**`NL_PROTOCOL_VERSION` 2**.
+`__version__` / `version()`, `Cargo.toml`, `pyproject.toml`). Wire
+protocol is **`NL_PROTOCOL_VERSION` 2**.
 
 Code review pass over the 0.1.0 core; all findings fixed with regression
 tests (`make` warning-free, `make test` green under ASan/UBSan). Wire
