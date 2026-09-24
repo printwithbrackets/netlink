@@ -429,7 +429,7 @@ impl Client {
     }
 }
 
-/// Returns the library's version string (e.g. "0.1.0").
+/// Returns the library's version string (e.g. "1.0.0").
 pub fn version() -> String {
     unsafe { CStr::from_ptr(raw::nl_version_string()).to_string_lossy().into_owned() }
 }

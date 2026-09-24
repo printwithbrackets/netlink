@@ -265,7 +265,7 @@ environment** (a sandboxed Linux container with a C toolchain, OpenSSL,
 and Python, but no Go/Rust toolchain, no IPv6 support at the kernel
 level, and no network access to install either):
 
-- 121 test cases across unit tests (`tests/test_seqbuf.c`,
+- 122 test cases across unit tests (`tests/test_seqbuf.c`,
   `test_crypto.c`, `test_fragment.c`, `test_channel.c`,
   `test_connection.c`, `test_network_simulation.c`) and real-socket
   integration tests (`tests/integration/test_integration.c`), all clean
@@ -375,7 +375,12 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Changelog
 
-### Unreleased
+### 1.0.0 (2026-09-24)
+
+First stable release. Library version is **1.0.0**
+(`NL_VERSION_MAJOR/MINOR/PATCH`, `nl_version_string()`, Python
+`__version__`, `Cargo.toml`, `pyproject.toml`). Wire protocol is
+**`NL_PROTOCOL_VERSION` 2**.
 
 Code review pass over the 0.1.0 core; all findings fixed with regression
 tests (`make` warning-free, `make test` green under ASan/UBSan). Wire
@@ -458,7 +463,8 @@ negotiation -- each with regression tests.
   (stack corruption / SIGSEGV at teardown in the Python CI job). Both
   mirrors now match C's layout (56 bytes); Go uses the real C header
   via cgo and was unaffected.
-- **Regression tests** for the above: sequenced out-of-order fragments,
+- **Regression tests** for the above: version string matching
+  `NL_VERSION_*`, sequenced out-of-order fragments,
   channel-tick reassembly expiry, ACCEPTED retransmit budget,
   `encryption_enabled` rejection, duplicate connect, discovery wrong
   nonce + rate limit (raw-socket injection, works without broadcast),

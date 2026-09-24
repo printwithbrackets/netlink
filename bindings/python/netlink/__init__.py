@@ -32,9 +32,12 @@ import time
 from dataclasses import dataclass
 from typing import Iterator, Optional
 
+__version__ = "1.0.0"
+
 __all__ = [
     "Delivery", "EventType", "AddressFamily", "Transport",
     "NetLinkError", "Event", "Config", "Endpoint", "Server", "Client",
+    "__version__",
 ]
 
 # --------------------------------------------------------------------------

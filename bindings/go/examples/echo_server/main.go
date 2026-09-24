@@ -15,7 +15,7 @@ import (
 	"strconv"
 	"time"
 
-	netlink "github.com/yourusername/netlink/bindings/go"
+	netlink "github.com/printwithbrackets/netlink/bindings/go"
 )
 
 func main() {

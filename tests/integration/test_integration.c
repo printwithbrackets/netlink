@@ -663,8 +663,18 @@ TEST(test_discovery_rate_limited) {
     nl_endpoint_destroy(server);
 }
 
+/* Version consistency: nl_version_string() must match the NL_VERSION_*
+ * macros so bindings and callers that parse either stay in sync. */
+TEST(test_version_string_matches_macros) {
+    char expected[32];
+    snprintf(expected, sizeof(expected), "%d.%d.%d",
+             NL_VERSION_MAJOR, NL_VERSION_MINOR, NL_VERSION_PATCH);
+    ASSERT_TRUE(strcmp(nl_version_string(), expected) == 0);
+}
+
 int main(void) {
     printf("=== integration tests (real UDP sockets) ===\n");
+    RUN_TEST(test_version_string_matches_macros);
     RUN_TEST(test_connect_and_reliable_ordered_data);
     RUN_TEST(test_capability_negotiation_intersects_both_sides);
     RUN_TEST(test_all_delivery_modes_over_real_sockets);

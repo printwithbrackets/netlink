@@ -1,3 +1,3 @@
-module github.com/yourusername/netlink/bindings/go
+module github.com/printwithbrackets/netlink/bindings/go
 
 go 1.21
