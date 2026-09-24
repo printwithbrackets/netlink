@@ -47,6 +47,13 @@ reimplementations that happen to agree today.
   server doesn't allocate full connection state until a client echoes
   back a server-issued cookie, proving it can receive at its claimed
   source address; handshake processing is additionally rate-limited.
+- **WebSocket transport** (`NL_TRANSPORT_WEBSOCKET`): TCP + RFC6455
+  framing for browser/interoperability use. The same encrypted NetLink
+  handshake and reliability machinery rides inside binary WebSocket
+  messages (one NL packet per frame); the opening HTTP upgrade is a
+  standards-compliant `Sec-WebSocket-Key`/`Accept` exchange (SHA-1 via
+  OpenSSL EVP). LAN discovery remains UDP-only and returns
+  `NL_ERR_UNSUPPORTED` on WebSocket endpoints. Fixed path `/`.
 - **Native thread safety.** The library runs its own background I/O
   thread; `nl_send()` and `nl_poll_event()` can be called from any thread
   without external locking.
@@ -55,7 +62,7 @@ reimplementations that happen to agree today.
   be run to completion in this project's own dev sandbox).
 - **LAN server discovery** via UDP broadcast (probe/reply with server
   name and player count) -- handy for local multiplayer without a
-  master server.
+  master server. UDP transport only.
 - **C/C++, Python, Go, and Rust bindings** over one shared protocol
   implementation.
 - **Real RTT measurement and adaptive retransmission timing.** Every
@@ -97,10 +104,6 @@ reimplementations that happen to agree today.
 - **WebRTC.** A correct, secure WebRTC implementation (ICE + DTLS + SCTP)
   is a large undertaking in its own right, and a half-correct one is a
   security liability. Not included; see the roadmap.
-- **WebSocket transport.** `NL_TRANSPORT_WEBSOCKET` is defined in the
-  public API as a placeholder for browser interop but is not implemented
-  yet (`nl_server_create`/`nl_client_create` return `NL_ERR_UNSUPPORTED`
-  for it today).
 
 ## Quick start
 
@@ -130,6 +133,31 @@ while (1) {
 
 See `examples/echo_server.c` and `examples/echo_client.c` for complete,
 runnable programs.
+
+### WebSocket transport
+
+Set `cfg.transport = NL_TRANSPORT_WEBSOCKET` on both ends. The server
+listens on TCP and speaks the RFC6455 opening handshake; the client
+dials out, upgrades, then runs the normal encrypted NetLink handshake.
+One NetLink packet rides in each binary WebSocket message.
+
+```c
+nl_config_t cfg;
+nl_config_default(&cfg);
+cfg.transport = NL_TRANSPORT_WEBSOCKET;
+
+nl_address_t addr = {0};
+strcpy(addr.host, "0.0.0.0");
+addr.port = 9001;
+
+nl_endpoint_t *server;
+nl_server_create(&addr, &cfg, &server);
+/* ... same nl_poll_event / nl_send loop as UDP ... */
+```
+
+See `tests/integration/test_websocket_integration.c` for a full
+client/server example. Path is fixed to `/`; LAN discovery is UDP-only
+and returns `NL_ERR_UNSUPPORTED` on WebSocket endpoints.
 
 ### Python
 
@@ -185,10 +213,13 @@ src/
   protocol.h          Wire format constants (packet types, header layout).
   byteorder.h          Alignment-safe big-endian read/write helpers.
   seqbuf.{h,c}          Sequence buffers: send-ring (retransmission),
-                         recv-dedupe (ack bitfield), reorder-ring (ordering).
+                          recv-dedupe (ack bitfield), reorder-ring (ordering).
   fragment.{h,c}         Message fragmentation / reassembly with DoS bounds.
   crypto.{h,c}            X25519, HKDF-SHA256, AES-256-GCM, replay window
-                          -- all via OpenSSL EVP, no hand-rolled primitives.
+                           -- all via OpenSSL EVP, no hand-rolled primitives.
+  websocket.{h,c}         RFC6455 framing + HTTP upgrade handshake (pure
+                           logic, unit-tested; no sockets). Endpoint.c
+                           drives it for NL_TRANSPORT_WEBSOCKET.
   channel.{h,c}            Per-(channel, delivery mode) "lane" state,
                             tying seqbuf + fragment together. Pure logic,
                             no sockets -- independently unit-testable by
@@ -197,9 +228,9 @@ src/
                             channel array, and the mutex that makes
                             concurrent nl_send()/receive/tick safe.
   endpoint.c                  Sockets, the background I/O thread, the
-                              connect handshake state machine, the
-                              connection table, and the event queue --
-                              i.e. everything in include/netlink.h.
+                               connect handshake state machine, the
+                               connection table, and the event queue --
+                               i.e. everything in include/netlink.h.
 ```
 
 ### Delivery modes and channels
@@ -265,12 +296,13 @@ environment** (a sandboxed Linux container with a C toolchain, OpenSSL,
 and Python, but no Go/Rust toolchain, no IPv6 support at the kernel
 level, and no network access to install either):
 
-- 129 test cases across unit tests (`tests/test_seqbuf.c`,
+- 147 test cases across unit tests (`tests/test_seqbuf.c`,
   `test_crypto.c`, `test_fragment.c`, `test_channel.c`,
-  `test_connection.c`, `test_network_simulation.c`: 110 cases) and
-  real-socket integration tests
-  (`tests/integration/test_integration.c`: 19 cases), all clean under
-  AddressSanitizer + UndefinedBehaviorSanitizer -- no leaks, no UB.
+  `test_connection.c`, `test_network_simulation.c`,
+  `test_websocket.c`: 128 cases) and real-socket integration tests
+  (`tests/integration/test_integration.c`: 19 cases,
+  `tests/integration/test_websocket_integration.c`: 5 cases), all clean
+  under AddressSanitizer + UndefinedBehaviorSanitizer -- no leaks, no UB.
 - `test_network_simulation.c` specifically drives thousands of messages
   through a simulated bad network (configurable packet loss, jitter/
   reordering, duplication) and verifies `RELIABLE_ORDERED` delivery stays
@@ -294,6 +326,10 @@ level, and no network access to install either):
 - The **example C programs** (`echo_server`/`echo_client`), run as two
   independent OS processes exchanging messages across three channels and
   delivery modes.
+- The **WebSocket transport** (`NL_TRANSPORT_WEBSOCKET`): HTTP upgrade +
+  encrypted NetLink handshake + reliable/unordered/unreliable delivery
+  and fragmentation over loopback TCP, exercised by
+  `tests/integration/test_websocket_integration.c` (5 cases).
 
 **Written but not compiled/run here, for lack of toolchain:**
 
@@ -332,7 +368,9 @@ genuinely valuable contribution.
 - **No connection migration.** If a client's address changes mid-connection
   (e.g. a NAT rebind or network switch), the connection times out rather
   than following the new address, unlike e.g. QUIC.
-- **WebSocket transport and WebRTC** are not implemented (see Features).
+- **WebRTC** is not implemented (see Features). WebSocket transport is
+  implemented but currently binds a fixed path (`/`) and does not
+  advertise LAN discovery over the WebSocket endpoint.
 - **Connection table lookup is O(n)** (linear scan, bounded at 512
   connections internally). Fine for small-to-medium deployments; a hash
   map would be a straightforward improvement for large ones.
@@ -362,8 +400,7 @@ priority order:
 3. **An optional RPC layer** with request/response semantics, and
    **built-in (optional, separate-from-core) serialization**.
 4. **Compression** (compress-then-encrypt, never the reverse).
-5. **WebSocket transport**, already reserved in the API.
-6. Smaller infrastructure: a C++ RAII wrapper, CMake alongside the
+5. Smaller infrastructure: a C++ RAII wrapper, CMake alongside the
    Makefile, a pkg-config `.pc` file, fuzzing (libFuzzer/AFL++) on the
    packet-parsing paths, Windows/macOS/Go/Rust CI, and benchmarks.
 
@@ -381,6 +418,17 @@ MIT -- see [LICENSE](LICENSE).
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Changelog
+
+### Unreleased
+
+- **WebSocket transport implemented** (`NL_TRANSPORT_WEBSOCKET`). TCP +
+  RFC6455 framing with a real HTTP upgrade handshake (`Sec-WebSocket-
+  Key`/`Accept`, SHA-1 via OpenSSL EVP) and the existing encrypted
+  NetLink protocol inside binary frames. Unit tests in
+  `tests/test_websocket.c`; integration tests in
+  `tests/integration/test_websocket_integration.c`. LAN discovery and a
+  configurable path are not included yet (fixed path `/`; discovery
+  returns `NL_ERR_UNSUPPORTED` on WebSocket endpoints).
 
 ### 1.0.0 (2026-09-24)
 

@@ -26,7 +26,7 @@ CRYPTO_LIBS   ?= $(shell pkg-config --libs libcrypto 2>/dev/null || echo -lcrypt
 
 BUILD_DIR := build
 SRC := src/endpoint.c src/connection.c src/channel.c src/seqbuf.c \
-       src/fragment.c src/crypto.c src/util.c
+       src/fragment.c src/crypto.c src/util.c src/websocket.c
 OBJ := $(SRC:src/%.c=$(BUILD_DIR)/%.o)
 
 STATIC_LIB := $(BUILD_DIR)/libnetlink.a
@@ -66,6 +66,7 @@ test-unit: | $(BUILD_DIR)
 	$(CC) $(TEST_CFLAGS) -o $(TEST_BIN_DIR)/test_channel src/channel.c src/seqbuf.c src/fragment.c tests/test_channel.c
 	$(CC) $(TEST_CFLAGS) -pthread -o $(TEST_BIN_DIR)/test_connection src/connection.c src/channel.c src/seqbuf.c src/fragment.c src/crypto.c tests/test_connection.c $(CRYPTO_LIBS)
 	$(CC) $(TEST_CFLAGS) -o $(TEST_BIN_DIR)/test_network_simulation src/channel.c src/seqbuf.c src/fragment.c tests/test_network_simulation.c
+	$(CC) $(TEST_CFLAGS) -o $(TEST_BIN_DIR)/test_websocket src/websocket.c src/crypto.c tests/test_websocket.c $(CRYPTO_LIBS)
 	@echo "--- running unit tests ---"
 	$(TEST_BIN_DIR)/test_seqbuf
 	$(TEST_BIN_DIR)/test_crypto
@@ -73,13 +74,18 @@ test-unit: | $(BUILD_DIR)
 	$(TEST_BIN_DIR)/test_channel
 	$(TEST_BIN_DIR)/test_connection
 	$(TEST_BIN_DIR)/test_network_simulation
+	$(TEST_BIN_DIR)/test_websocket
 
 test-integration: | $(BUILD_DIR)
 	mkdir -p $(TEST_BIN_DIR)
 	$(CC) $(TEST_CFLAGS) -D_GNU_SOURCE -pthread -o $(TEST_BIN_DIR)/test_integration \
 		$(SRC) tests/integration/test_integration.c $(CRYPTO_LIBS)
+	$(CC) $(TEST_CFLAGS) -D_GNU_SOURCE -pthread -o $(TEST_BIN_DIR)/test_websocket_integration \
+		$(SRC) tests/integration/test_websocket_integration.c $(CRYPTO_LIBS)
 	@echo "--- running integration tests (real sockets) ---"
 	$(TEST_BIN_DIR)/test_integration
+	@echo "--- running integration tests (websocket transport) ---"
+	$(TEST_BIN_DIR)/test_websocket_integration
 
 # --- examples ---
 examples: all | $(BUILD_DIR)
