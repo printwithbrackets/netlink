@@ -9,5 +9,6 @@ __pycache__/
 target/
 Cargo.lock
 .DS_Store
-echo_server
 *.test
+# Go example binary (`go build -o echo_server .`); keep the directory tracked.
+/bindings/go/examples/echo_server/echo_server
