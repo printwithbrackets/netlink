@@ -6,7 +6,7 @@
 #   make test-bindings - run Python/Go/Rust binding tests (needs go, cargo, python3)
 #   make examples      - build the example programs
 #   make install       - install libs, header, and pkg-config file to $(PREFIX)
-#   make dist          - package netlink-1.1.0.tar.gz (header + libs + .pc)
+#   make dist          - package netlink-$(VERSION).tar.gz (header + libs + .pc)
 #   make clean         - remove build artifacts
 #
 # Requires: a C11 compiler, pthreads, and OpenSSL's libcrypto (headers +
@@ -18,6 +18,10 @@ CC      ?= cc
 AR      ?= ar
 CFLAGS  ?= -std=c11 -Wall -Wextra -O2 -fPIC
 LDFLAGS ?=
+
+# Keep in sync with NL_VERSION_* in include/netlink.h and version fields
+# in bindings/python, bindings/rust.
+VERSION := 1.1.1
 
 # --- OpenSSL location ---
 # Default assumes libcrypto is discoverable via pkg-config. Override
@@ -121,7 +125,7 @@ $(BUILD_DIR)/netlink.pc: | $(BUILD_DIR)
 	@echo ""                                   >> $@
 	@echo "Name: netlink"                      >> $@
 	@echo "Description: Secure UDP/WebSocket networking library" >> $@
-	@echo "Version: 1.1.0"                     >> $@
+	@echo "Version: $(VERSION)"                 >> $@
 	@echo "Libs: -L\$${libdir} -lnetlink"      >> $@
 	@echo "Libs.private: -lcrypto -lpthread"   >> $@
 	@echo "Cflags: -I\$${includedir}"          >> $@
@@ -136,14 +140,14 @@ install: all $(BUILD_DIR)/netlink.pc
 # static + shared libraries, pkg-config file, license, README, examples.
 dist: all $(BUILD_DIR)/netlink.pc
 	rm -rf $(BUILD_DIR)/dist
-	mkdir -p $(BUILD_DIR)/dist/netlink-1.1.0/include
-	mkdir -p $(BUILD_DIR)/dist/netlink-1.1.0/lib
-	mkdir -p $(BUILD_DIR)/dist/netlink-1.1.0/lib/pkgconfig
-	mkdir -p $(BUILD_DIR)/dist/netlink-1.1.0/examples
-	cp include/netlink.h $(BUILD_DIR)/dist/netlink-1.1.0/include/
-	cp $(STATIC_LIB) $(SHARED_LIB) $(BUILD_DIR)/dist/netlink-1.1.0/lib/
-	cp $(BUILD_DIR)/netlink.pc $(BUILD_DIR)/dist/netlink-1.1.0/lib/pkgconfig/
-	cp LICENSE README.md $(BUILD_DIR)/dist/netlink-1.1.0/
-	cp examples/echo_server.c examples/echo_client.c $(BUILD_DIR)/dist/netlink-1.1.0/examples/
-	tar -C $(BUILD_DIR)/dist -czf $(BUILD_DIR)/netlink-1.1.0.tar.gz netlink-1.1.0
-	@echo "Created $(BUILD_DIR)/netlink-1.1.0.tar.gz"
+	mkdir -p $(BUILD_DIR)/dist/netlink-$(VERSION)/include
+	mkdir -p $(BUILD_DIR)/dist/netlink-$(VERSION)/lib
+	mkdir -p $(BUILD_DIR)/dist/netlink-$(VERSION)/lib/pkgconfig
+	mkdir -p $(BUILD_DIR)/dist/netlink-$(VERSION)/examples
+	cp include/netlink.h $(BUILD_DIR)/dist/netlink-$(VERSION)/include/
+	cp $(STATIC_LIB) $(SHARED_LIB) $(BUILD_DIR)/dist/netlink-$(VERSION)/lib/
+	cp $(BUILD_DIR)/netlink.pc $(BUILD_DIR)/dist/netlink-$(VERSION)/lib/pkgconfig/
+	cp LICENSE README.md $(BUILD_DIR)/dist/netlink-$(VERSION)/
+	cp examples/echo_server.c examples/echo_client.c $(BUILD_DIR)/dist/netlink-$(VERSION)/examples/
+	tar -C $(BUILD_DIR)/dist -czf $(BUILD_DIR)/netlink-$(VERSION).tar.gz netlink-$(VERSION)
+	@echo "Created $(BUILD_DIR)/netlink-$(VERSION).tar.gz"

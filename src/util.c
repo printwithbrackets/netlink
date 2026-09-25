@@ -2,7 +2,7 @@
 #include <string.h>
 
 const char *nl_version_string(void) {
-    return "1.1.0";
+    return "1.1.1";
 }
 
 const char *nl_error_string(nl_result_t code) {

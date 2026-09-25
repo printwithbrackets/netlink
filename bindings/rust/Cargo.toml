@@ -1,6 +1,6 @@
 [package]
 name = "netlink-rs"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2021"
 description = "Rust bindings for the NetLink secure UDP networking library"
 license = "MIT"

@@ -42,7 +42,7 @@ extern "C" {
 
 #define NL_VERSION_MAJOR 1
 #define NL_VERSION_MINOR 1
-#define NL_VERSION_PATCH 0
+#define NL_VERSION_PATCH 1
 
 /* Wire protocol version. Bumped whenever the on-the-wire packet format
  * changes in an incompatible way. Peers with different values refuse to

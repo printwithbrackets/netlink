@@ -424,6 +424,22 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Changelog
 
+### 1.1.1 (2026-09-25)
+
+**Fixed**
+
+- `gofmt` violations in the Go binding (`netlink.go`) and the Go
+  example (`examples/echo_server/main.go`) that made editors' Go
+  linters (e.g. nvim-lint) report a parser error. Formatting only --
+  no behavior change; `go vet` and `go test` still pass.
+- `.gitignore` pattern for the Go example build output narrowed to the
+  binary path so the `examples/echo_server/` directory stays tracked.
+
+**Changed**
+
+- `Makefile` dist/pkg-config targets now read a single `VERSION`
+  variable instead of hardcoding the release string.
+
 ### 1.1.0 (2026-09-25)
 
 **Added**

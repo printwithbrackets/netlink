@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "netlink-py"
-version = "1.1.0"
+version = "1.1.1"
 description = "Python bindings for the NetLink secure UDP networking library"
 readme = "README.md"
 requires-python = ">=3.8"
