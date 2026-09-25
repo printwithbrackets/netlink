@@ -32,7 +32,7 @@ def wait_for(client_or_server, event_type, timeout=3.0):
 
 
 def test_version_matches_package():
-    assert netlink.__version__ == "1.0.0"
+    assert netlink.__version__ == "1.1.0"
     assert netlink.version() == netlink.__version__
 
 

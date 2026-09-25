@@ -5,6 +5,8 @@
 #   make test          - build and run every unit + integration test (C)
 #   make test-bindings - run Python/Go/Rust binding tests (needs go, cargo, python3)
 #   make examples      - build the example programs
+#   make install       - install libs, header, and pkg-config file to $(PREFIX)
+#   make dist          - package netlink-1.1.0.tar.gz (header + libs + .pc)
 #   make clean         - remove build artifacts
 #
 # Requires: a C11 compiler, pthreads, and OpenSSL's libcrypto (headers +
@@ -108,7 +110,40 @@ clean:
 	rm -rf $(BUILD_DIR)
 
 PREFIX ?= /usr/local
-install: all
-	install -d $(PREFIX)/lib $(PREFIX)/include
+PKGCONFIG_DIR ?= $(PREFIX)/lib/pkgconfig
+
+# pkg-config file for downstream consumers (`pkg-config --cflags --libs netlink`).
+$(BUILD_DIR)/netlink.pc: | $(BUILD_DIR)
+	@echo "prefix=$(PREFIX)"                    > $@
+	@echo "exec_prefix=\$${prefix}"            >> $@
+	@echo "libdir=\$${exec_prefix}/lib"        >> $@
+	@echo "includedir=\$${prefix}/include"     >> $@
+	@echo ""                                   >> $@
+	@echo "Name: netlink"                      >> $@
+	@echo "Description: Secure UDP/WebSocket networking library" >> $@
+	@echo "Version: 1.1.0"                     >> $@
+	@echo "Libs: -L\$${libdir} -lnetlink"      >> $@
+	@echo "Libs.private: -lcrypto -lpthread"   >> $@
+	@echo "Cflags: -I\$${includedir}"          >> $@
+
+install: all $(BUILD_DIR)/netlink.pc
+	install -d $(PREFIX)/lib $(PREFIX)/include $(PKGCONFIG_DIR)
 	install -m 644 $(STATIC_LIB) $(SHARED_LIB) $(PREFIX)/lib/
 	install -m 644 include/netlink.h $(PREFIX)/include/
+	install -m 644 $(BUILD_DIR)/netlink.pc $(PKGCONFIG_DIR)/
+
+# Self-contained tarball of everything a downstream project needs: header,
+# static + shared libraries, pkg-config file, license, README, examples.
+dist: all $(BUILD_DIR)/netlink.pc
+	rm -rf $(BUILD_DIR)/dist
+	mkdir -p $(BUILD_DIR)/dist/netlink-1.1.0/include
+	mkdir -p $(BUILD_DIR)/dist/netlink-1.1.0/lib
+	mkdir -p $(BUILD_DIR)/dist/netlink-1.1.0/lib/pkgconfig
+	mkdir -p $(BUILD_DIR)/dist/netlink-1.1.0/examples
+	cp include/netlink.h $(BUILD_DIR)/dist/netlink-1.1.0/include/
+	cp $(STATIC_LIB) $(SHARED_LIB) $(BUILD_DIR)/dist/netlink-1.1.0/lib/
+	cp $(BUILD_DIR)/netlink.pc $(BUILD_DIR)/dist/netlink-1.1.0/lib/pkgconfig/
+	cp LICENSE README.md $(BUILD_DIR)/dist/netlink-1.1.0/
+	cp examples/echo_server.c examples/echo_client.c $(BUILD_DIR)/dist/netlink-1.1.0/examples/
+	tar -C $(BUILD_DIR)/dist -czf $(BUILD_DIR)/netlink-1.1.0.tar.gz netlink-1.1.0
+	@echo "Created $(BUILD_DIR)/netlink-1.1.0.tar.gz"

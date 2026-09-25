@@ -174,8 +174,18 @@ See `bindings/python/README.md`.
 
 ### Go / Rust
 
-See `bindings/go/README.md` and `bindings/rust/README.md` -- note the
-testing-status caveat in each (summarized in [Testing](#testing) below).
+```go
+// see bindings/go/README.md
+server, err := netlink.NewServer("0.0.0.0", 9000, netlink.NewConfig())
+```
+
+```rust
+// see bindings/rust/README.md
+let mut client = Client::new(Config::default())?;
+let peer = client.connect("127.0.0.1", 9000)?;
+```
+
+Both are covered by real-socket tests (`make test-bindings`).
 
 ### All four client/server combinations
 
@@ -414,25 +424,43 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Changelog
 
-### Unreleased
+### 1.1.0 (2026-09-25)
 
-- **Go and Rust bindings verified and covered by tests.** First real
-  `go build`/`go vet`/`go test` and `cargo build`/`cargo test` pass
-  against the compiled C library (10 Go tests, 11 Rust tests over real
-  loopback sockets). CI jobs for both are no longer best-effort.
-  New `make test-bindings` target runs Python + Go + Rust binding tests.
-- **Previously untested public C APIs covered:** `nl_peer_address`,
-  `nl_peer_rtt_ms`, `nl_peer_count`, `nl_send_ex`, and `nl_error_string`
-  now have integration tests; Python binding gained `peer_rtt_ms` /
-  `peer_count` / `error_string` coverage (9 tests total).
-- **WebSocket transport implemented** (`NL_TRANSPORT_WEBSOCKET`). TCP +
-  RFC6455 framing with a real HTTP upgrade handshake (`Sec-WebSocket-
-  Key`/`Accept`, SHA-1 via OpenSSL EVP) and the existing encrypted
-  NetLink protocol inside binary frames. Unit tests in
-  `tests/test_websocket.c`; integration tests in
-  `tests/integration/test_websocket_integration.c`. LAN discovery and a
-  configurable path are not included yet (fixed path `/`; discovery
-  returns `NL_ERR_UNSUPPORTED` on WebSocket endpoints).
+**Added**
+
+- WebSocket transport (`NL_TRANSPORT_WEBSOCKET`): TCP + RFC6455 framing
+  with a real HTTP upgrade handshake (`Sec-WebSocket-Key`/`Accept`,
+  SHA-1 via OpenSSL EVP) and the existing encrypted NetLink protocol
+  inside binary frames (one NL packet per frame). 18 unit tests in
+  `tests/test_websocket.c`; 5 loopback integration tests in
+  `tests/integration/test_websocket_integration.c`. Path fixed to `/`;
+  LAN discovery is UDP-only and returns `NL_ERR_UNSUPPORTED` on
+  WebSocket endpoints.
+- Integration tests for the previously untested public C APIs:
+  `nl_peer_address`, `nl_peer_rtt_ms`, `nl_peer_count`, `nl_send_ex`
+  (priority + error paths), and `nl_error_string` (all codes).
+- Go binding tests (`bindings/go/netlink_test.go`, 10 real-socket
+  tests): echo, all delivery modes, fragmentation, `SendEx` priority,
+  peer stats/capabilities/RTT/count, disconnect, server-full denial,
+  duplicate-connect rejection, error formatting.
+- Rust binding tests (`bindings/rust/tests/integration.rs`, 11
+  real-socket tests + doctest) covering the same surface as Go.
+- Python binding tests for `peer_rtt_ms`, `peer_count`, and
+  `nl_error_string` (9 tests total, runnable without pytest).
+- `make test-bindings` target: runs Python + Go + Rust binding tests
+  against the freshly built library.
+
+**Changed**
+
+- Go and Rust bindings built, vetted, and passing tests for the first
+  time; both can be exercised with `make test-bindings`.
+- CI: `go-bindings` and `rust-bindings` jobs are no longer
+  `continue-on-error`; they run `go test` / `cargo test` (plus example
+  builds) and fail the build on regressions.
+- cgo link flags now embed an rpath to `build/`, so `go test` finds
+  `libnetlink.so` without extra environment variables.
+- README, CONTRIBUTING, and `CROSS_LANGUAGE_TESTING.md` updated to
+  reflect the verified Go/Rust status and new test counts.
 
 ### 1.0.0 (2026-09-24)
 
