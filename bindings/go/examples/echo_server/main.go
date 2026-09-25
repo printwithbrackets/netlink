@@ -4,9 +4,12 @@
 // without modification.
 //
 // Build (from bindings/go/examples/echo_server/):
-//   go build -o echo_server .
+//
+//	go build -o echo_server .
+//
 // Run:
-//   ./echo_server 9000
+//
+//	./echo_server 9000
 package main
 
 import (

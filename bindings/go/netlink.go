@@ -37,10 +37,10 @@ import (
 type Delivery int
 
 const (
-	Unreliable           Delivery = 0
-	UnreliableSequenced  Delivery = 1
-	ReliableUnordered    Delivery = 2
-	ReliableOrdered      Delivery = 3
+	Unreliable          Delivery = 0
+	UnreliableSequenced Delivery = 1
+	ReliableUnordered   Delivery = 2
+	ReliableOrdered     Delivery = 3
 )
 
 // EventType mirrors nl_event_type_t.
@@ -81,15 +81,15 @@ const (
 
 // PeerStats mirrors nl_peer_stats_t.
 type PeerStats struct {
-	PacketsSent         uint64
-	PacketsReceived     uint64
-	BytesSent           uint64
-	BytesReceived       uint64
-	Retransmits         uint64
-	DuplicatesReceived  uint64
-	RTTMs               uint32
-	RTTVarMs            uint32
-	RtoMs               uint32
+	PacketsSent        uint64
+	PacketsReceived    uint64
+	BytesSent          uint64
+	BytesReceived      uint64
+	Retransmits        uint64
+	DuplicatesReceived uint64
+	RTTMs              uint32
+	RTTVarMs           uint32
+	RtoMs              uint32
 }
 
 // PeerID mirrors nl_peer_id_t (a uint64 connection identifier).
@@ -170,16 +170,16 @@ func addressToC(host string, port uint16, family AddressFamily) (C.nl_address_t,
 // (the underlying C buffer is only valid until the next PollEvent call,
 // so we copy it here rather than expose the raw pointer).
 type Event struct {
-	Type               EventType
-	Peer               PeerID
-	Channel            uint8
-	Data               []byte
-	DisconnectReason   error
-	FromHost           string
-	FromPort           uint16
-	ServerName         string
-	ServerPlayerCount  uint32
-	ServerMaxPlayers   uint32
+	Type              EventType
+	Peer              PeerID
+	Channel           uint8
+	Data              []byte
+	DisconnectReason  error
+	FromHost          string
+	FromPort          uint16
+	ServerName        string
+	ServerPlayerCount uint32
+	ServerMaxPlayers  uint32
 }
 
 func eventFromC(raw *C.nl_event_t) Event {
