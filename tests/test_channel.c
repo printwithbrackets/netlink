@@ -719,6 +719,49 @@ TEST(test_rwnd_carried_on_data_header) {
     nl_channel_free(&receiver);
 }
 
+/* Regression: nl_channel_send_range's ring-full path reported
+ * *out_sent_frags = i, but the loop counts from start_frag, so on a
+ * continuation send it over-reported by start_frag -- claiming fragments it
+ * never emitted. The caller (connection.c's flush_deferred) turns that into
+ * a continuation parked at the wrong frag_start, silently skipping that many
+ * fragments of the message. */
+TEST(test_partial_send_reports_fragments_actually_sent) {
+    nl_channel_t chan;
+    nl_channel_init(&chan);
+    capture_t cap = {0};
+
+    /* Fill the send ring completely so the next insert is refused. */
+    for (int i = 0; i < NL_SEQ_RING_SIZE; i++) {
+        uint8_t b = (uint8_t)i;
+        ASSERT_EQ(nl_channel_send(&chan, 0, 0, NL_RELIABLE_ORDERED, &b, 1,
+                                  NL_RECV_WINDOW_DEFAULT, capture_emit, &cap), NL_OK);
+    }
+    ASSERT_EQ(cap.count, NL_SEQ_RING_SIZE);
+
+    /* A 20-fragment message, attempted as a continuation starting at
+     * fragment 10: the very first insert is refused (ring full). */
+    size_t total = NL_FRAGMENT_CHUNK_SIZE * 20;
+    uint8_t *big = (uint8_t *)malloc(total);
+    ASSERT_TRUE(big != NULL);
+    memset(big, 'B', total);
+
+    uint16_t message_id = 12345;
+    uint16_t sent = 99, frag_count = 0;
+    ASSERT_EQ(nl_channel_send_range(&chan, 0, 0, NL_RELIABLE_ORDERED, big, total,
+                                    NL_RECV_WINDOW_DEFAULT, /*start_frag*/ 10,
+                                    /*max_frags*/ 0, &message_id, capture_emit, &cap,
+                                    &sent, &frag_count), NL_OK);
+    ASSERT_EQ(frag_count, 20);
+    /* Zero fragments went out. Reporting `i` (== 10) here would park a
+     * continuation at fragment 20 -- i.e. skip fragments 10..19 of a
+     * message the app still expects whole. */
+    ASSERT_EQ(sent, 0);
+    ASSERT_EQ(cap.count, NL_SEQ_RING_SIZE); /* and nothing was emitted */
+
+    free(big);
+    nl_channel_free(&chan);
+}
+
 int main(void) {
     printf("=== channel tests ===\n");
     RUN_TEST(test_unreliable_basic_roundtrip);
@@ -741,6 +784,7 @@ int main(void) {
     RUN_TEST(test_fast_retransmit_does_not_trigger_below_threshold);
     RUN_TEST(test_no_ack_from_empty_lane_does_not_ack_peer_seq_zero);
     RUN_TEST(test_packet_beyond_reorder_window_is_dropped_not_acked);
+    RUN_TEST(test_partial_send_reports_fragments_actually_sent);
     RUN_TEST(test_rwnd_carried_on_data_header);
     TEST_SUMMARY();
 }

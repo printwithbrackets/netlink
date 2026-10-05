@@ -113,7 +113,11 @@ nl_result_t nl_channel_send_range(nl_channel_t *chan, uint64_t now_ms, uint8_t c
                  * Connection-level gating normally prevents this; the
                  * refusal path keeps existing live slots intact (a
                  * previously-sent-but-unacked packet must not be lost). */
-                if (out_sent_frags) *out_sent_frags = i;
+                /* Counted from start_frag, like the success path below:
+                 * reporting the raw loop index over-reports by start_frag on
+                 * a continuation send, which would park the continuation
+                 * past fragments that never went out. */
+                if (out_sent_frags) *out_sent_frags = (uint16_t)(i - start_frag);
                 return NL_OK;
             }
         } else {

@@ -446,6 +446,14 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   lost, later ones acked). Regression tests:
   `test_burst_loss_at_cwnd_above_ack_window_no_teardown` (end to end,
   no teardown) and `test_oldest_unacked_tracks_span_not_count`.
+- **Continuation sends reported the wrong fragment count when the send ring
+  filled up.** `nl_channel_send_range`'s ring-full path set
+  `*out_sent_frags = i`, but the loop counts from `start_frag`, so on a
+  continuation send it over-reported by `start_frag` — claiming fragments
+  it never emitted. `flush_deferred` turns that into a continuation parked at
+  the wrong `frag_start`, silently skipping those fragments of a message the
+  application expects whole. Now `(i - start_frag)`, matching the success
+  path. Regression test: `test_partial_send_reports_fragments_actually_sent`.
 - **A dropped reorder-ring insert was still acked.**
   `nl_reorder_ring_insert`'s return value was discarded, and the dedupe
   insert preceding it had already recorded the sequence — so a
