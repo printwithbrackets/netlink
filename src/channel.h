@@ -111,9 +111,14 @@ nl_result_t nl_channel_send_range(nl_channel_t *chan, uint64_t now_ms, uint8_t c
  * other non-DATA source) to this channel's send side: marks newly-acked
  * slots, feeds the RTT estimator, and fires fast retransmit -- the same
  * work nl_channel_on_receive does for the piggybacked copy on DATA.
- * `delivery` must be a reliable lane. Outputs match on_receive's. */
+ * `delivery` must be a reliable lane. Outputs match on_receive's.
+ *
+ * `ack_valid` must be false when the source packet had nothing to ack: the
+ * all-zero (0, 0) pair is a legal encoding of "I have sequence 0", so
+ * applying it unconditionally would mark a never-received sequence acked
+ * and the sender would never retransmit it. */
 void nl_channel_apply_ack(nl_channel_t *chan, uint64_t now_ms, uint8_t channel_id,
-                          nl_delivery_t delivery, uint16_t ack, uint32_t ack_bits,
+                          nl_delivery_t delivery, bool ack_valid, uint16_t ack, uint32_t ack_bits,
                           uint16_t local_rwnd,
                           nl_channel_retransmit_fn retransmit, void *retransmit_ctx,
                           bool *out_has_rtt_sample, uint32_t *out_rtt_sample_ms,

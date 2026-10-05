@@ -122,8 +122,13 @@ nl_result_t nl_channel_send_range(nl_channel_t *chan, uint64_t now_ms, uint8_t c
 
         uint16_t ack = 0;
         uint32_t ack_bits = 0;
-        if (reliable && lane->recv_dedupe_init) {
+        /* Only advertise an ack once we actually have something to
+         * advertise: an all-zero ack is indistinguishable from a genuine
+         * "I have sequence 0" and would silently ack the peer's seq 0. */
+        bool ack_valid = false;
+        if (reliable && lane->recv_dedupe_init && lane->recv_dedupe.has_received_any) {
             nl_recv_dedupe_build_ack(&lane->recv_dedupe, &ack, &ack_bits);
+            ack_valid = true;
             lane->ack_dirty = false; /* piggybacked on this DATA */
         }
 
@@ -134,6 +139,7 @@ nl_result_t nl_channel_send_range(nl_channel_t *chan, uint64_t now_ms, uint8_t c
         nl_put_u16(wire + off, seq); off += 2;
         nl_put_u16(wire + off, ack); off += 2;
         nl_put_u32(wire + off, ack_bits); off += 4;
+        wire[off++] = ack_valid ? 1 : 0;
         nl_put_u16(wire + off, local_rwnd); off += 2;
         memcpy(wire + off, lane_payload, lp_len);
         off += lp_len;
@@ -174,8 +180,10 @@ static void emit_wire_for_slot(nl_lane_t *lane, uint8_t channel_id, uint8_t deli
                                 nl_channel_retransmit_fn retransmit, void *ctx) {
     uint16_t ack = 0;
     uint32_t ack_bits = 0;
-    if (lane->recv_dedupe_init) {
+    bool ack_valid = false;
+    if (lane->recv_dedupe_init && lane->recv_dedupe.has_received_any) {
         nl_recv_dedupe_build_ack(&lane->recv_dedupe, &ack, &ack_bits);
+        ack_valid = true;
         lane->ack_dirty = false; /* this retransmit carries a fresh ack */
     }
 
@@ -186,6 +194,7 @@ static void emit_wire_for_slot(nl_lane_t *lane, uint8_t channel_id, uint8_t deli
     nl_put_u16(wire + off, slot->sequence); off += 2;
     nl_put_u16(wire + off, ack); off += 2;
     nl_put_u32(wire + off, ack_bits); off += 4;
+    wire[off++] = ack_valid ? 1 : 0;
     nl_put_u16(wire + off, local_rwnd); off += 2;
     memcpy(wire + off, slot->data, slot->len);
     off += slot->len;
@@ -211,7 +220,7 @@ static void fast_retransmit_bridge(void *ctx, uint16_t sequence) {
 }
 
 void nl_channel_apply_ack(nl_channel_t *chan, uint64_t now_ms, uint8_t channel_id,
-                          nl_delivery_t delivery, uint16_t ack, uint32_t ack_bits,
+                          nl_delivery_t delivery, bool ack_valid, uint16_t ack, uint32_t ack_bits,
                           uint16_t local_rwnd,
                           nl_channel_retransmit_fn retransmit, void *retransmit_ctx,
                           bool *out_has_rtt_sample, uint32_t *out_rtt_sample_ms,
@@ -220,6 +229,10 @@ void nl_channel_apply_ack(nl_channel_t *chan, uint64_t now_ms, uint8_t channel_i
     if (out_newly_acked) *out_newly_acked = 0;
     if ((int)delivery < 0 || (int)delivery >= NL_LANES_PER_CHANNEL) return;
     if (!is_reliable(delivery)) return;
+    /* No ack in this packet: there is nothing to apply. Acting on the
+     * all-zero (ack, ack_bits) the sender left in the fields would ack a
+     * sequence it never received. */
+    if (!ack_valid) return;
 
     nl_lane_t *lane = &chan->lanes[delivery];
     if (!lane->send_ring_init) {
@@ -263,6 +276,9 @@ void nl_channel_on_receive(nl_channel_t *chan, uint64_t now_ms,
     uint16_t seq = nl_get_u16(wire_payload + off); off += 2;
     uint16_t ack = nl_get_u16(wire_payload + off); off += 2;
     uint32_t ack_bits = nl_get_u32(wire_payload + off); off += 4;
+    uint8_t ack_valid = wire_payload[off];
+    if (ack_valid > 1) return; /* malformed */
+    off += 1;
     uint16_t peer_rwnd = nl_get_u16(wire_payload + off); off += 2;
     if (out_rwnd) *out_rwnd = peer_rwnd;
     uint8_t is_fragment = wire_payload[off++];
@@ -274,8 +290,8 @@ void nl_channel_on_receive(nl_channel_t *chan, uint64_t now_ms,
     bool reliable = is_reliable(delivery);
 
     if (reliable) {
-        nl_channel_apply_ack(chan, now_ms, channel_id, delivery, ack, ack_bits, local_rwnd,
-                             retransmit, retransmit_ctx,
+        nl_channel_apply_ack(chan, now_ms, channel_id, delivery, ack_valid != 0, ack, ack_bits,
+                             local_rwnd, retransmit, retransmit_ctx,
                              out_has_rtt_sample, out_rtt_sample_ms, out_newly_acked);
     }
 

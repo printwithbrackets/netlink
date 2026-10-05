@@ -690,7 +690,9 @@ nl_result_t nl_connection_on_packet(nl_connection_t *conn, uint8_t type,
             }
             uint16_t ack = nl_get_u16(plaintext + 2);
             uint32_t ack_bits = nl_get_u32(plaintext + 4);
-            uint16_t peer_rwnd = nl_get_u16(plaintext + 8);
+            uint8_t ack_valid = plaintext[8];
+            if (ack_valid > 1) { result = NL_ERR_PROTOCOL_MISMATCH; break; }
+            uint16_t peer_rwnd = nl_get_u16(plaintext + 9);
             if (peer_rwnd > conn->peer_rwnd_capacity) conn->peer_rwnd_capacity = peer_rwnd;
             conn->peer_rwnd = peer_rwnd;
             conn->peer_window_in_flight = 0;
@@ -701,7 +703,7 @@ nl_result_t nl_connection_on_packet(nl_connection_t *conn, uint8_t type,
             uint32_t newly_acked = 0;
             uint16_t adv = nl_connection_adv_window(conn);
             nl_channel_apply_ack(&conn->channels[channel_id], now_ms, channel_id,
-                                 (nl_delivery_t)delivery_raw, ack, ack_bits, adv,
+                                 (nl_delivery_t)delivery_raw, ack_valid != 0, ack, ack_bits, adv,
                                  on_channel_retransmit, &rctx,
                                  &has_rtt_sample, &rtt_sample_ms, &newly_acked);
             total_newly_acked += newly_acked;
@@ -767,7 +769,8 @@ static void flush_acks_locked(nl_connection_t *conn, const nl_conn_callbacks_t *
             payload[1] = (uint8_t)d;
             nl_put_u16(payload + 2, ack);
             nl_put_u32(payload + 4, ack_bits);
-            nl_put_u16(payload + 8, adv);
+            payload[8] = 1; /* ack_valid: this packet carries a real ack */
+            nl_put_u16(payload + 9, adv);
             encrypt_and_emit(conn, NL_PKT_ACK, payload, NL_ACK_PAYLOAD_SIZE, /*is_retransmit*/ false, cb);
             lane->ack_dirty = false;
         }

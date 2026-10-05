@@ -198,7 +198,7 @@ static void run_reliability_stress_test(const char *name, uint32_t seed, int mes
                 uint32_t ack_bits;
                 nl_recv_dedupe_build_ack(&rlane->recv_dedupe, &ack, &ack_bits);
                 nl_channel_apply_ack(&sender, now_tick, 0, NL_RELIABLE_ORDERED,
-                                     ack, ack_bits, NL_RECV_WINDOW_DEFAULT,
+                                     /*ack_valid*/ true, ack, ack_bits, NL_RECV_WINDOW_DEFAULT,
                                      emit_to_network, &ectx, NULL, NULL, NULL);
             }
             rlane->ack_dirty = false;

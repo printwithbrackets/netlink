@@ -54,7 +54,7 @@ extern "C" {
  * v3: new encrypted NL_PKT_ACK packet (reliable receivers send standalone
  * acks when no reverse DATA exists to piggyback them on); discovery probe
  * nonces are random rather than a counter. */
-#define NL_PROTOCOL_VERSION 3
+#define NL_PROTOCOL_VERSION 4
 
 /* ----------------------------------------------------------------------- */
 /* Capabilities (exchanged during the handshake; negotiated = AND of both)  */

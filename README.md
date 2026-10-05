@@ -424,6 +424,30 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Changelog
 
+### Unreleased
+
+**Fixed**
+
+- **"No ack yet" was indistinguishable from "I have sequence 0."** A
+  reliable lane that had received nothing still stamped `ack=0,
+  ack_bits=0` into its outgoing DATA header -- a valid on-the-wire
+  encoding of "I have sequence 0." The receiver applies acks
+  unconditionally for reliable lanes, so a peer whose sequence 0 was
+  lost had it silently marked acked by that packet: it never
+  retransmitted, its reorder ring waited forever, and the same event
+  produced a bogus RTT sample and bogus congestion-window growth. DATA
+  headers and standalone ACK payloads now carry a 1-bit `ack_valid`
+  flag (0 = "this packet carries no ack"), set only once the lane's
+  receive dedupe has actually seen something; a clear `ack_valid` makes
+  the receiver skip ack application entirely. Regression test:
+  `test_no_ack_from_empty_lane_does_not_ack_peer_seq_zero`.
+
+**Changed**
+
+- Wire format: DATA header `NL_DATA_HEADER_SIZE` 13 → 14 (new `u8
+  ack_valid` between `ack_bits` and `rwnd`), ACK payload
+  `NL_ACK_PAYLOAD_SIZE` 10 → 11. **`NL_PROTOCOL_VERSION` bumped 3 → 4.**
+
 ### 1.1.1 (2026-09-25)
 
 **Fixed**

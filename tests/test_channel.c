@@ -583,6 +583,52 @@ TEST(test_fast_retransmit_does_not_trigger_below_threshold) {
     nl_channel_free(&receiver);
 }
 
+/* Regression: a reliable lane that has received NOTHING still used to stamp
+ * ack=0/ack_bits=0 into its DATA header -- a valid on-the-wire encoding of
+ * "I have sequence 0". The receiver applies acks unconditionally for
+ * reliable lanes, so a peer that sent seq 0 and had it lost would see its
+ * seq 0 silently marked acked by this bogus ack: it never retransmits and
+ * its reorder ring waits forever. The ack is now tagged with an
+ * ack_valid bit, and a "no ack yet" encoding must be distinguishable. */
+TEST(test_no_ack_from_empty_lane_does_not_ack_peer_seq_zero) {
+    nl_channel_t A, B;
+    nl_channel_init(&A);
+    nl_channel_init(&B);
+
+    /* B sends one RELIABLE_ORDERED packet (its sequence 0). Dropped. */
+    uint8_t p[4] = {1, 2, 3, 4};
+    capture_t b_cap = {0};
+    ASSERT_EQ(nl_channel_send(&B, 0, 0, NL_RELIABLE_ORDERED, p, sizeof(p),
+                              NL_RECV_WINDOW_DEFAULT, capture_emit, &b_cap), NL_OK);
+    ASSERT_EQ(b_cap.count, 1);
+    ASSERT_EQ(B.lanes[NL_RELIABLE_ORDERED].send_ring.unacked_count, 1);
+
+    /* A's lane has never received anything, so its outgoing reliable
+     * packet carries "no ack" -- which must arrive at B as such. */
+    capture_t a_cap = {0};
+    ASSERT_EQ(nl_channel_send(&A, 10, 0, NL_RELIABLE_ORDERED, p, sizeof(p),
+                              NL_RECV_WINDOW_DEFAULT, capture_emit, &a_cap), NL_OK);
+    ASSERT_EQ(a_cap.count, 1);
+    ASSERT_FALSE(A.lanes[NL_RELIABLE_ORDERED].recv_dedupe_init);
+
+    delivered_t del = {0};
+    bool has_sample = false;
+    uint32_t sample_ms = 0;
+    uint32_t newly = 99;
+    nl_channel_on_receive(&B, 20, a_cap.packets[0].data, a_cap.packets[0].len,
+                          NL_RECV_WINDOW_DEFAULT, capture_deliver, &del,
+                          NULL, NULL, &has_sample, &sample_ms, &newly, NULL);
+    ASSERT_EQ(del.count, 1); /* A's own message delivered fine */
+
+    /* B's lost sequence 0 must still be awaiting retransmission. */
+    ASSERT_EQ(B.lanes[NL_RELIABLE_ORDERED].send_ring.unacked_count, 1);
+    ASSERT_EQ(newly, 0);
+    ASSERT_FALSE(has_sample);
+
+    nl_channel_free(&A);
+    nl_channel_free(&B);
+}
+
 TEST(test_rwnd_carried_on_data_header) {
     nl_channel_t sender, receiver;
     nl_channel_init(&sender);
@@ -627,6 +673,7 @@ int main(void) {
     RUN_TEST(test_rtt_no_sample_for_unreliable_lane);
     RUN_TEST(test_fast_retransmit_triggers_on_reorder_threshold);
     RUN_TEST(test_fast_retransmit_does_not_trigger_below_threshold);
+    RUN_TEST(test_no_ack_from_empty_lane_does_not_ack_peer_seq_zero);
     RUN_TEST(test_rwnd_carried_on_data_header);
     TEST_SUMMARY();
 }
