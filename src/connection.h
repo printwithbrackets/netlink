@@ -68,8 +68,8 @@ typedef struct nl_deferred_msg {
  * become permanently unackable -- it then burns its whole retry budget and
  * tears the connection down even though the receiver has the packet.
  * These bounds must be raised only together with NL_ACK_WINDOW_BITS. */
-#define NL_SSTHRESH_INITIAL_PACKETS 32
-#define NL_CWND_MAX_PACKETS 32        /* bounded by the ack window (above); the
+#define NL_SSTHRESH_INITIAL_PACKETS 64
+#define NL_CWND_MAX_PACKETS 64        /* bounded by the ack window (above); the
                                        * send ring is far deeper */
 #define NL_DEFERRED_MAX_MSGS 128
 /* One max-size message must always be parkable (a 256 KiB send that only

@@ -446,6 +446,15 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   lost, later ones acked). Regression tests:
   `test_burst_loss_at_cwnd_above_ack_window_no_teardown` (end to end,
   no teardown) and `test_oldest_unacked_tracks_span_not_count`.
+- **Ack bitmap widened from 32 to 64 bits** (`NL_ACK_WINDOW_BITS`),
+  completing the fix above: a 32-bit bitmap against a 64-packet
+  congestion window leaves the oldest packet of a full-window burst
+  exactly at the edge of reach. The receiver already tracked 256
+  sequences (`NL_SEQ_RING_SIZE`) -- only the encoder refused to
+  express them. Regression tests:
+  `test_ack_bitmap_window_covers_cwnd_in_flight` and
+  `test_ack_bitmap_covers_burst_loss_at_full_cwnd` (both fail against a
+  32-bit bitmap).
 - **"No ack yet" was indistinguishable from "I have sequence 0."** A
   reliable lane that had received nothing still stamped `ack=0,
   ack_bits=0` into its outgoing DATA header -- a valid on-the-wire
@@ -462,9 +471,11 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 **Changed**
 
-- Wire format: DATA header `NL_DATA_HEADER_SIZE` 13 → 14 (new `u8
-  ack_valid` between `ack_bits` and `rwnd`), ACK payload
-  `NL_ACK_PAYLOAD_SIZE` 10 → 11. **`NL_PROTOCOL_VERSION` bumped 3 → 4.**
+- Wire format, two steps: DATA header `NL_DATA_HEADER_SIZE` 13 → 14
+  (new `u8 ack_valid` between `ack_bits` and `rwnd`) and ACK payload
+  `NL_ACK_PAYLOAD_SIZE` 10 → 11, then `ack_bits` widened from `u32` to
+  `u64` (`NL_DATA_HEADER_SIZE` 14 → 18, `NL_ACK_PAYLOAD_SIZE` 11 → 15).
+  **`NL_PROTOCOL_VERSION` bumped 3 → 5.**
 
 ### 1.1.1 (2026-09-25)
 

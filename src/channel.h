@@ -118,7 +118,8 @@ nl_result_t nl_channel_send_range(nl_channel_t *chan, uint64_t now_ms, uint8_t c
  * applying it unconditionally would mark a never-received sequence acked
  * and the sender would never retransmit it. */
 void nl_channel_apply_ack(nl_channel_t *chan, uint64_t now_ms, uint8_t channel_id,
-                          nl_delivery_t delivery, bool ack_valid, uint16_t ack, uint32_t ack_bits,
+                          nl_delivery_t delivery, bool ack_valid, uint16_t ack,
+                          nl_ack_bits_t ack_bits,
                           uint16_t local_rwnd,
                           nl_channel_retransmit_fn retransmit, void *retransmit_ctx,
                           bool *out_has_rtt_sample, uint32_t *out_rtt_sample_ms,

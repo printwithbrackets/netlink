@@ -54,7 +54,7 @@ static bool ack_one(nl_send_ring_t *ring, uint16_t seq) {
     return false;
 }
 
-void nl_send_ring_ack(nl_send_ring_t *ring, uint16_t ack, uint32_t ack_bits, uint64_t now_ms,
+void nl_send_ring_ack(nl_send_ring_t *ring, uint16_t ack, nl_ack_bits_t ack_bits, uint64_t now_ms,
                        bool *out_has_rtt_sample, uint32_t *out_rtt_sample_ms,
                        uint32_t *out_newly_acked) {
     *out_has_rtt_sample = false;
@@ -71,8 +71,8 @@ void nl_send_ring_ack(nl_send_ring_t *ring, uint16_t ack, uint32_t ack_bits, uin
     }
 
     if (ack_one(ring, ack)) newly++;
-    for (int i = 0; i < 32; i++) {
-        if (ack_bits & (1u << i)) {
+    for (int i = 0; i < NL_ACK_WINDOW_BITS; i++) {
+        if (ack_bits & ((nl_ack_bits_t)1 << i)) {
             uint16_t seq = (uint16_t)(ack - (i + 1));
             if (ack_one(ring, seq)) newly++;
         }
@@ -80,7 +80,7 @@ void nl_send_ring_ack(nl_send_ring_t *ring, uint16_t ack, uint32_t ack_bits, uin
     if (out_newly_acked) *out_newly_acked = newly;
 }
 
-void nl_send_ring_fast_retransmit(nl_send_ring_t *ring, uint16_t ack, uint32_t ack_bits,
+void nl_send_ring_fast_retransmit(nl_send_ring_t *ring, uint16_t ack, nl_ack_bits_t ack_bits,
                                    uint32_t reorder_threshold, uint64_t now_ms,
                                    nl_fast_retransmit_fn emit, void *ctx) {
     for (int i = 0; i < NL_SEQ_RING_SIZE; i++) {
@@ -92,7 +92,7 @@ void nl_send_ring_fast_retransmit(nl_send_ring_t *ring, uint16_t ack, uint32_t a
         if (nl_seq_greater_than(slot->sequence, ack)) continue; /* newer than the ack horizon, not yet due */
 
         uint16_t age = (uint16_t)(ack - slot->sequence);
-        if (age == 0 || age > 32) continue; /* == 0 shouldn't occur unacked; > 32 is outside this ack_bits' window */
+        if (age == 0 || age > NL_ACK_WINDOW_BITS) continue; /* == 0 shouldn't occur unacked; beyond the bitmap's reach */
 
         /* Is this slot itself acked per the CURRENT snapshot? Re-derive
          * directly from (ack, ack_bits) rather than only trusting
@@ -100,11 +100,11 @@ void nl_send_ring_fast_retransmit(nl_send_ring_t *ring, uint16_t ack, uint32_t a
          * caller invokes it without first calling nl_send_ring_ack with
          * these same values (real usage always does both together, but
          * this way correctness doesn't silently depend on that ordering). */
-        if (ack_bits & (1u << (age - 1))) continue;
+        if (ack_bits & ((nl_ack_bits_t)1 << (age - 1))) continue;
 
         uint32_t newer_acked = 1; /* `ack` itself is always acked by definition */
         for (uint16_t b = 0; b < (uint16_t)(age - 1); b++) {
-            if (ack_bits & (1u << b)) newer_acked++;
+            if (ack_bits & ((nl_ack_bits_t)1 << b)) newer_acked++;
         }
 
         if (newer_acked >= reorder_threshold) {
@@ -187,15 +187,15 @@ bool nl_recv_dedupe_insert(nl_recv_dedupe_t *d, uint16_t sequence) {
     return true;
 }
 
-void nl_recv_dedupe_build_ack(const nl_recv_dedupe_t *d, uint16_t *out_ack, uint32_t *out_ack_bits) {
+void nl_recv_dedupe_build_ack(const nl_recv_dedupe_t *d, uint16_t *out_ack, nl_ack_bits_t *out_ack_bits) {
     *out_ack = d->most_recent;
-    uint32_t bits = 0;
+    nl_ack_bits_t bits = 0;
     if (d->has_received_any) {
-        for (int i = 0; i < 32; i++) {
+        for (int i = 0; i < NL_ACK_WINDOW_BITS; i++) {
             uint16_t s = (uint16_t)(d->most_recent - (i + 1));
             nl_recv_slot_t *slot = &d->slots[s & NL_SEQ_RING_MASK];
             if (slot->valid && slot->sequence == s) {
-                bits |= (1u << i);
+                bits |= ((nl_ack_bits_t)1 << i);
             }
         }
     }

@@ -8,8 +8,8 @@
  *   nl_send_ring_t    - unacked outgoing packets, kept around for
  *                        retransmission until acked or given up on.
  *   nl_recv_dedupe_t  - lightweight "have I seen sequence N" tracker,
- *                        also produces the 32-bit ack bitfield we piggyback
- *                        on outgoing packets.
+ *                        also produces the NL_ACK_WINDOW_BITS-bit ack
+ *                        bitfield we piggyback on outgoing packets.
  *   nl_reorder_ring_t - buffers reliable packets that arrived ahead of the
  *                        next expected in-order sequence, for channels
  *                        using NL_RELIABLE_ORDERED.
@@ -36,8 +36,12 @@
  * falls further back than this can never be named by any future ack, so it
  * would burn its entire retry budget and then tear the connection down
  * even though the receiver has it. connection.h's congestion-window bounds
- * must therefore never exceed this. */
-#define NL_ACK_WINDOW_BITS 32
+ * must therefore never exceed this.
+ *
+ * 64 rather than 32 so a comfortable window is nameable without making the
+ * in-flight ceiling the binding constraint on throughput; the send ring is
+ * 256 deep, so the receiver's tracking comfortably covers it. */
+#define NL_ACK_WINDOW_BITS 64
 
 static inline bool nl_seq_greater_than(uint16_t s1, uint16_t s2) {
     /* Standard signed-wraparound sequence comparison (Fiedler-style). */
@@ -67,14 +71,19 @@ typedef struct {
 
 int  nl_send_ring_init(nl_send_ring_t *ring);
 void nl_send_ring_free(nl_send_ring_t *ring);
+/* Bits in the ack bitmap (NL_ACK_WINDOW_BITS), so callers don't repeat the
+ * width as a literal at each call site. */
+typedef uint64_t nl_ack_bits_t;
+
 /* Insert data at `next_sequence`, return the sequence used, and advance.
  * Returns false if len exceeds the max slot size, or if the target slot
  * still holds a live unacked packet (never overwrite un-retransmittable
  * state -- see seqbuf.c). */
 bool nl_send_ring_insert(nl_send_ring_t *ring, const uint8_t *data, uint16_t len,
                           uint64_t now_ms, uint16_t *out_seq);
-/* Mark `sequence` (and, per the ack-bitfield convention, the 32 preceding
- * sequences whose corresponding bit is set in ack_bits) as acked.
+/* Mark `sequence` (and, per the ack-bitfield convention, the
+ * NL_ACK_WINDOW_BITS preceding sequences whose corresponding bit is set in
+ * ack_bits) as acked.
  *
  * If the exact `ack` sequence was newly acked by this call (not already
  * acked, i.e. this isn't a duplicate/stale ack) AND it was never
@@ -92,7 +101,7 @@ bool nl_send_ring_insert(nl_send_ring_t *ring, const uint8_t *data, uint16_t len
  * *out_newly_acked (optional) receives how many slots transitioned from
  * unacked to acked by this call -- the congestion controller's growth
  * signal. */
-void nl_send_ring_ack(nl_send_ring_t *ring, uint16_t ack, uint32_t ack_bits, uint64_t now_ms,
+void nl_send_ring_ack(nl_send_ring_t *ring, uint16_t ack, nl_ack_bits_t ack_bits, uint64_t now_ms,
                        bool *out_has_rtt_sample, uint32_t *out_rtt_sample_ms,
                        uint32_t *out_newly_acked);
 
@@ -113,7 +122,7 @@ void nl_send_ring_ack(nl_send_ring_t *ring, uint16_t ack, uint32_t ack_bits, uin
  * together with one incoming packet's ack/ack_bits, but correctness here
  * doesn't depend on that ordering). */
 typedef void (*nl_fast_retransmit_fn)(void *ctx, uint16_t sequence);
-void nl_send_ring_fast_retransmit(nl_send_ring_t *ring, uint16_t ack, uint32_t ack_bits,
+void nl_send_ring_fast_retransmit(nl_send_ring_t *ring, uint16_t ack, nl_ack_bits_t ack_bits,
                                    uint32_t reorder_threshold, uint64_t now_ms,
                                    nl_fast_retransmit_fn emit, void *ctx);
 /* Look up an entry by exact sequence, for a caller that wants to inspect it
@@ -147,7 +156,7 @@ void nl_recv_dedupe_free(nl_recv_dedupe_t *d);
 bool nl_recv_dedupe_insert(nl_recv_dedupe_t *d, uint16_t sequence);
 /* Produce the (ack, ack_bits) pair to piggyback on an outgoing packet,
  * describing everything received up through `most_recent`. */
-void nl_recv_dedupe_build_ack(const nl_recv_dedupe_t *d, uint16_t *out_ack, uint32_t *out_ack_bits);
+void nl_recv_dedupe_build_ack(const nl_recv_dedupe_t *d, uint16_t *out_ack, nl_ack_bits_t *out_ack_bits);
 
 /* ---- reorder ring: buffers early-arriving reliable-ordered packets ---- */
 

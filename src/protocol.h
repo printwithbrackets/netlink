@@ -114,7 +114,7 @@ typedef enum {
  *   u8  delivery              (nl_delivery_t)
  *   u16 sequence
  *   u16 ack
- *   u32 ack_bits
+ *   u64 ack_bits
  *   u8  ack_valid             (0/1: 0 means "this packet carries no ack" --
  *                               ack/ack_bits are then meaningless. Without
  *                               it a lane that has received nothing would
@@ -133,7 +133,7 @@ typedef enum {
  *     u16 fragment_count
  *   -- payload bytes follow to end of plaintext --
  */
-#define NL_DATA_HEADER_SIZE (1 + 1 + 2 + 2 + 4 + 1 + 2 + 1)
+#define NL_DATA_HEADER_SIZE (1 + 1 + 2 + 2 + 8 + 1 + 2 + 1)
 #define NL_FRAGMENT_HEADER_SIZE (2 + 2 + 2)
 
 /* ---- ACK payload (AEAD plaintext of NL_PKT_ACK) ----
@@ -146,11 +146,11 @@ typedef enum {
  *   u8  channel
  *   u8  delivery              (must be a reliable nl_delivery_t)
  *   u16 ack
- *   u32 ack_bits
+ *   u64 ack_bits
  *   u8  ack_valid             (0/1: same meaning as in the DATA header)
  *   u16 rwnd                  (our advertised receive window)
  */
-#define NL_ACK_PAYLOAD_SIZE (1 + 1 + 2 + 4 + 1 + 2)
+#define NL_ACK_PAYLOAD_SIZE (1 + 1 + 2 + 8 + 1 + 2)
 
 /* Default receive window (bytes) advertised when nothing better is known.
  * Lives here so channel-level tests can stamp it without pulling in

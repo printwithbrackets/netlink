@@ -125,7 +125,7 @@ TEST(test_send_ring_ack_bitfield_marks_older) {
     uint16_t seqs[5];
     for (int i = 0; i < 5; i++) nl_send_ring_insert(&ring, payload, 1, 0, &seqs[i]);
     /* seqs = 0,1,2,3,4. Ack seq=4 with bit0 set (=seq 3) and bit2 set (=seq 1). */
-    uint32_t ack_bits = (1u << 0) | (1u << 2);
+    nl_ack_bits_t ack_bits = (1u << 0) | (1u << 2);
     bool has_sample; uint32_t sample_ms;
     nl_send_ring_ack(&ring, 4, ack_bits, 0, &has_sample, &sample_ms, NULL);
     ASSERT_TRUE(nl_send_ring_get(&ring, 4)->acked);
@@ -216,7 +216,7 @@ TEST(test_fast_retransmit_triggers_past_threshold) {
      * nl_send_ring_ack() before nl_send_ring_fast_retransmit() with the
      * same ack/ack_bits), apply the ack first so already-acked slots are
      * correctly excluded from the scan. */
-    uint32_t ack_bits = (1u << 0) | (1u << 1) | (1u << 2);
+    nl_ack_bits_t ack_bits = (1u << 0) | (1u << 1) | (1u << 2);
     bool has_sample; uint32_t sample_ms;
     nl_send_ring_ack(&ring, 4, ack_bits, 0, &has_sample, &sample_ms, NULL);
 
@@ -243,7 +243,7 @@ TEST(test_fast_retransmit_correct_without_prior_ack_call) {
     uint16_t seqs[5];
     for (int i = 0; i < 5; i++) nl_send_ring_insert(&ring, payload, 1, 0, &seqs[i]);
 
-    uint32_t ack_bits = (1u << 0) | (1u << 1) | (1u << 2); /* seqs 1,2,3 acked; seq 0's own bit not covered */
+    nl_ack_bits_t ack_bits = (1u << 0) | (1u << 1) | (1u << 2); /* seqs 1,2,3 acked; seq 0's own bit not covered */
 
     fast_retransmit_capture_reset();
     nl_send_ring_fast_retransmit(&ring, 4, ack_bits, 3, 100, fast_retransmit_capture, NULL);
@@ -307,6 +307,92 @@ TEST(test_oldest_unacked_tracks_span_not_count) {
     nl_send_ring_free(&ring);
 }
 
+/* Regression: an ack can only name the sequences its bitmap reaches back
+ * to, so the bitmap has to be at least as wide as the largest flight the
+ * congestion window allows. With a 32-bit bitmap and a 64-packet window,
+ * the oldest of a burst of lost packets fell out of every future ack's
+ * reach and could never be retired. */
+TEST(test_ack_bitmap_window_covers_cwnd_in_flight) {
+    const int flight = 64; /* == NL_CWND_MAX_PACKETS */
+    const int lost = 8;
+    ASSERT_TRUE(flight <= NL_ACK_WINDOW_BITS);
+
+    nl_send_ring_t ring;
+    nl_send_ring_init(&ring);
+    nl_recv_dedupe_t d;
+    nl_recv_dedupe_init(&d);
+
+    uint8_t payload[] = {0xAA};
+    for (int i = 0; i < flight; i++) {
+        uint16_t seq;
+        ASSERT_TRUE(nl_send_ring_insert(&ring, payload, 1, 0, &seq));
+        ASSERT_EQ(seq, (uint16_t)i);
+    }
+
+    /* Receiver gets the tail of the flight; the first `lost` are dropped. */
+    for (int i = lost; i < flight; i++) ASSERT_TRUE(nl_recv_dedupe_insert(&d, (uint16_t)i));
+    uint16_t ack; nl_ack_bits_t bits;
+    nl_recv_dedupe_build_ack(&d, &ack, &bits);
+    ASSERT_EQ(ack, flight - 1);
+    bool has_sample; uint32_t sample_ms; uint32_t newly;
+    nl_send_ring_ack(&ring, ack, bits, 50, &has_sample, &sample_ms, &newly);
+    ASSERT_EQ(ring.unacked_count, lost);
+
+    /* The sender's retransmits of those arrive, so the receiver now holds
+     * every sequence. The next ack must retire all `lost` of them: the
+     * oldest sits at age flight-1, the deepest the bitmap can reach. */
+    for (int i = 0; i < lost; i++) ASSERT_TRUE(nl_recv_dedupe_insert(&d, (uint16_t)i));
+    nl_recv_dedupe_build_ack(&d, &ack, &bits);
+    ASSERT_EQ(ack, flight - 1);
+    nl_send_ring_ack(&ring, ack, bits, 100, &has_sample, &sample_ms, &newly);
+    ASSERT_EQ(newly, lost);
+    ASSERT_EQ(ring.unacked_count, 0);
+
+    nl_recv_dedupe_free(&d);
+    nl_send_ring_free(&ring);
+}
+
+/* Regression: the same burst seen through fast retransmit. The hole must
+ * be flagged (its age is within the ack window) and must then be retirable,
+ * otherwise a full-window burst loss is unrecoverable and tears the
+ * connection down. */
+TEST(test_ack_bitmap_covers_burst_loss_at_full_cwnd) {
+    const int flight = 64;
+    const int lost = 8;
+
+    nl_send_ring_t ring;
+    nl_send_ring_init(&ring);
+    nl_recv_dedupe_t d;
+    nl_recv_dedupe_init(&d);
+
+    uint8_t payload[] = {0xBB};
+    for (int i = 0; i < flight; i++) {
+        uint16_t seq;
+        ASSERT_TRUE(nl_send_ring_insert(&ring, payload, 1, 0, &seq));
+    }
+
+    for (int i = lost; i < flight; i++) ASSERT_TRUE(nl_recv_dedupe_insert(&d, (uint16_t)i));
+    uint16_t ack; nl_ack_bits_t bits;
+    bool has_sample; uint32_t sample_ms; uint32_t newly;
+
+    fast_retransmit_capture_reset();
+    nl_recv_dedupe_build_ack(&d, &ack, &bits);
+    nl_send_ring_ack(&ring, ack, bits, 50, &has_sample, &sample_ms, &newly);
+    nl_send_ring_fast_retransmit(&ring, ack, bits, /*reorder_threshold*/ 3, 50,
+                                  fast_retransmit_capture, NULL);
+    /* Every hole, including the oldest one, is fast-retransmit-eligible. */
+    ASSERT_EQ(fast_retransmit_capture_count(), lost);
+    for (int i = 0; i < lost; i++) ASSERT_EQ(fast_retransmit_capture_get(i), (uint16_t)i);
+
+    for (int i = 0; i < lost; i++) ASSERT_TRUE(nl_recv_dedupe_insert(&d, (uint16_t)i));
+    nl_recv_dedupe_build_ack(&d, &ack, &bits);
+    nl_send_ring_ack(&ring, ack, bits, 100, &has_sample, &sample_ms, &newly);
+    ASSERT_EQ(ring.unacked_count, 0);
+
+    nl_recv_dedupe_free(&d);
+    nl_send_ring_free(&ring);
+}
+
 TEST(test_recv_dedupe_rejects_duplicates) {
     nl_recv_dedupe_t d;
     nl_recv_dedupe_init(&d);
@@ -345,7 +431,7 @@ TEST(test_recv_dedupe_build_ack_bitfield) {
     nl_recv_dedupe_insert(&d, 3);
     nl_recv_dedupe_insert(&d, 4);
 
-    uint16_t ack; uint32_t bits;
+    uint16_t ack; nl_ack_bits_t bits;
     nl_recv_dedupe_build_ack(&d, &ack, &bits);
     ASSERT_EQ(ack, 4);
     /* bit0 = seq 3 (received) -> 1
@@ -475,6 +561,8 @@ int main(void) {
     RUN_TEST(test_fast_retransmit_correct_without_prior_ack_call);
     RUN_TEST(test_fast_retransmit_skips_already_acked);
     RUN_TEST(test_oldest_unacked_tracks_span_not_count);
+    RUN_TEST(test_ack_bitmap_window_covers_cwnd_in_flight);
+    RUN_TEST(test_ack_bitmap_covers_burst_loss_at_full_cwnd);
     RUN_TEST(test_recv_dedupe_rejects_duplicates);
     RUN_TEST(test_recv_dedupe_out_of_order_accepted_once);
     RUN_TEST(test_recv_dedupe_too_old_rejected);
