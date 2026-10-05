@@ -1,5 +1,6 @@
 #include "test_framework.h"
 #include "../src/channel.h"
+#include "../src/byteorder.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -583,6 +584,71 @@ TEST(test_fast_retransmit_does_not_trigger_below_threshold) {
     nl_channel_free(&receiver);
 }
 
+/* Regression: nl_reorder_ring_insert's return value was discarded, and the
+ * dedupe insert that precedes it recorded the sequence regardless. A packet
+ * so far ahead of next_expected that the reorder ring drops it was therefore
+ * acked: the sender stopped retransmitting it, while next_expected sat
+ * behind the gap forever, withholding every later message with it. */
+TEST(test_packet_beyond_reorder_window_is_dropped_not_acked) {
+    nl_channel_t sender, receiver;
+    nl_channel_init(&sender);
+    nl_channel_init(&receiver);
+    capture_t cap = {0};
+
+    /* Sequence 0, so the wire layout is the real one; then rewrite the
+     * sequence field to something far beyond any receiver's reorder window
+     * (NL_SEQ_RING_SIZE). Going through the real encoder keeps the header
+     * layout honest -- the send ring itself can only hold 256 packets, so a
+     * genuinely far-ahead sequence can't be produced by sending. */
+    uint8_t payload[4] = { 'x', 0, 0, 0 };
+    ASSERT_EQ(nl_channel_send(&sender, 0, 0, NL_RELIABLE_ORDERED, payload, sizeof(payload),
+                              NL_RECV_WINDOW_DEFAULT, capture_emit, &cap), NL_OK);
+    ASSERT_EQ(cap.count, 1);
+    const uint16_t far_seq = NL_SEQ_RING_SIZE + 40;
+    nl_put_u16(cap.packets[0].data + 2, far_seq);
+
+    delivered_t del = {0};
+    nl_channel_on_receive(&receiver, 0, cap.packets[0].data, cap.packets[0].len,
+                          NL_RECV_WINDOW_DEFAULT, capture_deliver, &del,
+                          NULL, NULL, NULL, NULL, NULL, NULL);
+    ASSERT_EQ(del.count, 0);
+
+    nl_lane_t *lane = &receiver.lanes[NL_RELIABLE_ORDERED];
+    /* It must not be recorded as received: an ack covering it would stop the
+     * sender retransmitting a packet this lane will never deliver, and
+     * next_expected would sit behind the gap forever, withholding every
+     * later message. A fresh insert succeeding proves the dedupe never saw
+     * it. */
+    ASSERT_TRUE(nl_recv_dedupe_insert(&lane->recv_dedupe, far_seq));
+    ASSERT_EQ(lane->reorder_ring.next_expected, 0);
+
+    /* The lane is still usable: a real in-order stream from 0 delivers
+     * normally. */
+    nl_channel_t s2, r2;
+    nl_channel_init(&s2);
+    nl_channel_init(&r2);
+    capture_t cap2 = {0};
+    const int n = 8; /* delivered_t holds 8 payloads */
+    for (int i = 0; i < n; i++) {
+        uint8_t b = (uint8_t)i;
+        ASSERT_EQ(nl_channel_send(&s2, 0, 0, NL_RELIABLE_ORDERED, &b, 1,
+                                  NL_RECV_WINDOW_DEFAULT, capture_emit, &cap2), NL_OK);
+    }
+    delivered_t del2 = {0};
+    for (int i = 0; i < n; i++) {
+        nl_channel_on_receive(&r2, 10, cap2.packets[i].data, cap2.packets[i].len,
+                              NL_RECV_WINDOW_DEFAULT, capture_deliver, &del2,
+                              NULL, NULL, NULL, NULL, NULL, NULL);
+    }
+    ASSERT_EQ(del2.count, n);
+    for (int i = 0; i < n; i++) ASSERT_EQ(del2.data[i][0], (uint8_t)i);
+
+    nl_channel_free(&s2);
+    nl_channel_free(&r2);
+    nl_channel_free(&sender);
+    nl_channel_free(&receiver);
+}
+
 /* Regression: a reliable lane that has received NOTHING still used to stamp
  * ack=0/ack_bits=0 into its DATA header -- a valid on-the-wire encoding of
  * "I have sequence 0". The receiver applies acks unconditionally for
@@ -674,6 +740,7 @@ int main(void) {
     RUN_TEST(test_fast_retransmit_triggers_on_reorder_threshold);
     RUN_TEST(test_fast_retransmit_does_not_trigger_below_threshold);
     RUN_TEST(test_no_ack_from_empty_lane_does_not_ack_peer_seq_zero);
+    RUN_TEST(test_packet_beyond_reorder_window_is_dropped_not_acked);
     RUN_TEST(test_rwnd_carried_on_data_header);
     TEST_SUMMARY();
 }

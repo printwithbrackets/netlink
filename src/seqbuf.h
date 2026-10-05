@@ -184,8 +184,18 @@ typedef struct {
 
 int  nl_reorder_ring_init(nl_reorder_ring_t *ring);
 void nl_reorder_ring_free(nl_reorder_ring_t *ring);
+/* True when `sequence` is close enough behind/ahead of next_expected that
+ * nl_reorder_ring_insert can actually buffer it. Far ahead is the only
+ * unrecoverable case: a stale or already-buffered sequence will resolve
+ * itself (it was delivered, or is already waiting its turn), but one beyond
+ * the window is dropped outright and must never be acked -- acking it tells
+ * the sender to stop retransmitting a packet that will never be delivered,
+ * and for RELIABLE_ORDERED it wedges next_expected behind the gap forever.
+ * Exposed so callers can make that decision without duplicating the rule. */
+bool nl_reorder_ring_reachable(const nl_reorder_ring_t *ring, uint16_t sequence);
 /* Buffer an out-of-order packet. Returns false if it's a duplicate of
- * something already buffered or already delivered (stale). */
+ * something already buffered or already delivered (stale), or if it's too
+ * far ahead to fit the window (see nl_reorder_ring_reachable). */
 bool nl_reorder_ring_insert(nl_reorder_ring_t *ring, uint16_t sequence, const uint8_t *data, uint16_t len);
 /* Pop the next in-order packet if it's available (either just inserted or
  * previously buffered). Call repeatedly until it returns false -- multiple

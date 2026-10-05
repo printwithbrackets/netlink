@@ -236,6 +236,12 @@ void nl_reorder_ring_free(nl_reorder_ring_t *ring) {
     ring->slots = NULL;
 }
 
+bool nl_reorder_ring_reachable(const nl_reorder_ring_t *ring, uint16_t sequence) {
+    if (nl_seq_greater_than(ring->next_expected, sequence)) return true; /* stale */
+    uint16_t gap = (uint16_t)(sequence - ring->next_expected);
+    return gap < NL_SEQ_RING_SIZE;
+}
+
 bool nl_reorder_ring_insert(nl_reorder_ring_t *ring, uint16_t sequence, const uint8_t *data, uint16_t len) {
     if (len > NL_MAX_PACKET_SIZE_INTERNAL) return false;
     /* Already delivered (older than what we're waiting for)? */

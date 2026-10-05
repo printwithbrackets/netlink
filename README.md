@@ -446,6 +446,17 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   lost, later ones acked). Regression tests:
   `test_burst_loss_at_cwnd_above_ack_window_no_teardown` (end to end,
   no teardown) and `test_oldest_unacked_tracks_span_not_count`.
+- **A dropped reorder-ring insert was still acked.**
+  `nl_reorder_ring_insert`'s return value was discarded, and the dedupe
+  insert preceding it had already recorded the sequence — so a
+  `RELIABLE_ORDERED` packet too far ahead of `next_expected` to buffer was
+  marked as received and acked. The sender stopped retransmitting it,
+  `next_expected` sat behind the gap forever, and every later message on
+  that lane was withheld with it. `nl_channel_on_receive` now checks
+  `nl_reorder_ring_reachable()` (new; extracted from the ring's own rule)
+  *before* touching the dedupe, so an unreachable packet leaves no
+  bookkeeping and no ack. Regression test:
+  `test_packet_beyond_reorder_window_is_dropped_not_acked`.
 - **Receive-window charging was clamped while the release was not.** The
   charge on delivery did `used += min(len, room)`, so for a burst larger
   than the window less was charged than queued; the release on

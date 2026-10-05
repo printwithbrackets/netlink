@@ -361,6 +361,19 @@ void nl_channel_on_receive(nl_channel_t *chan, uint64_t now_ms,
         if (nl_recv_dedupe_init(&lane->recv_dedupe) != 0) return;
         lane->recv_dedupe_init = true;
     }
+    if (delivery == NL_RELIABLE_ORDERED) {
+        /* Reachability gate before any bookkeeping: a packet beyond the
+         * reorder ring's window is dropped for good, and acking it would
+         * tell the sender to stop retransmitting something this lane will
+         * never deliver -- while next_expected sits behind the gap and
+         * withholds every later message with it. Reorder rings are cheap to
+         * allocate, so do it here rather than deferring the check. */
+        if (!lane->reorder_ring_init) {
+            if (nl_reorder_ring_init(&lane->reorder_ring) != 0) return;
+            lane->reorder_ring_init = true;
+        }
+        if (!nl_reorder_ring_reachable(&lane->reorder_ring, seq)) return;
+    }
     /* Even a duplicate needs an ack: the sender hasn't heard this
      * sequence was received (that's why it retransmitted). Mark dirty
      * before the dup check so the flush isn't skipped. */
@@ -374,16 +387,18 @@ void nl_channel_on_receive(nl_channel_t *chan, uint64_t now_ms,
         return;
     }
 
-    /* NL_RELIABLE_ORDERED: buffer in the reorder ring, keyed by `seq`,
-     * storing everything from the is_fragment marker onward so it can be
-     * re-parsed once released in order. */
-    if (!lane->reorder_ring_init) {
-        if (nl_reorder_ring_init(&lane->reorder_ring) != 0) return;
-        lane->reorder_ring_init = true;
-    }
+    /* NL_RELIABLE_ORDERED: buffer in the reorder ring (already initialized
+     * and reachability-checked above), keyed by `seq`, storing everything
+     * from the is_fragment marker onward so it can be re-parsed once
+     * released in order. */
     const uint8_t *reorder_payload = wire_payload + (NL_DATA_HEADER_SIZE - 1); /* is_fragment onward */
     uint16_t reorder_len = (uint16_t)(wire_len - (NL_DATA_HEADER_SIZE - 1));
-    nl_reorder_ring_insert(&lane->reorder_ring, seq, reorder_payload, reorder_len);
+    if (!nl_reorder_ring_insert(&lane->reorder_ring, seq, reorder_payload, reorder_len)) {
+        /* Stale or already buffered -- the reachability gate above passed,
+         * so this is one of the benign cases and the ack already recorded
+         * is correct. */
+        return;
+    }
 
     uint8_t pop_buf[NL_MAX_PACKET_SIZE];
     uint16_t pop_len;
