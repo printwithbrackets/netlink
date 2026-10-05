@@ -99,6 +99,20 @@ typedef enum {
  */
 #define NL_CONNECT_DENIED_SIZE (1 + 1)
 
+/* Largest of every cleartext handshake packet. Any buffer that holds one of
+ * them for retransmission (pending_t.retry_packet, the retry_pending_handshakes
+ * copy-out array, the per-role scratch buffers) must be sized with this rather
+ * than with one particular packet's size: CONNECT_CHALLENGE is the biggest and
+ * is stored server-side, while a REQUEST/RESPONSE-sized buffer silently
+ * overflows on the CHALLENGE retransmit path. The _Static_asserts below make
+ * that failure a compile error instead. */
+#define NL_CONNECT_MAX_PACKET_SIZE (NL_CONNECT_REQUEST_SIZE > NL_CONNECT_CHALLENGE_SIZE \
+                                     ? NL_CONNECT_REQUEST_SIZE : NL_CONNECT_CHALLENGE_SIZE)
+_Static_assert(NL_CONNECT_MAX_PACKET_SIZE >= NL_CONNECT_REQUEST_SIZE, "");
+_Static_assert(NL_CONNECT_MAX_PACKET_SIZE >= NL_CONNECT_CHALLENGE_SIZE, "");
+_Static_assert(NL_CONNECT_MAX_PACKET_SIZE >= NL_CONNECT_RESPONSE_SIZE, "");
+_Static_assert(NL_CONNECT_MAX_PACKET_SIZE >= NL_CONNECT_DENIED_SIZE, "");
+
 typedef enum {
     NL_DENY_SERVER_FULL         = 1,
     NL_DENY_PROTOCOL_MISMATCH   = 2,

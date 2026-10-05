@@ -688,6 +688,85 @@ TEST(test_discovery_rate_limited) {
 
 /* Version consistency: nl_version_string() must match the NL_VERSION_*
  * macros so bindings and callers that parse either stay in sync. */
+/* Regression: the handshake retransmit path copied the retained packet
+ * into a buffer sized for CONNECT_RESPONSE (65) while a server entry
+ * retains a CONNECT_CHALLENGE (69) -- a 4-byte stack overflow from the I/O
+ * thread on every retransmitted server handshake. ASan/UBSan don't catch it
+ * (the clobbered bytes are the next struct member's padding/fields, which
+ * the following statements overwrite), so this test drives the retransmit
+ * for real and requires the retransmitted CHALLENGE to be byte-identical to
+ * the original at full length. */
+TEST(test_server_challenge_retransmit_roundtrips_at_full_length) {
+    nl_config_t cfg; nl_config_default(&cfg);
+    nl_endpoint_t *server = NULL;
+    nl_address_t bind_addr = addr("127.0.0.1", 34722);
+    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+
+    /* Speak the handshake by hand so we control whether the RESPONSE is ever
+     * sent -- which is what keeps the server's pending entry alive and armed
+     * for retry. */
+    int raw = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    ASSERT_TRUE(raw >= 0);
+    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+    setsockopt(raw, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(bind_addr.port);
+    server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    uint8_t req[NL_CONNECT_REQUEST_SIZE];
+    memset(req, 0, sizeof(req));
+    req[0] = NL_PKT_CONNECT_REQUEST;
+    nl_put_u32(req + 1, NL_MAGIC);
+    nl_put_u16(req + 5, NL_PROTOCOL_VERSION);
+    req[7] = 4; /* channel_count */
+    nl_put_u64(req + 8, 0x0123456789ABCDEFull);
+    for (int i = 0; i < 32; i++) req[16 + i] = (uint8_t)(i * 7 + 1);  /* client pubkey */
+    for (int i = 0; i < 16; i++) req[48 + i] = (uint8_t)(i * 11 + 3); /* client nonce */
+    nl_put_u32(req + 64, cfg.capabilities);
+    ASSERT_EQ((int)sizeof(req), NL_CONNECT_REQUEST_SIZE);
+
+    ASSERT_TRUE(sendto(raw, req, sizeof(req), 0,
+                       (struct sockaddr *)&server_addr, sizeof(server_addr)) >= 0);
+
+    uint8_t first[256];
+    ssize_t n = recv(raw, first, sizeof(first), 0);
+    ASSERT_TRUE(n >= 1);
+    ASSERT_EQ(first[0], NL_PKT_CONNECT_CHALLENGE);
+    ASSERT_EQ(n, NL_CONNECT_CHALLENGE_SIZE); /* the full, untruncated packet */
+    uint8_t original[256];
+    memcpy(original, first, NL_CONNECT_CHALLENGE_SIZE);
+
+    /* Answer nothing: the server must retransmit its CHALLENGE on its
+     * NL_HANDSHAKE_RETRY_MS timer. */
+    uint8_t again[256];
+    n = recv(raw, again, sizeof(again), 0);
+    ASSERT_TRUE(n >= 1);
+    ASSERT_EQ(again[0], NL_PKT_CONNECT_CHALLENGE);
+    ASSERT_EQ(n, NL_CONNECT_CHALLENGE_SIZE);
+    /* Byte-identical: the cookie, both nonces and the server pubkey all
+     * survived the copy out of the pending table. */
+    CHECK_MEM_EQ(again, original, NL_CONNECT_CHALLENGE_SIZE);
+
+    close(raw);
+    nl_endpoint_destroy(server);
+}
+
+/* The retained-handshake buffer must fit every handshake packet, and the
+ * CHALLENGE (server-side) is the largest. */
+_Static_assert(NL_CONNECT_MAX_PACKET_SIZE >= NL_CONNECT_CHALLENGE_SIZE,
+               "retained handshake buffer must fit a CONNECT_CHALLENGE");
+_Static_assert(NL_CONNECT_MAX_PACKET_SIZE >= NL_CONNECT_RESPONSE_SIZE,
+               "retained handshake buffer must fit a CONNECT_RESPONSE");
+_Static_assert(NL_CONNECT_MAX_PACKET_SIZE >= NL_CONNECT_REQUEST_SIZE,
+               "retained handshake buffer must fit a CONNECT_REQUEST");
+_Static_assert(NL_CONNECT_CHALLENGE_SIZE > NL_CONNECT_RESPONSE_SIZE,
+               "if CHALLENGE ever becomes smaller than RESPONSE, the "
+               "max-size sizing above still holds but this test's premise "
+               "(that the old sizing was wrong) no longer describes the bug");
+
 TEST(test_version_string_matches_macros) {
     char expected[32];
     snprintf(expected, sizeof(expected), "%d.%d.%d",
@@ -843,6 +922,7 @@ TEST(test_peer_rtt_ms_and_peer_count) {
 
 int main(void) {
     printf("=== integration tests (real UDP sockets) ===\n");
+    RUN_TEST(test_server_challenge_retransmit_roundtrips_at_full_length);
     RUN_TEST(test_version_string_matches_macros);
     RUN_TEST(test_error_string_covers_all_codes);
     RUN_TEST(test_connect_and_reliable_ordered_data);

@@ -446,6 +446,23 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   lost, later ones acked). Regression tests:
   `test_burst_loss_at_cwnd_above_ack_window_no_teardown` (end to end,
   no teardown) and `test_oldest_unacked_tracks_span_not_count`.
+- **4-byte stack buffer overflow in the handshake retransmit path.**
+  `retry_pending_handshakes` copied a pending entry's retained handshake
+  packet into a `pkt[NL_CONNECT_RESPONSE_SIZE]` (65-byte) array, but a
+  server-side entry retains a `CONNECT_CHALLENGE`, which is 69 bytes.
+  Every server handshake whose CHALLENGE was retransmitted (i.e. the
+  normal retransmit path, >250 ms) overflowed the I/O thread's stack by
+  four bytes. ASan/UBSan don't catch it because the clobbered bytes are
+  the following struct member's fields, which the next two statements
+  overwrite. `NL_CONNECT_MAX_PACKET_SIZE` (the max over all four
+  handshake packet sizes) is now the single source of truth for both
+  `pending_t.retry_packet` and the copy-out array, with `_Static_assert`s
+  covering every handshake packet so a future size change is a compile
+  error rather than a latent overflow. The dead `last_retry_ms` pointer
+  (written to `&p->last_retry_ms` then immediately set to NULL) is
+  gone. Regression test:
+  `test_server_challenge_retransmit_roundtrips_at_full_length` (a real
+  retransmitted CHALLENGE must be byte-identical to the original).
 - **Fast retransmit had no cooldown and consumed the RTO give-up
   budget.** Every inbound packet whose ack horizon was >=3 sequences
   newer re-fired a retransmit for the same hole, and each of those bumped

@@ -181,8 +181,10 @@ typedef struct {
      * (REQUEST / CHALLENGE / RESPONSE), retained so the IO thread can
      * retransmit it while the entry is still in_use. CONNECT_ACCEPTED is
      * handled separately by connection.c's accept_retries_left budget. */
-    uint8_t retry_packet[NL_CONNECT_RESPONSE_SIZE > NL_CONNECT_CHALLENGE_SIZE
-                             ? NL_CONNECT_RESPONSE_SIZE : NL_CONNECT_CHALLENGE_SIZE];
+    /* Sized for the largest handshake packet, not for any one of them: a
+     * server entry retains a CONNECT_CHALLENGE (69 bytes), which is bigger
+     * than a CONNECT_RESPONSE (65). */
+    uint8_t retry_packet[NL_CONNECT_MAX_PACKET_SIZE];
     uint16_t retry_packet_len;
     uint64_t last_retry_ms;
 } pending_t;
@@ -710,8 +712,13 @@ static void retry_pending_handshakes(nl_endpoint_t *ep, uint64_t now) {
      * ep_send_nl on the WebSocket path can block up to ~1s on a stalled
      * TCP write, and holding pending_lock that long would freeze the
      * whole handshake table. */
-    struct { struct sockaddr_storage addr; socklen_t addr_len; uint8_t pkt[NL_CONNECT_RESPONSE_SIZE];
-             uint16_t len; uint64_t *last_retry_ms; } due[NL_MAX_PENDING];
+    /* pkt is sized NL_CONNECT_MAX_PACKET_SIZE, not a specific handshake
+     * packet's size: a server entry retains a CONNECT_CHALLENGE, and a
+     * RESPONSE-sized buffer overflowed by 4 bytes here -- on the I/O
+     * thread's stack -- on every retransmitted server handshake. */
+    struct { struct sockaddr_storage addr; socklen_t addr_len;
+             uint8_t pkt[NL_CONNECT_MAX_PACKET_SIZE];
+             uint16_t len; } due[NL_MAX_PENDING];
     int n_due = 0;
 
     pthread_mutex_lock(&ep->pending_lock);
@@ -724,13 +731,7 @@ static void retry_pending_handshakes(nl_endpoint_t *ep, uint64_t now) {
         due[n_due].addr_len = p->addr_len;
         memcpy(due[n_due].pkt, p->retry_packet, p->retry_packet_len);
         due[n_due].len = p->retry_packet_len;
-        due[n_due].last_retry_ms = &p->last_retry_ms;
-        p->last_retry_ms = now; /* mark sent; if the entry is released
-                                 * before the real send, the pointer is
-                                 * only used for the timestamp update
-                                 * below which we skip if null -- see
-                                 * note: we already updated here. */
-        due[n_due].last_retry_ms = NULL;
+        p->last_retry_ms = now; /* mark sent while we still hold the lock */
         n_due++;
     }
     pthread_mutex_unlock(&ep->pending_lock);
