@@ -446,6 +446,22 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   lost, later ones acked). Regression tests:
   `test_burst_loss_at_cwnd_above_ack_window_no_teardown` (end to end,
   no teardown) and `test_oldest_unacked_tracks_span_not_count`.
+- **Fast retransmit had no cooldown and consumed the RTO give-up
+  budget.** Every inbound packet whose ack horizon was >=3 sequences
+  newer re-fired a retransmit for the same hole, and each of those bumped
+  `retry_count` -- the counter `nl_channel_tick` compares against
+  `max_retries`. About 18 acks within a second therefore drove
+  `retry_count` past `NL_MAX_RETRIES` and destroyed an otherwise healthy
+  connection. Slots now carry a `fast_retx_done` flag: set on the
+  fast-retransmit path, cleared in `ack_one()`, and skipped while set, so
+  each hole is fast-retransmitted at most once per flight. Fast retransmit
+  refreshes `send_time_ms` (so the RTO scan doesn't immediately re-fire)
+  but no longer touches `retry_count`, which is reserved for RTO retries.
+  The comment at `seqbuf.h`'s `nl_send_ring_fast_retransmit` claiming the
+  `send_time_ms`/`retry_count` bookkeeping prevented re-flagging was the
+  source of the bug; it now describes the actual mechanism. Regression
+  tests: `test_fast_retransmit_fires_once_per_hole`,
+  `test_fast_retransmit_cooldown_clears_on_ack`.
 - **Ack bitmap widened from 32 to 64 bits** (`NL_ACK_WINDOW_BITS`),
   completing the fix above: a 32-bit bitmap against a 64-packet
   congestion window leaves the oldest packet of a full-window burst

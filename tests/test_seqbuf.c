@@ -225,10 +225,15 @@ TEST(test_fast_retransmit_triggers_past_threshold) {
 
     ASSERT_EQ(fast_retransmit_capture_count(), 1);
     ASSERT_EQ(fast_retransmit_capture_get(0), seqs[0]);
-    /* Fast-retransmitting must bump retry_count and refresh send_time_ms,
-     * exactly like a normal RTO retransmit. */
-    ASSERT_EQ(nl_send_ring_get(&ring, seqs[0])->retry_count, 1u);
+    /* Fast retransmit refreshes the RTO clock (so the RTO scan doesn't
+     * also fire for this slot on the next tick) and marks the slot as
+     * done. It deliberately does NOT touch retry_count: that counter is
+     * the give-up budget, and charging fast retransmit to it let ~18 acks
+     * within a second exhaust NL_MAX_RETRIES and kill a healthy
+     * connection. */
     ASSERT_EQ(nl_send_ring_get(&ring, seqs[0])->send_time_ms, 100u);
+    ASSERT_EQ(nl_send_ring_get(&ring, seqs[0])->retry_count, 0u);
+    ASSERT_TRUE(nl_send_ring_get(&ring, seqs[0])->fast_retx_done);
 
     nl_send_ring_free(&ring);
 }
@@ -390,6 +395,94 @@ TEST(test_ack_bitmap_covers_burst_loss_at_full_cwnd) {
     ASSERT_EQ(ring.unacked_count, 0);
 
     nl_recv_dedupe_free(&d);
+    nl_send_ring_free(&ring);
+}
+
+/* Regression: fast retransmit had no cooldown, so every inbound packet
+ * whose ack horizon was >=3 newer re-fired a retransmit for the same hole,
+ * and each of those bumped retry_count -- which is shared with the give-up
+ * budget. ~18 acks within a second therefore drove retry_count past
+ * NL_MAX_RETRIES and destroyed a healthy connection. */
+TEST(test_fast_retransmit_fires_once_per_hole) {
+    const int n = 40;
+    nl_send_ring_t ring;
+    nl_send_ring_init(&ring);
+    nl_recv_dedupe_t d;
+    nl_recv_dedupe_init(&d);
+
+    uint8_t payload[] = {0xCC};
+    for (int i = 0; i < n; i++) {
+        uint16_t seq;
+        ASSERT_TRUE(nl_send_ring_insert(&ring, payload, 1, 0, &seq));
+    }
+    /* Sequence 0 is lost; every other packet arrives, one per round, so
+     * the ack horizon advances each time. */
+
+    bool has_sample; uint32_t sample_ms; uint32_t newly;
+    uint16_t ack; nl_ack_bits_t bits;
+
+    fast_retransmit_capture_reset();
+    /* 15 successive acks with horizons 3..17: every one of them is past
+     * the reorder threshold for the seq-0 hole. */
+    for (uint16_t horizon = 3; horizon < 18; horizon++) {
+        for (uint16_t i = 1; i <= horizon; i++) {
+            nl_recv_dedupe_insert(&d, i); /* arrives now; all but 0 */
+        }
+        nl_recv_dedupe_build_ack(&d, &ack, &bits);
+        ASSERT_EQ(ack, horizon);
+        nl_send_ring_ack(&ring, ack, bits, 100, &has_sample, &sample_ms, &newly);
+        nl_send_ring_fast_retransmit(&ring, ack, bits, 3, 100, fast_retransmit_capture, NULL);
+    }
+
+    ASSERT_EQ(fast_retransmit_capture_count(), 1);
+    ASSERT_EQ(fast_retransmit_capture_get(0), 0);
+    /* The give-up budget must be untouched by fast retransmit: RTO retries
+     * are what the retry_count limit is there for. */
+    nl_send_slot_t *s0 = nl_send_ring_get(&ring, 0);
+    ASSERT_TRUE(s0 != NULL);
+    ASSERT_EQ(s0->retry_count, 0);
+
+    nl_recv_dedupe_free(&d);
+    nl_send_ring_free(&ring);
+}
+
+/* Regression: once a fast-retransmitted hole is finally acked, the slot's
+ * cooldown must clear too, so a later loss in the same slot can be
+ * fast-retransmitted again rather than waiting on the RTO. */
+TEST(test_fast_retransmit_cooldown_clears_on_ack) {
+    nl_send_ring_t ring;
+    nl_send_ring_init(&ring);
+    uint8_t payload[] = {0xDD};
+    uint16_t seqs[5];
+    for (int i = 0; i < 5; i++) ASSERT_TRUE(nl_send_ring_insert(&ring, payload, 1, 0, &seqs[i]));
+
+    nl_ack_bits_t bits = (nl_ack_bits_t)1 << 0 | (nl_ack_bits_t)1 << 1 | (nl_ack_bits_t)1 << 2;
+    fast_retransmit_capture_reset();
+    nl_send_ring_fast_retransmit(&ring, 4, bits, 3, 100, fast_retransmit_capture, NULL);
+    ASSERT_EQ(fast_retransmit_capture_count(), 1);
+
+    /* Same ack again: still no second fire (cooldown holds). */
+    nl_send_ring_fast_retransmit(&ring, 4, bits, 3, 100, fast_retransmit_capture, NULL);
+    ASSERT_EQ(fast_retransmit_capture_count(), 1);
+
+    /* Ack everything, then re-use the lane for a second loss burst. */
+    bool has_sample; uint32_t sample_ms;
+    for (uint16_t i = 0; i < 5; i++) {
+        nl_send_ring_ack(&ring, i, 0, 200, &has_sample, &sample_ms, NULL);
+    }
+    ASSERT_EQ(ring.unacked_count, 0);
+    for (int i = 5; i < 10; i++) {
+        uint16_t seq;
+        ASSERT_TRUE(nl_send_ring_insert(&ring, payload, 1, 300, &seq));
+    }
+    /* Sequences 6..9 received, 5 lost: one hole, so exactly one fire. */
+    nl_ack_bits_t bits2 = (nl_ack_bits_t)1 << 0 | (nl_ack_bits_t)1 << 1 | (nl_ack_bits_t)1 << 2;
+    nl_send_ring_ack(&ring, 9, bits2, 300, &has_sample, &sample_ms, NULL);
+    fast_retransmit_capture_reset();
+    nl_send_ring_fast_retransmit(&ring, 9, bits2, 3, 400, fast_retransmit_capture, NULL);
+    ASSERT_EQ(fast_retransmit_capture_count(), 1);
+    ASSERT_EQ(fast_retransmit_capture_get(0), 5);
+
     nl_send_ring_free(&ring);
 }
 
@@ -563,6 +656,8 @@ int main(void) {
     RUN_TEST(test_oldest_unacked_tracks_span_not_count);
     RUN_TEST(test_ack_bitmap_window_covers_cwnd_in_flight);
     RUN_TEST(test_ack_bitmap_covers_burst_loss_at_full_cwnd);
+    RUN_TEST(test_fast_retransmit_fires_once_per_hole);
+    RUN_TEST(test_fast_retransmit_cooldown_clears_on_ack);
     RUN_TEST(test_recv_dedupe_rejects_duplicates);
     RUN_TEST(test_recv_dedupe_out_of_order_accepted_once);
     RUN_TEST(test_recv_dedupe_too_old_rejected);

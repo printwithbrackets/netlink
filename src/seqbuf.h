@@ -58,6 +58,11 @@ typedef struct {
     uint16_t len;
     uint64_t send_time_ms;
     uint32_t retry_count;
+    /* This slot has already been fast-retransmitted once and is waiting to
+     * be acked. Cleared by ack_one(); set by nl_send_ring_fast_retransmit.
+     * Without it, every inbound packet whose ack horizon is far enough
+     * ahead re-fires a retransmit for the same hole. */
+    bool     fast_retx_done;
     uint8_t  data[NL_MAX_PACKET_SIZE_INTERNAL];
 } nl_send_slot_t;
 
@@ -110,10 +115,14 @@ void nl_send_ring_ack(nl_send_ring_t *ring, uint16_t ack, nl_ack_bits_t ack_bits
  * "three duplicate acks" heuristic uses -- if `reorder_threshold` or more
  * strictly-newer sequences are already confirmed acked (per `ack` and
  * `ack_bits`) while an older one isn't, waiting for the RTO timer is
- * pure wasted latency; the loss is already evident. Calls `emit` once
- * per sequence identified this way, marking it as retransmitted (bumping
- * retry_count and refreshing send_time_ms, exactly as a normal
- * RTO-triggered retransmit would) so it isn't immediately re-flagged.
+ * pure wasted latency; the loss is already evident. Calls `emit` at most
+ * once per sequence: a slot already fast-retransmitted is skipped until
+ * it's acked, since every further inbound packet with an advanced ack
+ * horizon would otherwise re-fire the same retransmission. The RTO clock
+ * (send_time_ms) is refreshed so the RTO scan doesn't immediately fire
+ * for the same slot too; retry_count is deliberately left alone, as that
+ * is the give-up budget and charging it here would let ordinary loss
+ * recovery exhaust it.
  *
  * Whether a candidate slot is itself already acked is re-derived directly
  * from (ack, ack_bits) rather than solely trusted from slot->acked, so

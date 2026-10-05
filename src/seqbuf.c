@@ -37,6 +37,7 @@ bool nl_send_ring_insert(nl_send_ring_t *ring, const uint8_t *data, uint16_t len
     slot->len = len;
     slot->send_time_ms = now_ms;
     slot->retry_count = 0;
+    slot->fast_retx_done = false;
     memcpy(slot->data, data, len);
     ring->unacked_count++;
     ring->next_sequence = (uint16_t)(seq + 1);
@@ -48,6 +49,9 @@ static bool ack_one(nl_send_ring_t *ring, uint16_t seq) {
     nl_send_slot_t *slot = &ring->slots[seq & NL_SEQ_RING_MASK];
     if (slot->valid && slot->sequence == seq && !slot->acked) {
         slot->acked = true;
+        /* The slot is retired: whatever cooldown its fast retransmit put
+         * on is done with, and the index becomes recyclable. */
+        slot->fast_retx_done = false;
         if (ring->unacked_count > 0) ring->unacked_count--;
         return true;
     }
@@ -107,10 +111,17 @@ void nl_send_ring_fast_retransmit(nl_send_ring_t *ring, uint16_t ack, nl_ack_bit
             if (ack_bits & ((nl_ack_bits_t)1 << b)) newer_acked++;
         }
 
-        if (newer_acked >= reorder_threshold) {
+        if (newer_acked >= reorder_threshold && !slot->fast_retx_done) {
             emit(ctx, slot->sequence);
-            slot->send_time_ms = now_ms; /* same bookkeeping a normal retransmit performs */
-            slot->retry_count++;
+            /* Refresh the RTO clock so the RTO scan doesn't also fire for
+             * this slot on the next tick. Deliberately does NOT touch
+             * retry_count: that counter is the give-up budget
+             * (NL_MAX_RETRIES), and fast retransmit exists precisely to
+             * recover loss the RTO timer would otherwise handle, so
+             * charging it here meant ~18 acks within a second could
+             * destroy an otherwise healthy connection. */
+            slot->send_time_ms = now_ms;
+            slot->fast_retx_done = true;
         }
     }
 }
