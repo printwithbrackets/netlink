@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <poll.h>
+#include <pthread.h>
 
 static bool wait_for_event(nl_endpoint_t *ep, nl_event_type_t type, nl_event_t *out, int timeout_ms) {
     uint64_t deadline_iterations = (uint64_t)timeout_ms / 50 + 1;
@@ -686,6 +687,106 @@ TEST(test_discovery_rate_limited) {
     nl_endpoint_destroy(server);
 }
 
+/* Regression: the payload nl_poll_event hands out was a single
+ * endpoint-wide "returned_owned_data" slot, freed by the next poll from ANY
+ * thread. Two threads polling concurrently meant one thread's poll freed a
+ * buffer the other was still reading -- a use-after-free that also made the
+ * Rust binding's `unsafe impl Sync for Endpoint` unsound, since its
+ * poll_event borrows a pointer into that same slot. Borrows are now
+ * tracked per (endpoint, thread). */
+#define POLLER_THREADS 4
+#define POLLS_PER_THREAD 150
+#define PAYLOAD_LEN 64
+#define PAYLOAD_BYTE 0xC3
+
+typedef struct {
+    nl_endpoint_t *server;
+    int delivered;
+    int corrupted;   /* payload bytes not matching the sent pattern */
+    int missing;     /* polls that timed out */
+} poller_ctx_t;
+
+/* Each payload is a single distinctive byte repeated: a buffer freed and
+ * reused under us (or torn by a concurrent write) shows up as a mismatch
+ * without depending on which thread receives which message. */
+static void *poller_main(void *arg) {
+    poller_ctx_t *ctx = (poller_ctx_t *)arg;
+    for (int i = 0; i < POLLS_PER_THREAD; i++) {
+        nl_event_t ev;
+        if (!nl_poll_event(ctx->server, &ev, 10000)) { ctx->missing++; continue; }
+        if (ev.event_type != NL_EVENT_DATA) continue;
+        /* The payload is only valid until THIS thread's next poll, so read
+         * it immediately -- a shared endpoint-wide borrow slot would already
+         * have been freed by another thread's poll by now. */
+        if (ev.data_len != PAYLOAD_LEN) { ctx->corrupted++; continue; }
+        for (uint32_t k = 0; k < ev.data_len; k++) {
+            if (ev.data[k] != PAYLOAD_BYTE) { ctx->corrupted++; break; }
+        }
+        ctx->delivered++;
+    }
+    return NULL;
+}
+
+TEST(test_concurrent_pollers_do_not_free_each_others_payloads) {
+    nl_config_t cfg; nl_config_default(&cfg);
+    nl_endpoint_t *server = NULL, *client = NULL;
+    nl_address_t bind_addr = addr("127.0.0.1", 34730);
+    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+
+    nl_peer_id_t client_peer;
+    ASSERT_EQ(nl_connect(client, &bind_addr, &client_peer), NL_OK);
+    nl_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 5000));
+    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 5000));
+
+    const int total = POLLER_THREADS * POLLS_PER_THREAD;
+    pthread_t threads[POLLER_THREADS];
+    poller_ctx_t ctxs[POLLER_THREADS];
+    for (int t = 0; t < POLLER_THREADS; t++) {
+        memset(&ctxs[t], 0, sizeof(ctxs[t]));
+        ctxs[t].server = server;
+    }
+    for (int t = 0; t < POLLER_THREADS; t++) {
+        ASSERT_EQ(pthread_create(&threads[t], NULL, poller_main, &ctxs[t]), 0);
+    }
+
+    /* Push enough traffic that the pollers spend real time overlapping.
+     * Sends are window-gated, so back off rather than filling the deferred
+     * queue: this test is about payload ownership, not flow control. */
+    uint8_t payload[PAYLOAD_LEN];
+    memset(payload, PAYLOAD_BYTE, sizeof(payload));
+    int sent = 0, idle_rounds = 0;
+    while (sent < total && idle_rounds < 200) {
+        nl_result_t r = nl_send(client, client_peer, 0, NL_RELIABLE_ORDERED,
+                                payload, sizeof(payload));
+        if (r == NL_OK) { sent++; idle_rounds = 0; continue; }
+        usleep(2000);
+        idle_rounds++;
+    }
+    CHECK_EQ(sent, total);
+
+    for (int t = 0; t < POLLER_THREADS; t++) pthread_join(threads[t], NULL);
+
+    int delivered = 0, corrupted = 0, missing = 0;
+    for (int t = 0; t < POLLER_THREADS; t++) {
+        delivered += ctxs[t].delivered;
+        corrupted += ctxs[t].corrupted;
+        missing += ctxs[t].missing;
+    }
+    if (corrupted || missing) {
+        printf("    corrupted %d, timed out %d, delivered %d\n", corrupted, missing, delivered);
+    }
+    /* Every payload a poller read must be intact -- under the old
+     * endpoint-wide slot these were freed out from under their readers. */
+    ASSERT_EQ(corrupted, 0);
+    ASSERT_EQ(missing, 0);
+    ASSERT_EQ(delivered, total);
+
+    nl_endpoint_destroy(client);
+    nl_endpoint_destroy(server);
+}
+
 /* Version consistency: nl_version_string() must match the NL_VERSION_*
  * macros so bindings and callers that parse either stay in sync. */
 /* Regression: the handshake retransmit path copied the retained packet
@@ -923,6 +1024,7 @@ TEST(test_peer_rtt_ms_and_peer_count) {
 int main(void) {
     printf("=== integration tests (real UDP sockets) ===\n");
     RUN_TEST(test_server_challenge_retransmit_roundtrips_at_full_length);
+    RUN_TEST(test_concurrent_pollers_do_not_free_each_others_payloads);
     RUN_TEST(test_version_string_matches_macros);
     RUN_TEST(test_error_string_covers_all_codes);
     RUN_TEST(test_connect_and_reliable_ordered_data);

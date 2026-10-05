@@ -55,8 +55,10 @@ reimplementations that happen to agree today.
   OpenSSL EVP). LAN discovery remains UDP-only and returns
   `NL_ERR_UNSUPPORTED` on WebSocket endpoints. Fixed path `/`.
 - **Native thread safety.** The library runs its own background I/O
-  thread; `nl_send()` and `nl_poll_event()` can be called from any thread
-  without external locking.
+  thread; `nl_send()` and `nl_poll_event()` can be called from any thread,
+  including concurrently from several, without external locking. A polled
+  event's payload is borrowed to the calling thread only — other threads
+  polling in the meantime never free it.
 - **IPv6 support**, dual-stack where the OS allows it (implemented and
   exercised in code review; see [Testing](#testing) for why it couldn't
   be run to completion in this project's own dev sandbox).
@@ -446,6 +448,18 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   lost, later ones acked). Regression tests:
   `test_burst_loss_at_cwnd_above_ack_window_no_teardown` (end to end,
   no teardown) and `test_oldest_unacked_tracks_span_not_count`.
+- **`nl_poll_event`'s payload borrow was a single endpoint-wide slot.**
+  `ep->returned_owned_data` was freed by the *next* poll from *any* thread,
+  so two threads polling concurrently meant one thread's poll freed a buffer
+  another was still reading — a use-after-free that also made the Rust
+  binding's `unsafe impl Sync for Endpoint` unsound, since its `poll_event`
+  copies out of that same slot. Borrows are now tracked per (endpoint,
+  thread): each poll frees only the calling thread's own previous borrow,
+  and `endpoint_free` reclaims whatever is still outstanding. The public
+  header, the README's thread-safety note, and the Rust binding now state
+  the per-thread borrow explicitly. Regression test (4 concurrent pollers
+  over 600 messages): `test_concurrent_pollers_do_not_free_each_others_payloads`
+  — ASan reports a heap-use-after-free against the old code.
 - **Continuation sends reported the wrong fragment count when the send ring
   filled up.** `nl_channel_send_range`'s ring-full path set
   `*out_sent_frags = i`, but the loop counts from `start_frag`, so on a

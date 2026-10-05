@@ -301,8 +301,13 @@ NL_API nl_result_t nl_send_ex(nl_endpoint_t *ep, nl_peer_id_t peer, uint8_t chan
 
 /* Pop the next event, waiting up to timeout_ms for one to arrive (0 = don't
  * block, -1 = block forever). Returns true if an event was written to *out.
- * `out->data` (for NL_EVENT_DATA) is only valid until the next call to
- * nl_poll_event on this endpoint -- copy it if you need it longer. */
+ *
+ * Thread-safe: callable from any thread, and concurrently from several. The
+ * returned `out->data` (for NL_EVENT_DATA) is owned by the library and
+ * borrowed to the CALLING THREAD: it stays valid until that same thread's
+ * next call to nl_poll_event, or until the endpoint is destroyed. Other
+ * threads polling in the meantime never free it. Copy the bytes if you need
+ * them longer. */
 NL_API bool nl_poll_event(nl_endpoint_t *ep, nl_event_t *out, int timeout_ms);
 
 /* ----------------------------------------------------------------------- */

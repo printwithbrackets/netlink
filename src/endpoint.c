@@ -210,6 +210,24 @@ typedef struct event_node {
     struct event_node *next;
 } event_node_t;
 
+/* A payload handed to the application by nl_poll_event, still owned by the
+ * library until that same thread polls again (or the endpoint is destroyed).
+ *
+ * One borrow per (endpoint, thread) rather than one per endpoint: the
+ * payload borrow is a per-thread loan of a shared buffer, and nl_poll_event
+ * is documented as callable from any thread. With a single endpoint-wide
+ * slot, one thread's poll freed a payload another thread was still reading
+ * -- a use-after-free that also made the Rust binding's `unsafe impl Sync`
+ * unsound, since its poll_event hands out a pointer into that same slot. */
+typedef struct borrow_node {
+    uint8_t *data;
+    uint32_t len;
+    nl_peer_id_t peer;
+    bool is_data;
+    pthread_t owner;
+    struct borrow_node *next;
+} borrow_node_t;
+
 struct nl_endpoint {
     bool is_server;
     nl_config_t config;
@@ -227,13 +245,11 @@ struct nl_endpoint {
     event_node_t *queue_head, *queue_tail;
     pthread_mutex_t queue_lock;
     pthread_cond_t queue_cond;
-    uint8_t *returned_owned_data;
-    /* Metadata for the payload currently borrowed by the app via
-     * nl_poll_event, so its receive-window charge can be released when
-     * the next poll frees it (flow control's "app consumed" signal). */
-    nl_peer_id_t returned_owned_peer;
-    uint32_t returned_owned_len;
-    bool returned_owned_is_data;
+    /* Payloads currently borrowed by the application via nl_poll_event,
+     * one per polling thread (see borrow_node_t). Each entry also carries
+     * the metadata needed to release that payload's receive-window charge
+     * when the borrow ends -- flow control's "app consumed" signal. */
+    borrow_node_t *borrows;
 
     /* TCP listen socket for NL_TRANSPORT_WEBSOCKET servers (NL_INVALID_
      * SOCKET when using UDP or on clients). */
@@ -1661,7 +1677,14 @@ static void endpoint_free(nl_endpoint_t *ep) {
 
     event_node_t *n = ep->queue_head;
     while (n) { event_node_t *next = n->next; free(n->payload); free(n); n = next; }
-    free(ep->returned_owned_data);
+    /* Any payload still borrowed by the app dies with the endpoint: its
+     * window charge is moot now that the connections are gone. */
+    while (ep->borrows) {
+        borrow_node_t *b = ep->borrows;
+        ep->borrows = b->next;
+        free(b->data);
+        free(b);
+    }
 
     if (ep->sock != NL_INVALID_SOCKET) nl_close_socket(ep->sock);
     if (ep->listen_sock != NL_INVALID_SOCKET) nl_close_socket(ep->listen_sock);
@@ -1969,29 +1992,52 @@ nl_result_t nl_send_ex(nl_endpoint_t *ep, nl_peer_id_t peer, uint8_t channel, nl
     return r;
 }
 
+/* Release a thread's finished payload borrows: free the buffers and hand
+ * back their receive-window charges. Must be called with queue_lock DROPPED
+ * (it takes connections_lock, and the lock order is connections_lock ->
+ * queue_lock, never the reverse). */
+static void consume_window_for_borrows(nl_endpoint_t *ep, borrow_node_t *borrows) {
+    while (borrows) {
+        borrow_node_t *b = borrows;
+        borrows = b->next;
+        if (b->is_data && b->len > 0) {
+            pthread_mutex_lock(&ep->connections_lock);
+            nl_connection_t *c = find_connection_locked(ep, b->peer);
+            if (c) nl_connection_consume_window(c, b->len);
+            pthread_mutex_unlock(&ep->connections_lock);
+        }
+        free(b->data);
+        free(b);
+    }
+}
+
 bool nl_poll_event(nl_endpoint_t *ep, nl_event_t *out, int timeout_ms) {
     if (!ep || !out) return false;
 
-    nl_peer_id_t consume_peer = NL_INVALID_PEER;
-    uint32_t consume_len = 0;
-    bool do_consume = false;
+    /* Up to a few of THIS thread's own previous borrows may still be
+     * outstanding only if it polled and never polled again -- so exactly
+     * one, but don't rely on that for the release accounting. */
+    borrow_node_t *release = NULL, *release_tail = NULL;
 
     pthread_mutex_lock(&ep->queue_lock);
-    if (ep->returned_owned_data) {
-        /* App is done with the previous payload: free it and release the
-         * connection's receive-window charge so the peer can send more.
-         * Defer the charge release until after queue_lock is dropped to
-         * preserve lock order (connections_lock/conn->lock -> queue_lock). */
-        if (ep->returned_owned_is_data && ep->returned_owned_len > 0) {
-            do_consume = true;
-            consume_peer = ep->returned_owned_peer;
-            consume_len = ep->returned_owned_len;
+    {
+        /* The app is done with whatever it borrowed from previous polls:
+         * free it and release the connection's receive-window charge so the
+         * peer can send more. Only entries owned by this thread -- another
+         * thread's borrow is still live and its payload must not be freed
+         * here. Defer the charge release until after queue_lock is dropped
+         * to preserve lock order (connections_lock/conn->lock ->
+         * queue_lock). */
+        pthread_t self = pthread_self();
+        borrow_node_t **pp = &ep->borrows;
+        while (*pp) {
+            borrow_node_t *b = *pp;
+            if (!pthread_equal(b->owner, self)) { pp = &b->next; continue; }
+            *pp = b->next;
+            b->next = NULL;
+            if (release_tail) release_tail->next = b; else release = b;
+            release_tail = b;
         }
-        free(ep->returned_owned_data);
-        ep->returned_owned_data = NULL;
-        ep->returned_owned_is_data = false;
-        ep->returned_owned_len = 0;
-        ep->returned_owned_peer = NL_INVALID_PEER;
     }
 
     if (!ep->queue_head) {
@@ -2014,16 +2060,11 @@ bool nl_poll_event(nl_endpoint_t *ep, nl_event_t *out, int timeout_ms) {
         }
 
         if (!ep->queue_head) {
-            /* Timed out / non-blocking empty: still release the previous
-             * payload's window charge -- the app finished with it by
-             * calling poll. connections_lock may nest under nothing here
+            /* Timed out / non-blocking empty: still release this thread's
+             * previous payload's window charge -- the app finished with it
+             * by calling poll. connections_lock may nest under nothing here
              * (queue_lock already dropped). */
-            if (do_consume) {
-                pthread_mutex_lock(&ep->connections_lock);
-                nl_connection_t *c = find_connection_locked(ep, consume_peer);
-                if (c) nl_connection_consume_window(c, consume_len);
-                pthread_mutex_unlock(&ep->connections_lock);
-            }
+            consume_window_for_borrows(ep, release);
             return false;
         }
         /* Event arrived while waiting: still hold queue_lock, dequeued below. */
@@ -2034,26 +2075,28 @@ bool nl_poll_event(nl_endpoint_t *ep, nl_event_t *out, int timeout_ms) {
     if (!ep->queue_head) ep->queue_tail = NULL;
     pthread_mutex_unlock(&ep->queue_lock);
 
-    if (do_consume) {
-        pthread_mutex_lock(&ep->connections_lock);
-        nl_connection_t *c = find_connection_locked(ep, consume_peer);
-        if (c) nl_connection_consume_window(c, consume_len);
-        pthread_mutex_unlock(&ep->connections_lock);
-    }
+    consume_window_for_borrows(ep, release);
 
     *out = node->pub;
     if (node->payload) {
         out->data = node->payload;
         out->data_len = node->payload_len;
-        /* Book the borrowed payload under queue_lock: these fields are
-         * what the *next* nl_poll_event frees/consumes, so a concurrent
-         * poll must not observe a torn write. */
-        pthread_mutex_lock(&ep->queue_lock);
-        ep->returned_owned_data = node->payload;
-        ep->returned_owned_len = (uint32_t)node->payload_len;
-        ep->returned_owned_is_data = (node->pub.event_type == NL_EVENT_DATA);
-        ep->returned_owned_peer = node->pub.peer;
-        pthread_mutex_unlock(&ep->queue_lock);
+        /* Book the borrow under queue_lock: a concurrent poll must not
+         * observe a torn list. If the bookkeeping allocation fails we still
+         * hand the payload over and just leak it -- the alternative (freeing
+         * it now) would return a dangling out->data. */
+        borrow_node_t *b = (borrow_node_t *)calloc(1, sizeof(borrow_node_t));
+        if (b) {
+            b->data = node->payload;
+            b->len = (uint32_t)node->payload_len;
+            b->peer = node->pub.peer;
+            b->is_data = (node->pub.event_type == NL_EVENT_DATA);
+            b->owner = pthread_self();
+            pthread_mutex_lock(&ep->queue_lock);
+            b->next = ep->borrows;
+            ep->borrows = b;
+            pthread_mutex_unlock(&ep->queue_lock);
+        }
     } else {
         out->data = NULL;
         out->data_len = 0;

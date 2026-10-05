@@ -349,6 +349,12 @@ pub struct Endpoint {
 
 // The underlying C endpoint is internally thread-safe (see include/netlink.h);
 // it's sound to share/move handles across Rust threads.
+//
+// `poll_event` copies the borrowed payload into an owned `Vec` before
+// returning, so the per-thread borrow C hands out never escapes Rust and the
+// Sync impl is sound. (It was NOT sound while C kept a single
+// endpoint-wide payload slot: one thread's poll freed the buffer another
+// thread was still copying.)
 unsafe impl Send for Endpoint {}
 unsafe impl Sync for Endpoint {}
 
@@ -378,7 +384,8 @@ impl Endpoint {
     }
 
     /// Wait up to `timeout` for the next event. A zero timeout returns
-    /// immediately if nothing is queued.
+    /// immediately if nothing is queued. Safe to call concurrently from
+    /// several threads.
     pub fn poll_event(&self, timeout: Duration) -> Option<Event> {
         let mut raw_ev = unsafe { std::mem::zeroed::<raw::nl_event_t>() };
         let ms = timeout.as_millis().min(i32::MAX as u128) as c_int;
