@@ -15,6 +15,15 @@
 #define NL_ACCEPT_RETRIES 8
 #define NL_HANDSHAKE_RETRY_MS 250
 
+/* Enforce the invariant documented on NL_ACK_WINDOW_BITS at compile time:
+ * letting the congestion window exceed the ack window is a silent
+ * permanent-data-loss bug, not a tuning mistake. */
+_Static_assert(NL_CWND_MAX_PACKETS <= NL_ACK_WINDOW_BITS,
+               "cwnd must not exceed the ack window: unacked sequences beyond "
+               "it can never be named by any ack");
+_Static_assert(NL_SSTHRESH_INITIAL_PACKETS <= NL_ACK_WINDOW_BITS,
+               "ssthresh must not exceed the ack window (see above)");
+
 /* Jacobson/Karels smoothed RTT + RTTVAR update (the same algorithm TCP's
  * RTO estimation uses, RFC 6298), fed only by clean samples -- see
  * seqbuf.h's nl_send_ring_ack() doc comment on why retransmitted and
@@ -41,12 +50,21 @@ static void update_rtt(nl_connection_t *conn, uint32_t sample_ms) {
 
 /* ---- congestion control (packet Reno, reliable traffic only) ---- */
 
+/* Sequences in flight, measured as the SPAN from each lane's oldest
+ * unacked sequence to its next sequence to be used -- not the count of
+ * unacked slots. An ack names sequences by bitmap position relative to the
+ * receiver's newest one, so what matters is how far back the oldest
+ * unacked sequence is: counting packets understates the window exactly when
+ * it matters (early packets lost, later ones acked), letting the span grow
+ * past what any ack can reach and stranding the oldest packet forever. */
 static uint32_t reliable_in_flight(nl_connection_t *conn) {
     uint32_t n = 0;
     for (uint8_t c = 0; c < conn->channel_count; c++) {
         for (int d = NL_RELIABLE_UNORDERED; d <= NL_RELIABLE_ORDERED; d++) {
             nl_lane_t *lane = &conn->channels[c].lanes[d];
-            if (lane->send_ring_init) n += lane->send_ring.unacked_count;
+            if (!lane->send_ring_init) continue;
+            uint16_t oldest = nl_send_ring_oldest_unacked(&lane->send_ring);
+            n += (uint32_t)(uint16_t)(lane->send_ring.next_sequence - oldest);
         }
     }
     return n;

@@ -428,6 +428,24 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 **Fixed**
 
+- **The 32-bit ack bitmap was narrower than the congestion window.** An
+  ack can only name 32 sequences back from the receiver's newest one,
+  while the congestion window allowed 256 packets in flight
+  (`NL_SSTHRESH_INITIAL_PACKETS` was 64). More than 32 reliable packets
+  in flight was therefore a normal steady state: once the receiver's
+  horizon advanced past a still-unacked sequence, no future ack could
+  name it again, even after the sender retransmitted it and the receiver
+  had it. It burned all `NL_MAX_RETRIES` and the connection was torn
+  down with `NL_ERR_TIMEOUT`. A loss burst of >=8 consecutive packets
+  killed a healthy connection. `NL_CWND_MAX_PACKETS` and
+  `NL_SSTHRESH_INITIAL_PACKETS` are now clamped to the ack window
+  (32), enforced by `_Static_assert`, and congestion control gates on
+  the *span* from each lane's oldest unacked sequence to its next
+  sequence rather than the count of unacked slots -- counting
+  understated the window exactly in the failing case (early packets
+  lost, later ones acked). Regression tests:
+  `test_burst_loss_at_cwnd_above_ack_window_no_teardown` (end to end,
+  no teardown) and `test_oldest_unacked_tracks_span_not_count`.
 - **"No ack yet" was indistinguishable from "I have sequence 0."** A
   reliable lane that had received nothing still stamped `ack=0,
   ack_bits=0` into its outgoing DATA header -- a valid on-the-wire

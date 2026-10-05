@@ -121,6 +121,23 @@ nl_send_slot_t *nl_send_ring_get(nl_send_ring_t *ring, uint16_t sequence) {
     return NULL;
 }
 
+uint16_t nl_send_ring_oldest_unacked(const nl_send_ring_t *ring) {
+    /* Ring indices are sequence & MASK, so slot order is sequence order
+     * within the tracked window; comparing with nl_seq_greater_than keeps
+     * that correct across a 16-bit wrap. */
+    bool found = false;
+    uint16_t oldest = 0;
+    for (int i = 0; i < NL_SEQ_RING_SIZE; i++) {
+        const nl_send_slot_t *slot = &ring->slots[i];
+        if (!slot->valid || slot->acked) continue;
+        if (!found || nl_seq_greater_than(oldest, slot->sequence)) {
+            oldest = slot->sequence;
+            found = true;
+        }
+    }
+    return found ? oldest : ring->next_sequence;
+}
+
 /* ==================== receive dedupe ==================== */
 
 int nl_recv_dedupe_init(nl_recv_dedupe_t *d) {

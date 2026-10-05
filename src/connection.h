@@ -61,9 +61,16 @@ typedef struct nl_deferred_msg {
 } nl_deferred_msg_t;
 
 #define NL_CWND_INITIAL_PACKETS 10    /* RFC 6928-style initial window */
-#define NL_SSTHRESH_INITIAL_PACKETS 64
-#define NL_CWND_MAX_PACKETS 256       /* matches send-ring depth; above this
-                                       * the ring itself becomes the limit */
+/* Invariant: the congestion window must never exceed NL_ACK_WINDOW_BITS.
+ * An ack can only name the sequences its bitmap reaches back from the
+ * receiver's newest one, so more reliable packets in flight than that
+ * means an unacked sequence can slide out of every future ack's reach and
+ * become permanently unackable -- it then burns its whole retry budget and
+ * tears the connection down even though the receiver has the packet.
+ * These bounds must be raised only together with NL_ACK_WINDOW_BITS. */
+#define NL_SSTHRESH_INITIAL_PACKETS 32
+#define NL_CWND_MAX_PACKETS 32        /* bounded by the ack window (above); the
+                                       * send ring is far deeper */
 #define NL_DEFERRED_MAX_MSGS 128
 /* One max-size message must always be parkable (a 256 KiB send that only
  * partially fit the window is a continuation, not an error), plus headroom

@@ -271,6 +271,42 @@ TEST(test_fast_retransmit_skips_already_acked) {
     nl_send_ring_free(&ring);
 }
 
+/* Regression: what congestion control has to gate on is the span from the
+ * oldest unacked sequence to the next sequence to be used, NOT the count of
+ * unacked slots. Counting understates the window exactly when it matters
+ * (early packets lost, later ones acked), letting the span grow past what
+ * any ack's bitmap can reach and stranding the oldest packet forever. */
+TEST(test_oldest_unacked_tracks_span_not_count) {
+    nl_send_ring_t ring;
+    nl_send_ring_init(&ring);
+    uint8_t payload[] = {0xAA};
+    for (int i = 0; i < 40; i++) {
+        uint16_t seq;
+        ASSERT_TRUE(nl_send_ring_insert(&ring, payload, 1, 0, &seq));
+    }
+    ASSERT_EQ(nl_send_ring_oldest_unacked(&ring), 0); /* span is the whole 40 */
+
+    bool has_sample; uint32_t sample_ms;
+    /* Ack 8..39 directly: 32 slots retired, but seq 0 still gates the span. */
+    for (int i = 8; i < 40; i++) {
+        nl_send_ring_ack(&ring, (uint16_t)i, 0, 0, &has_sample, &sample_ms, NULL);
+    }
+    ASSERT_EQ(ring.unacked_count, 8);
+    ASSERT_EQ(nl_send_ring_oldest_unacked(&ring), 0);
+
+    /* Retire the front of the ring one at a time: the span only shrinks as
+     * the oldest gap fills. */
+    for (int i = 0; i < 7; i++) {
+        nl_send_ring_ack(&ring, (uint16_t)i, 0, 0, &has_sample, &sample_ms, NULL);
+        ASSERT_EQ(nl_send_ring_oldest_unacked(&ring), (uint16_t)(i + 1));
+    }
+    nl_send_ring_ack(&ring, 7, 0, 0, &has_sample, &sample_ms, NULL);
+    ASSERT_EQ(ring.unacked_count, 0);
+    ASSERT_EQ(nl_send_ring_oldest_unacked(&ring), 40); /* nothing outstanding */
+
+    nl_send_ring_free(&ring);
+}
+
 TEST(test_recv_dedupe_rejects_duplicates) {
     nl_recv_dedupe_t d;
     nl_recv_dedupe_init(&d);
@@ -438,6 +474,7 @@ int main(void) {
     RUN_TEST(test_fast_retransmit_triggers_past_threshold);
     RUN_TEST(test_fast_retransmit_correct_without_prior_ack_call);
     RUN_TEST(test_fast_retransmit_skips_already_acked);
+    RUN_TEST(test_oldest_unacked_tracks_span_not_count);
     RUN_TEST(test_recv_dedupe_rejects_duplicates);
     RUN_TEST(test_recv_dedupe_out_of_order_accepted_once);
     RUN_TEST(test_recv_dedupe_too_old_rejected);

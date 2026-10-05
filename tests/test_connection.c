@@ -49,6 +49,7 @@ typedef struct harness {
     nl_result_t  last_disconnect_reason;
 
     bool drop_next_send;
+    int  drop_remaining;  /* drop this many upcoming sends in transit (burst loss) */
     int  packets_sent;
 
     nl_conn_callbacks_t cb;
@@ -155,6 +156,10 @@ static void h_send_wire(void *ctx, nl_peer_id_t peer, const uint8_t *packet, siz
     h->packets_sent++;
     if (h->drop_next_send) {
         h->drop_next_send = false;
+        return;
+    }
+    if (h->drop_remaining > 0) {
+        h->drop_remaining--;
         return;
     }
     if (!h->peer_conn) return;
@@ -758,12 +763,15 @@ TEST(test_capabilities_stored_on_connection) {
 /* Alternate server/client ticks for up to max_iters passes: each server
  * tick flushes standalone acks (applied synchronously on the client via
  * the harness queue), each client tick flushes deferred continuations and
- * runs the retransmit scan. */
+ * runs the retransmit scan. Each harness's clock is advanced alongside
+ * the tick time so inbound packets carry a plausible receive timestamp. */
 static void pump_until(harness_t *ch, nl_connection_t *cc, harness_t *sh,
                        nl_connection_t *sc, uint64_t *t, int max_iters) {
     for (int i = 0; i < max_iters; i++) {
+        sh->now_ms = *t;
         harness_tick(sh, sc, *t);
         *t += 50;
+        ch->now_ms = *t;
         harness_tick(ch, cc, *t);
         *t += 50;
     }
@@ -932,6 +940,69 @@ TEST(test_one_way_reliable_acked_without_reverse_data) {
     nl_connection_destroy(sc);
 }
 
+/* Regression: a loss burst of >=8 consecutive packets while more than 32
+ * reliable packets are in flight used to kill a healthy connection. The
+ * ack bitmap could only name the 32 sequences below the receiver's newest
+ * one, so once the horizon slid past a still-unacked sequence, no future
+ * ack could ever retire it: it burned NL_MAX_RETRIES and the connection
+ * was torn down with NL_ERR_TIMEOUT even though the receiver had it. */
+TEST(test_burst_loss_at_cwnd_above_ack_window_no_teardown) {
+    harness_t ch, sh;
+    nl_connection_t *cc, *sc;
+    /* Generous timeout: the point is to pump long enough that every
+     * unacked slot exhausts NL_MAX_RETRIES (RTO backoff grows
+     * exponentially, so the budget spans >2 minutes of virtual time). */
+    make_pair(&ch, &sh, &cc, &sc, /*timeout*/ 10000000, /*keepalive*/ 10000000);
+
+    /* Grow the congestion window the way a real long-lived connection
+     * does -- by receiving acks, never by poking the field -- so the test
+     * exercises whatever bound the library actually enforces. */
+    uint64_t t = 0;
+    int sent = 0;
+    for (int round = 0; round < 8 && cc->cwnd < NL_CWND_MAX_PACKETS; round++) {
+        ch.now_ms = t;
+        for (int i = 0; i < NL_CWND_INITIAL_PACKETS; i++) {
+            uint8_t payload[4] = { (uint8_t)sent, 0, 0, 0 };
+            sent++;
+            ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED, payload, sizeof(payload), t), NL_OK);
+        }
+        sh.now_ms = t;
+        harness_tick(&sh, sc, t); /* flush standalone acks -> cwnd grows */
+        t += 50;
+    }
+    ASSERT_EQ(sh.data_count, sent); /* lossless warm-up fully delivered */
+    ASSERT_TRUE(cc->cwnd > NL_CWND_INITIAL_PACKETS); /* window really did grow */
+
+    const int burst = 40;
+    /* A burst of >=8 consecutive lost packets, while in-flight exceeds
+     * what a 32-bit ack bitmap can name. */
+    ch.drop_remaining = 8;
+    for (int i = 0; i < burst; i++) {
+        uint8_t payload[4] = { (uint8_t)i, 0, 0, 0 };
+        ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED, payload, sizeof(payload), t), NL_OK);
+    }
+    ASSERT_EQ(ch.drop_remaining, 0);
+    /* Ordered delivery: the server has the tail of the burst but must
+     * withhold all of it until the front gap is filled. */
+    ASSERT_EQ(sh.data_count, sent);
+
+    /* Pump well past NL_MAX_RETRIES worth of RTOs. The RTO backs off
+     * exponentially to its 10s ceiling, so exhausting a 15-retry budget
+     * spans ~130s of virtual time; 300s leaves ample margin. The gap must
+     * be recovered and the connection must survive. */
+    pump_until(&ch, cc, &sh, sc, &t, 3000);
+
+    ASSERT_EQ(ch.disconnect_count, 0);
+    ASSERT_EQ(sh.disconnect_count, 0);
+    if (sh.data_count != sent + burst || ch.disconnect_count != 0) {
+        printf("    delivered %d/%d, client disconnects %d\n", sh.data_count, sent + burst, ch.disconnect_count);
+    }
+    ASSERT_EQ(sh.data_count, sent + burst);
+
+    nl_connection_destroy(cc);
+    nl_connection_destroy(sc);
+}
+
 int main(void) {
     printf("=== connection tests ===\n");
     RUN_TEST(test_connection_send_and_receive_roundtrip);
@@ -956,5 +1027,6 @@ int main(void) {
     RUN_TEST(test_large_reliable_message_100000);
     RUN_TEST(test_partial_ring_parks_continuation_without_overwriting);
     RUN_TEST(test_one_way_reliable_acked_without_reverse_data);
+    RUN_TEST(test_burst_loss_at_cwnd_above_ack_window_no_teardown);
     TEST_SUMMARY();
 }

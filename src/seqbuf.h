@@ -30,6 +30,14 @@
 #define NL_MAX_PACKET_SIZE_INTERNAL NL_MAX_PACKET_SIZE
 #define NL_SEQ_RING_SIZE 256 /* must be a power of two */
 #define NL_SEQ_RING_MASK (NL_SEQ_RING_SIZE - 1)
+/* How many sequences below the receiver's newest one an ack can name.
+ * This is the ack bitmap's width, and therefore the hard ceiling on how
+ * many reliable packets may be in flight: a still-unacked sequence that
+ * falls further back than this can never be named by any future ack, so it
+ * would burn its entire retry budget and then tear the connection down
+ * even though the receiver has it. connection.h's congestion-window bounds
+ * must therefore never exceed this. */
+#define NL_ACK_WINDOW_BITS 32
 
 static inline bool nl_seq_greater_than(uint16_t s1, uint16_t s2) {
     /* Standard signed-wraparound sequence comparison (Fiedler-style). */
@@ -111,6 +119,12 @@ void nl_send_ring_fast_retransmit(nl_send_ring_t *ring, uint16_t ack, uint32_t a
 /* Look up an entry by exact sequence, for a caller that wants to inspect it
  * (e.g. retransmission scan). Returns NULL if not present/valid. */
 nl_send_slot_t *nl_send_ring_get(nl_send_ring_t *ring, uint16_t sequence);
+/* Oldest sequence still awaiting an ack, or ring->next_sequence if nothing
+ * is outstanding. The *span* from here to next_sequence -- not the count of
+ * unacked slots -- is what an ack must be able to reach, so congestion
+ * control has to gate on it: counting unacked packets understates the
+ * window whenever earlier packets are still missing. */
+uint16_t nl_send_ring_oldest_unacked(const nl_send_ring_t *ring);
 
 /* ---- receive dedupe: "have I seen this sequence" + ack bitfield ---- */
 
