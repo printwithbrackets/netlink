@@ -154,7 +154,10 @@ typedef struct nl_connection {
      * streamed fragment-by-fragment as space opens, while a message that
      * would fit waits for the window to reach fit-size (so a mid-message
      * stall can't strand reassembly for something the peer *could* take
-     * whole). */
+     * whole). It starts at 0, not at the default: seeding it with the
+     * default claims the peer advertised something it never did, which
+     * makes a peer with a smaller window look like it could still take a
+     * message whole, and that message parks forever. */
     uint16_t peer_rwnd;
     uint16_t peer_rwnd_capacity;
     uint32_t peer_window_in_flight;

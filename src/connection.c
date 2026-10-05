@@ -224,7 +224,14 @@ nl_connection_t *nl_connection_create(nl_peer_id_t id, const struct sockaddr_sto
     conn->ssthresh = NL_SSTHRESH_INITIAL_PACKETS;
     conn->cwnd_ack_accum = 0;
     conn->peer_rwnd = (uint16_t)NL_RECV_WINDOW_DEFAULT;
-    conn->peer_rwnd_capacity = (uint16_t)NL_RECV_WINDOW_DEFAULT;
+    /* Unknown, not "32768": the peer has advertised nothing yet, and
+     * seeding capacity with the default made send_window_frags()'s
+     * "can this ever fit in a full window?" test answer wrongly for a
+     * peer whose real window is smaller than the default -- such a
+     * message then waits for a window that can never reach its size and
+     * parks forever with no error. 0 means "nothing known", which routes
+     * sends down the stream-fragment-by-fragment path instead. */
+    conn->peer_rwnd_capacity = 0;
     conn->peer_window_in_flight = 0;
     conn->recv_window_size = NL_RECV_WINDOW_DEFAULT;
     conn->recv_window_used = 0;

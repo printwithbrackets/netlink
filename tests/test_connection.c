@@ -1003,6 +1003,64 @@ TEST(test_burst_loss_at_cwnd_above_ack_window_no_teardown) {
     nl_connection_destroy(sc);
 }
 
+/* Regression: peer_rwnd_capacity started at NL_RECV_WINDOW_DEFAULT, a
+ * value the peer never advertised. A peer running a smaller receive window
+ * (cfg.recv_window_bytes < 32768) then makes send_window_frags() park
+ * forever: rem_bytes <= peer_rwnd_capacity is true (20000 <= 32768), so the
+ * send waits for a window that can never grow that big -- no error, no
+ * progress, the message is never delivered. */
+TEST(test_small_peer_window_does_not_park_large_message) {
+    harness_t ch, sh;
+    nl_connection_t *cc, *sc;
+    make_pair(&ch, &sh, &cc, &sc, 100000, 100000);
+
+    /* The peer runs a 4096-byte window and says so (its own send carries the
+     * advertisement). A 20000-byte message is 20 fragments, larger than that. */
+    sc->recv_window_size = 4096;
+    sc->recv_window_used = 0;
+    ASSERT_EQ(harness_send(&sh, sc, 0, NL_UNRELIABLE, (const uint8_t *)"hi", 2, 0), NL_OK);
+    ASSERT_EQ(ch.data_count, 1);
+    uint8_t *big = (uint8_t *)malloc(20000);
+    ASSERT_TRUE(big != NULL);
+    memset(big, 'R', 20000);
+    /* Reliable, so the peer keeps refreshing its advertisement in the acks
+     * that come back -- an unreliable lane would advertise once and never
+     * again, which would park for reasons unrelated to this bug. */
+    ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_UNORDERED, big, 20000, 0), NL_OK);
+
+    /* Stream it across several windows, consuming each window's worth as the
+     * application would (nl_poll_event -> nl_connection_consume_window; there
+     * is no endpoint in this harness). */
+    uint64_t t = 100;
+    for (int i = 0; i < 400; i++) {
+        sh.now_ms = t;
+        harness_tick(&sh, sc, t);
+        nl_connection_consume_window(sc, sc->recv_window_used);
+        t += 50;
+        ch.now_ms = t;
+        harness_tick(&ch, cc, t);
+        t += 50;
+        if (sh.data_count >= 1 && sh.last_data_len == 20000) break;
+    }
+
+    ASSERT_EQ(ch.disconnect_count, 0);
+    ASSERT_EQ(sh.disconnect_count, 0);
+    if (sh.data_count != 1 || sh.last_data_len != 20000) {
+        printf("    server got %d events, last %u bytes (wanted 1 / 20000)\n",
+               sh.data_count, sh.last_data_len);
+    }
+    ASSERT_EQ(sh.data_count, 1);
+    ASSERT_EQ(sh.last_data_len, 20000u);
+    /* And the capacity must be what the peer actually advertised, never the
+     * never-advertised default it used to start at. */
+    ASSERT_EQ(cc->peer_rwnd, 4096);
+    ASSERT_EQ(cc->peer_rwnd_capacity, 4096);
+
+    free(big);
+    nl_connection_destroy(cc);
+    nl_connection_destroy(sc);
+}
+
 int main(void) {
     printf("=== connection tests ===\n");
     RUN_TEST(test_connection_send_and_receive_roundtrip);
@@ -1028,5 +1086,6 @@ int main(void) {
     RUN_TEST(test_partial_ring_parks_continuation_without_overwriting);
     RUN_TEST(test_one_way_reliable_acked_without_reverse_data);
     RUN_TEST(test_burst_loss_at_cwnd_above_ack_window_no_teardown);
+    RUN_TEST(test_small_peer_window_does_not_park_large_message);
     TEST_SUMMARY();
 }

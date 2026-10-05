@@ -446,6 +446,16 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   lost, later ones acked). Regression tests:
   `test_burst_loss_at_cwnd_above_ack_window_no_teardown` (end to end,
   no teardown) and `test_oldest_unacked_tracks_span_not_count`.
+- **`peer_rwnd_capacity` started at 32768, which the peer never
+  advertised.** A peer running a smaller receive window
+  (`cfg.recv_window_bytes < 32768`) made `send_window_frags()` park
+  forever: `rem_bytes <= peer_rwnd_capacity` was true, so the send waited
+  for a window that could never grow that big, and any message larger than
+  the peer's real window was delivered never, with no error. It now
+  starts at 0 ("nothing advertised yet"), which routes sends down the
+  stream-fragment-by-fragment path until a real advertisement arrives.
+  Regression test: `test_small_peer_window_does_not_park_large_message`
+  (4096-byte peer window, 20000-byte message, must arrive).
 - **4-byte stack buffer overflow in the handshake retransmit path.**
   `retry_pending_handshakes` copied a pending entry's retained handshake
   packet into a `pkt[NL_CONNECT_RESPONSE_SIZE]` (65-byte) array, but a
