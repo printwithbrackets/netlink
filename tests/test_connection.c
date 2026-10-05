@@ -1061,6 +1061,61 @@ TEST(test_small_peer_window_does_not_park_large_message) {
     nl_connection_destroy(sc);
 }
 
+/* Regression: the receive-window charge clamped to the available room
+ * (used += min(len, room)) while the release subtracted the full event
+ * length. For a burst larger than the window that freed more than was ever
+ * charged, so recv_window_used drifted below the real outstanding bytes and
+ * the receiver kept advertising free window it didn't have -- accepting more
+ * than it could buffer. The charge must be the full length. */
+TEST(test_receive_window_charges_full_length) {
+    harness_t ch, sh;
+    nl_connection_t *cc, *sc;
+    make_pair(&ch, &sh, &cc, &sc, 100000, 100000);
+
+    sc->recv_window_size = 4096;
+    sc->recv_window_used = 0;
+
+    /* One 3000-byte message: fits, so the full length is charged. */
+    uint8_t a[3000];
+    memset(a, 'a', sizeof(a));
+    ASSERT_EQ(harness_send(&ch, cc, 0, NL_UNRELIABLE, a, sizeof(a), 0), NL_OK);
+    ASSERT_EQ(sh.data_count, 1);
+    ASSERT_EQ(sc->recv_window_used, 3000u);
+    ASSERT_EQ(nl_connection_adv_window(sc), 4096 - 3000);
+
+    /* App consumes it: the charge is released in full. */
+    nl_connection_consume_window(sc, 3000);
+    ASSERT_EQ(sc->recv_window_used, 0u);
+    ASSERT_EQ(nl_connection_adv_window(sc), 4096);
+
+    /* A 3000-byte message plus a 3000-byte message exceeds the 4096
+     * window. The second charge must saturate at the window size, not add
+     * only the 1096 bytes that fit -- otherwise the sum silently drifts
+     * below the true outstanding bytes and the receiver over-advertises. */
+    ASSERT_EQ(harness_send(&ch, cc, 0, NL_UNRELIABLE, a, sizeof(a), 0), NL_OK);
+    ASSERT_EQ(sc->recv_window_used, 3000u);
+    ASSERT_EQ(harness_send(&ch, cc, 0, NL_UNRELIABLE, a, sizeof(a), 0), NL_OK);
+    /* 6000 bytes really are queued against a 4096-byte window: the charge
+     * must reflect that, not the 4096 the old clamp produced. */
+    ASSERT_EQ(sc->recv_window_used, 6000u);
+    ASSERT_EQ(nl_connection_adv_window(sc), 0); /* window closed either way */
+
+    /* Consuming message 1's charge frees exactly 3000, leaving message 2's
+     * 3000 bytes outstanding -- the real backlog. The old clamping charge
+     * left 1096 here, i.e. 1904 bytes of phantom free window. */
+    nl_connection_consume_window(sc, 3000);
+    ASSERT_EQ(sc->recv_window_used, 3000u);
+    ASSERT_EQ(nl_connection_adv_window(sc), 4096 - 3000);
+
+    /* And consuming the last one closes the books exactly. */
+    nl_connection_consume_window(sc, 3000);
+    ASSERT_EQ(sc->recv_window_used, 0u);
+    ASSERT_EQ(nl_connection_adv_window(sc), 4096);
+
+    nl_connection_destroy(cc);
+    nl_connection_destroy(sc);
+}
+
 int main(void) {
     printf("=== connection tests ===\n");
     RUN_TEST(test_connection_send_and_receive_roundtrip);
@@ -1087,5 +1142,6 @@ int main(void) {
     RUN_TEST(test_one_way_reliable_acked_without_reverse_data);
     RUN_TEST(test_burst_loss_at_cwnd_above_ack_window_no_teardown);
     RUN_TEST(test_small_peer_window_does_not_park_large_message);
+    RUN_TEST(test_receive_window_charges_full_length);
     TEST_SUMMARY();
 }

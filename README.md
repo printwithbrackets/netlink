@@ -446,6 +446,16 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   lost, later ones acked). Regression tests:
   `test_burst_loss_at_cwnd_above_ack_window_no_teardown` (end to end,
   no teardown) and `test_oldest_unacked_tracks_span_not_count`.
+- **Receive-window charging was clamped while the release was not.** The
+  charge on delivery did `used += min(len, room)`, so for a burst larger
+  than the window less was charged than queued; the release on
+  `nl_poll_event` subtracted the full event length anyway. `recv_window_used`
+  therefore drifted below the real outstanding bytes and the receiver kept
+  advertising free window it didn't have — accepting more than it could
+  buffer. The charge is now the full length (no clamp);
+  `nl_connection_adv_window()` already reports 0 for `used >= size`, so an
+  over-count self-limits to "window closed" rather than corrupting the
+  arithmetic. Regression test: `test_receive_window_charges_full_length`.
 - **`peer_rwnd_capacity` started at 32768, which the peer never
   advertised.** A peer running a smaller receive window
   (`cfg.recv_window_bytes < 32768`) made `send_window_frags()` park

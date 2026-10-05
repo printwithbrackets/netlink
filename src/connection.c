@@ -602,10 +602,15 @@ static void on_channel_deliver(void *ctx, uint8_t channel_id, nl_delivery_t deli
      * until nl_poll_event returns them to the app (nl_connection_consume_window).
      * Called from on_packet with conn->lock already held. */
     nl_connection_t *conn = d->conn;
-    if (conn->recv_window_size > conn->recv_window_used) {
-        uint32_t room = conn->recv_window_size - conn->recv_window_used;
-        conn->recv_window_used += (len < room ? len : room);
-    }
+    /* Charge the FULL length, with no clamp to recv_window_size: the release
+     * (nl_connection_consume_window) subtracts the full event length too, so
+     * clamping the charge while releasing in full frees more than was ever
+     * charged and recv_window_used drifts below the real outstanding bytes.
+     * The receiver then keeps advertising free window it doesn't have.
+     * nl_connection_adv_window() already reports 0 for any used >= size, so
+     * an over-count self-limits to "window closed" rather than corrupting the
+     * arithmetic -- unlike a clamp, which corrupts it. */
+    conn->recv_window_used += len;
 }
 
 nl_result_t nl_connection_on_packet(nl_connection_t *conn, uint8_t type,
