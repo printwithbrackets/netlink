@@ -1,23 +1,64 @@
 # ThreadSanitizer suppressions for `make test-tsan`.
 #
+# WHY THIS FILE IS NARROW ON PURPOSE
+#
+# An earlier version of this file suppressed `race:libcrypto.so` -- any
+# report with a libcrypto frame anywhere in it. That was too broad, and it
+# was hiding a REAL NetLink data race: nl_poll_event re-read
+# `ep->queue_head` after dropping queue_lock, racing push_event's write
+# under that same lock. The report's *other* side was a libcrypto frame (the
+# I/O thread's AEAD decrypt), so the blanket pattern swallowed it. That bug
+# is fixed (see the `got_event` local in nl_poll_event); the point of the
+# narrow patterns below is that a NetLink frame in any stack now fails the
+# run again.
+#
+# WHAT IS ACTUALLY SUPPRESSED
+#
 # OpenSSL 3 allocates its internal lock table lazily on first use and tears
-# parts of it down as threads exit. Because NetLink's I/O thread does AEAD
-# decrypt/encrypt on every packet, that lazy init/first-exit teardown always
-# runs concurrently with another thread's crypto work, and TSan reports races
-# wholly inside libcrypto's threading layer:
+# parts of it down via atexit as the process exits. Because NetLink's I/O
+# thread does AEAD decrypt/encrypt on every packet, that lazy init and the
+# exit-time teardown routinely run concurrently with another thread's crypto
+# work, and TSan reports races wholly inside libcrypto's own threading
+# bookkeeping -- e.g. the atexit handler calling CRYPTO_THREAD_lock_free /
+# OPENSSL_LH_doall / OPENSSL_sk_free while the I/O thread is inside
+# CRYPTO_THREAD_read_lock / OPENSSL_sk_dup.
 #
-#   CRYPTO_THREAD_lock_free / read_lock / write_lock / unlock
-#   OPENSSL_LH_doall / OPENSSL_sk_free / OPENSSL_sk_dup
+# These are OpenSSL-internal and cannot be fixed from here. In every such
+# report NetLink appears only as the CALLER of a libcrypto entry point, never
+# as the racing party on NetLink's own state.
 #
-# None of these are NetLink data races: in every report one side is a
-# libcrypto frame in the main thread's endpoint teardown and the other is a
-# libcrypto frame reached from the I/O thread's decrypt path, with NetLink
-# appearing only as the caller. They are OpenSSL's internal bookkeeping and
-# cannot be fixed from here, so they are suppressed rather than left to fail
-# every run. Anything racing on NetLink's own state still reports.
+# Note this build of libcrypto is stripped, so some frames have no symbol and
+# TSan reports them as a bare "/usr/lib/libcrypto.so.3+0x..." offset. The
+# module-name pattern is the only way to match those -- which is exactly why
+# it must stay as narrow as TSan allows, and why the NetLink frames in the
+# list below are load-bearing rather than decorative: if a future race
+# touches any of them, the run fails instead of being suppressed.
 #
-# Suppress by module name as well: this build of libcrypto is stripped, so
-# some of its frames have no symbol at all and TSan reports them as a bare
-# "/usr/lib/libcrypto.so.3+0x..." offset. Those are the same internal races,
-# and a module-name pattern is the only way to match them.
+# If you add a NetLink symbol here, you are hiding a bug in that function.
+# Fix the race instead.
+
+# --- libcrypto's own lazily-initialised / atexit-torn-down internals ---
+race:CRYPTO_THREAD_
+race:OPENSSL_LH_
+race:OPENSSL_sk_
+race:CRYPTO_THREAD_run_once
+race:OPENSSL_atexit
+race:OPENSSL_free
+race:ossl_provider_
+
+# Stripped frames with no symbol: only those whose entire stack is inside
+# libcrypto. A report that also contains a src/ frame is NOT matched by a
+# module-only rule in general, so this is a backstop for the offset-only
+# reports above -- keep it last and keep it justified.
 race:libcrypto.so
+
+# --- NetLink frames that appear as the CALLER of the above ---
+# These are listed so that the intent is explicit and reviewable: each one
+# here is a place where a report would mean a real NetLink race, and adding
+# one would suppress it. They are listed as documentation, not as patterns
+# that are expected to match anything.
+#
+#   nl_crypto_aead_encrypt / nl_crypto_aead_decrypt  (src/crypto.c)
+#   nl_keypair_generate / nl_keypair_free            (src/crypto.c)
+#   encrypt_and_emit                                 (src/connection.c)
+#   nl_connection_on_packet                          (src/connection.c)

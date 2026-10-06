@@ -128,7 +128,10 @@ test-tsan: | $(BUILD_DIR)
 	@echo "--- running concurrency tests (ThreadSanitizer) ---"
 	TSAN_OPTIONS="suppressions=$(TSAN_SUPPRESSIONS) halt_on_error=1" $(TSAN_DIR)/test_threading
 	@echo "--- running integration tests (ThreadSanitizer) ---"
-	TSAN_OPTIONS="suppressions=$(TSAN_SUPPRESSIONS) halt_on_error=1" $(TSAN_DIR)/test_integration
+	# No halt_on_error here: this suite carries the races that only show up
+	# under real timing, so stopping at the first report hides the rest.
+	# Keep going and fail on the total.
+	TSAN_OPTIONS="suppressions=$(TSAN_SUPPRESSIONS) halt_on_error=0" $(TSAN_DIR)/test_integration
 
 # --- examples ---
 examples: all | $(BUILD_DIR)

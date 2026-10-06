@@ -322,7 +322,99 @@ TEST(test_threading_send_and_poll_concurrently) {
     nl_endpoint_destroy(server);
 }
 
-/* ---- 4: disconnect racing in-flight traffic ---- */
+/* ---- 4: non-blocking poll spinning against a concurrent producer ---- */
+
+/* Spins on non-blocking polls until told to stop, rather than a fixed
+ * iteration count: the producer below is window-gated, so a spinner that
+ * stopped early would let the window close and the sends would park. */
+typedef struct {
+    nl_endpoint_t *ep;
+    atomic_bool *go;
+    int delivered;
+    int corrupted;
+    uint64_t empty_polls;
+} spinner_ctx_t;
+
+static void *spinner_main(void *arg) {
+    spinner_ctx_t *c = (spinner_ctx_t *)arg;
+    while (atomic_load(c->go)) {
+        nl_event_t ev;
+        if (!nl_poll_event(c->ep, &ev, 0)) { c->empty_polls++; continue; } /* the racy path */
+        if (ev.event_type != NL_EVENT_DATA) continue;
+        if (ev.data_len != POLL_PAYLOAD_LEN) { c->corrupted++; continue; }
+        for (uint32_t k = 0; k < ev.data_len; k++) {
+            if (ev.data[k] != POLL_PAYLOAD_BYTE) { c->corrupted++; break; }
+        }
+        c->delivered++;
+    }
+    return NULL;
+}
+
+/* Regression: nl_poll_event's empty-queue path used to drop queue_lock and
+ * then re-read ep->queue_head to decide whether it had an event. That read
+ * raced push_event's write of the same field under that same lock, so a
+ * non-blocking poller spinning against a concurrent producer could miss an
+ * event that was in fact queued (TSan flagged the unsynchronized read; it
+ * reproduced roughly 1 run in 7). The decision is now made while the lock
+ * is held and carried in a local.
+ *
+ * This is the shape that hits it: timeout_ms == 0 (never blocks, so the
+ * unlock-then-recheck path runs every iteration) against a producer that is
+ * actively pushing. Blocking polls mostly hide it because the condvar
+ * handoff re-establishes the ordering. */
+TEST(test_threading_nonblocking_poll_against_producer) {
+    nl_endpoint_t *server, *client;
+    nl_peer_id_t client_peer;
+    make_pair(&server, &client, &client_peer, 34940, 0);
+
+    const int total = 2000;
+    uint8_t payload[POLL_PAYLOAD_LEN];
+    memset(payload, POLL_PAYLOAD_BYTE, sizeof(payload));
+
+    /* A second thread spins on non-blocking polls of the server while this
+     * thread produces -- the two genuinely overlap, which is the shape that
+     * hits the unlock-then-recheck path. */
+    atomic_bool go;
+    atomic_init(&go, true);
+    spinner_ctx_t sp = { server, &go, 0, 0, 0 };
+    pthread_t spinner;
+    ASSERT_EQ(pthread_create(&spinner, NULL, spinner_main, &sp), 0);
+
+    int sent = 0, idle = 0;
+    while (sent < total && idle < 500) {
+        if (nl_send(client, client_peer, 0, NL_RELIABLE_ORDERED, payload, sizeof(payload)) == NL_OK) {
+            sent++;
+            idle = 0;
+            continue;
+        }
+        usleep(1000); /* window-gated; back off rather than fill the queue */
+        idle++;
+    }
+    CHECK_EQ(sent, total);
+
+    atomic_store(&go, false);
+    pthread_join(spinner, NULL);
+    printf("    spinner: %d delivered, %d corrupted, %llu empty polls\n",
+           sp.delivered, sp.corrupted, (unsigned long long)sp.empty_polls);
+    if (sp.corrupted) {
+        printf("    %d payloads were corrupt -- a poll observed freed/overwritten memory\n",
+               sp.corrupted);
+    }
+    /* The spinner must only ever see whole payloads. */
+    ASSERT_EQ(sp.corrupted, 0);
+    CHECK_TRUE(sp.delivered > 0);
+
+    /* Drain what the spinner left so teardown is clean. */
+    for (int i = 0; i < total + 500; i++) {
+        nl_event_t ev;
+        if (!nl_poll_event(server, &ev, 1000)) break;
+    }
+
+    nl_endpoint_destroy(client);
+    nl_endpoint_destroy(server);
+}
+
+/* ---- 5: disconnect racing in-flight traffic ---- */
 
 typedef struct {
     nl_endpoint_t *ep;
@@ -457,6 +549,7 @@ int main(void) {
     RUN_TEST(test_threading_concurrent_pollers);
     RUN_TEST(test_threading_many_senders_one_poller);
     RUN_TEST(test_threading_send_and_poll_concurrently);
+    RUN_TEST(test_threading_nonblocking_poll_against_producer);
     RUN_TEST(test_threading_destroy_races_in_flight_traffic);
     RUN_TEST(test_threading_concurrent_connects);
     TEST_SUMMARY();

@@ -315,12 +315,13 @@ and Rust):
   `tests/integration/test_websocket_integration.c`: 5 cases,
   `tests/integration/test_threading.c`: 5 cases), all clean
   under AddressSanitizer + UndefinedBehaviorSanitizer -- no leaks, no UB.
-- **Concurrency tests under ThreadSanitizer** (`make test-tsan`, 5 cases
-  in `tests/integration/test_threading.c`). The main suite runs every
-  test on one thread, which cannot reach a race between the endpoint's
-  I/O thread and user threads -- so the concurrency claims below were
-  previously untested. TSan also can't follow `setjmp`/`longjmp`, so the
-  harness exits on first failure under `NL_TEST_NO_LONGJMP` instead.
+- **Concurrency tests under ThreadSanitizer** (`make test-tsan`, 6 cases
+  in `tests/integration/test_threading.c` plus the integration suite).
+  The main suite runs every test on one thread, which cannot reach a race
+  between the endpoint's I/O thread and user threads -- so the concurrency
+  claims below were previously untested. TSan also can't follow
+  `setjmp`/`longjmp`, so the harness exits on first failure under
+  `NL_TEST_NO_LONGJMP` instead.
 - `test_network_simulation.c` specifically drives thousands of messages
   through a simulated bad network (configurable packet loss, jitter/
   reordering, duplication) and verifies `RELIABLE_ORDERED` delivery stays
@@ -446,17 +447,36 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 - **`make test-tsan`**, plus 5 multi-threaded tests in
   `tests/integration/test_threading.c`: concurrent pollers on one
   endpoint, 6 senders against one poller with a small receive window,
-  send and poll on the same endpoint, endpoint destroy racing in-flight
-  traffic, and 5 concurrent connects. The existing suite runs every test
-  on one thread and never under TSan, so it could not reach the races
-  between the endpoint's I/O thread and user threads — which is how the
-  `nl_poll_event` use-after-free below survived. `tests/tsan.supp`
-  suppresses races wholly inside OpenSSL's own threading layer (it frees
-  its lazily-allocated lock table as threads exit, concurrently with other
-  threads' crypto work); NetLink's own state is not suppressed.
+  send and poll on the same endpoint, a non-blocking poll spinning against
+  a concurrent producer, endpoint destroy racing in-flight traffic, and 5
+  concurrent connects. The existing suite runs every test on one thread
+  and never under TSan, so it could not reach the races between the
+  endpoint's I/O thread and user threads — which is how both the
+  `nl_poll_event` use-after-free below and a queue-head data race
+  survived. `tests/tsan.supp` suppresses only races wholly inside
+  OpenSSL's own threading layer (it frees its lazily-allocated lock table
+  as threads exit, concurrently with other threads' crypto work).
+
+  That suppression file was itself a finding: its first version
+  suppressed `race:libcrypto.so`, i.e. any report with a libcrypto frame
+  anywhere in it. Because NetLink's I/O thread reaches libcrypto on every
+  packet, that pattern was also swallowing a genuine `queue_lock` race in
+  NetLink. It is now narrowed to OpenSSL's own symbols, with the reasoning
+  and the NetLink frames that must *not* be added recorded inline.
 
 **Fixed**
 
+- **`nl_poll_event` read `ep->queue_head` without holding `queue_lock`.**
+  The empty-queue paths (non-blocking poll, and a timed wait that expired)
+  dropped the lock and then re-read the queue head to decide whether an
+  event had arrived -- racing the I/O thread's `push_event`, which writes
+  that field under the very same lock. Beyond the data race itself, a
+  poller could miss an event that was in fact queued. The decision is now
+  made while the lock is held and carried in a local. Found by TSan once
+  the suppressions were narrowed (see below); regression test
+  `test_threading_nonblocking_poll_against_producer`, which spins on
+  non-blocking polls against a concurrent producer -- the shape that hits
+  the unlock-then-recheck path, and which a blocking poll mostly hides.
 - **`ep->io_thread_started` was a non-atomic `bool`** written by the
   creating thread after `pthread_create` and read by the I/O thread with
   no synchronisation edge between them. Now `atomic_bool`, like the

@@ -2049,11 +2049,19 @@ bool nl_poll_event(nl_endpoint_t *ep, nl_event_t *out, int timeout_ms) {
     }
 
     if (!ep->queue_head) {
+        /* Whether we ended up with an event must be decided WHILE HOLDING
+         * queue_lock, and remembered in a local. Re-reading ep->queue_head
+         * after unlocking races the I/O thread's push_event(), which writes
+         * that field under this same lock: TSan reported the unsynchronized
+         * read here, and on a weakly ordered read the poller could miss an
+         * event that was in fact queued (or see a torn head pointer). */
+        bool got_event = false;
         if (timeout_ms == 0) {
+            /* Nothing queued and we must not block. */
             pthread_mutex_unlock(&ep->queue_lock);
         } else if (timeout_ms < 0) {
             while (!ep->queue_head) pthread_cond_wait(&ep->queue_cond, &ep->queue_lock);
-            /* still holding queue_lock; fall through to dequeue below */
+            got_event = (ep->queue_head != NULL); /* still holding queue_lock */
         } else {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
@@ -2063,11 +2071,11 @@ bool nl_poll_event(nl_endpoint_t *ep, nl_event_t *out, int timeout_ms) {
             while (!ep->queue_head) {
                 if (pthread_cond_timedwait(&ep->queue_cond, &ep->queue_lock, &ts) != 0) break;
             }
-            /* still holding queue_lock if an event arrived; unlock if not */
-            if (!ep->queue_head) pthread_mutex_unlock(&ep->queue_lock);
+            got_event = (ep->queue_head != NULL); /* still holding queue_lock */
+            if (!got_event) pthread_mutex_unlock(&ep->queue_lock);
         }
 
-        if (!ep->queue_head) {
+        if (!got_event) {
             /* Timed out / non-blocking empty: still release this thread's
              * previous payload's window charge -- the app finished with it
              * by calling poll. connections_lock may nest under nothing here

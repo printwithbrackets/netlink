@@ -9,13 +9,25 @@
 //! ```
 
 use netlink::{Client, Config, Delivery, EventType, PeerId, Server};
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
-static PORT: AtomicU16 = AtomicU16::new(37100);
-
+/// Ports come from the OS, not a fixed base.
+///
+/// A fixed base (this file used `AtomicU16::new(37100)`) means the suite
+/// collides with anything else on the machine holding that range, with a
+/// concurrent `cargo test` invocation, or with a previous run whose
+/// processes were killed before their sockets closed -- and the resulting
+/// failure is a bind error that surfaces as an unrelated intermittent test
+/// failure. Asking the OS for a free port removes the shared state; the
+/// tiny bind-close-rebind window is the standard trade and far narrower than
+/// a fixed range.
 fn next_port() -> u16 {
-    PORT.fetch_add(1, Ordering::SeqCst)
+    UdpSocket::bind("127.0.0.1:0")
+        .expect("bind ephemeral port")
+        .local_addr()
+        .expect("local_addr")
+        .port()
 }
 
 fn wait_for(ep: &netlink::Endpoint, typ: EventType, timeout: Duration) -> netlink::Event {
