@@ -386,6 +386,10 @@ impl Endpoint {
     /// Wait up to `timeout` for the next event. A zero timeout returns
     /// immediately if nothing is queued. Safe to call concurrently from
     /// several threads.
+    ///
+    /// The returned `Event` owns its data (copied out of the payload C
+    /// borrows to this thread), so it stays valid after the next
+    /// `poll_event` call.
     pub fn poll_event(&self, timeout: Duration) -> Option<Event> {
         let mut raw_ev = unsafe { std::mem::zeroed::<raw::nl_event_t>() };
         let ms = timeout.as_millis().min(i32::MAX as u128) as c_int;
