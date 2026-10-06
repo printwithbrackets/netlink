@@ -42,6 +42,19 @@ jobs:
             make examples
           fi
 
+  concurrency:
+    name: Concurrency tests (ThreadSanitizer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install OpenSSL
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      # Linux only: clang's TSan and GCC's differ enough that the OpenSSL
+      # suppressions in tests/tsan.supp are tuned for what we verify locally.
+      # The single-threaded suite above still covers macOS.
+      - name: Run concurrency tests
+        run: make test-tsan
+
   python-bindings:
     name: Python bindings
     runs-on: ubuntu-latest
