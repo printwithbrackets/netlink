@@ -267,7 +267,10 @@ struct nl_endpoint {
     pthread_mutex_t ws_links_lock;
 
     pthread_t io_thread;
-    bool io_thread_started;
+    /* Read by the I/O thread (ws_drain_dead) with no synchronisation edge
+     * from the creating thread's write after pthread_create, so it must be
+     * atomic like `running` beside it. */
+    atomic_bool io_thread_started;
     atomic_bool running;
 
     /* Guards discovery_sock/discovery_port/discovery_expected_nonce and
@@ -410,7 +413,7 @@ static void ws_drain_dead(nl_endpoint_t *ep) {
     pthread_mutex_lock(&ep->ws_links_lock);
     ws_link_t *list = ep->ws_dead;
     ep->ws_dead = NULL;
-    bool also_live = !ep->io_thread_started || !atomic_load(&ep->running);
+    bool also_live = !atomic_load(&ep->io_thread_started) || !atomic_load(&ep->running);
     if (also_live) {
         ws_link_t *live = ep->ws_links;
         ep->ws_links = NULL;
@@ -1644,6 +1647,7 @@ static nl_endpoint_t *endpoint_alloc(bool is_server, const nl_config_t *cfg) {
     ep->listen_sock = NL_INVALID_SOCKET;
     ep->discovery_sock = NL_INVALID_SOCKET;
     atomic_init(&ep->running, false);
+    atomic_init(&ep->io_thread_started, false);
     nl_crypto_random(ep->server_secret, 32);
     pthread_mutex_init(&ep->pending_lock, NULL);
     pthread_mutex_init(&ep->connections_lock, NULL);
@@ -1655,12 +1659,16 @@ static nl_endpoint_t *endpoint_alloc(bool is_server, const nl_config_t *cfg) {
 }
 
 static nl_result_t start_io_thread(nl_endpoint_t *ep) {
+    /* Both flags are published BEFORE pthread_create: the new thread reads
+     * them on its first cycle (ws_drain_dead), and a store after the
+     * create leaves a window where it observes them unset. */
+    atomic_store(&ep->io_thread_started, true);
     atomic_store(&ep->running, true);
     if (pthread_create(&ep->io_thread, NULL, io_thread_main, ep) != 0) {
         atomic_store(&ep->running, false);
+        atomic_store(&ep->io_thread_started, false);
         return NL_ERR_INTERNAL;
     }
-    ep->io_thread_started = true;
     return NL_OK;
 }
 
@@ -1970,7 +1978,7 @@ void nl_endpoint_destroy(nl_endpoint_t *ep) {
     /* pthread_join on a never-started thread is UB; construction-failure
      * paths free via endpoint_free without joining, and destroy only
      * reaches here after a successful start_io_thread. */
-    if (ep->io_thread_started) pthread_join(ep->io_thread, NULL);
+    if (atomic_load(&ep->io_thread_started)) pthread_join(ep->io_thread, NULL);
     endpoint_free(ep);
 }
 

@@ -26,6 +26,33 @@
 extern "C" {
 #endif
 
+/* ABI guard for the structs the language bindings mirror by hand.
+ *
+ * The Python and Rust bindings declare their own copies of these layouts
+ * (ctypes.Structure / #[repr(C)]) rather than including this header, so a
+ * field added on the C side and forgotten on the binding side compiles
+ * cleanly in BOTH languages and then corrupts memory at runtime:
+ * nl_config_default() writes past the end of the binding's shorter struct.
+ * That exact mismatch shipped in 1.0.0 (three fields missing from both
+ * mirrors). These asserts pin the sizes so the C side at least fails to
+ * build when a struct changes, and the bindings' tests assert the same
+ * numbers against the real library.
+ *
+ * Sizes are asserted for the 64-bit ABI only; a 32-bit build legitimately
+ * differs (pointers are 4 bytes and the structs contain pointers), and the
+ * bindings are written against this ABI. */
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(NL_SKIP_ABI_ASSERTS)
+  #if UINTPTR_MAX == 0xFFFFFFFFFFFFFFFFULL
+    #define NL_ABI_ASSERT(cond, msg) _Static_assert(cond, msg)
+  #else
+    #define NL_ABI_ASSERT(cond, msg) ((void)0)
+  #endif
+#else
+  /* Pre-C11 (or C++ without _Static_assert): no compile-time guard. The
+   * binding tests still check the sizes at runtime. */
+  #define NL_ABI_ASSERT(cond, msg) ((void)0)
+#endif
+
 #if defined(_WIN32) && defined(NETLINK_SHARED)
   #ifdef NETLINK_BUILD
     #define NL_API __declspec(dllexport)
@@ -160,6 +187,10 @@ typedef struct {
     nl_af_t  family;
 } nl_address_t;
 
+NL_ABI_ASSERT(sizeof(nl_address_t) == 72,
+              "nl_address_t changed size -- update the Python/Rust mirrors "
+              "and their size assertions (the host buffer size is ABI)");
+
 /* ----------------------------------------------------------------------- */
 /* Opaque handles                                                          */
 /* ----------------------------------------------------------------------- */
@@ -212,6 +243,11 @@ typedef struct {
     uint32_t       capabilities;
 } nl_config_t;
 
+/* 64 bytes would be the pre-v2 size; 56 is with all three v2 fields. */
+NL_ABI_ASSERT(sizeof(nl_config_t) == 56,
+              "nl_config_t changed size -- update the Python/Rust mirrors "
+              "and their size assertions (they mirror this struct by hand)");
+
 NL_API void nl_config_default(nl_config_t *cfg);
 
 /* ----------------------------------------------------------------------- */
@@ -247,6 +283,10 @@ typedef struct {
     uint32_t        server_player_count;
     uint32_t        server_max_players;
 } nl_event_t;
+
+NL_ABI_ASSERT(sizeof(nl_event_t) == 192,
+              "nl_event_t changed size -- update the Python/Rust mirrors "
+              "and their size assertions");
 
 /* ----------------------------------------------------------------------- */
 /* Lifecycle                                                                */
@@ -347,6 +387,10 @@ typedef struct {
     uint32_t rtt_var_ms;
     uint32_t rto_ms;
 } nl_peer_stats_t;
+
+NL_ABI_ASSERT(sizeof(nl_peer_stats_t) == 64,
+              "nl_peer_stats_t changed size -- update the Python/Rust mirrors "
+              "and their size assertions");
 
 /* Copy out a snapshot of `peer`'s counters and RTT estimates. Returns
  * false if `peer` is not a currently-known connection. Thread-safe. */

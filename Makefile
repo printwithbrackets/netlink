@@ -3,6 +3,7 @@
 # Targets:
 #   make               - build the static and shared libraries
 #   make test          - build and run every unit + integration test (C)
+#   make test-tsan     - build and run the multi-threaded tests under ThreadSanitizer
 #   make test-bindings - run Python/Go/Rust binding tests (needs go, cargo, python3)
 #   make examples      - build the example programs
 #   make install       - install libs, header, and pkg-config file to $(PREFIX)
@@ -62,7 +63,7 @@ $(SHARED_LIB): $(OBJ)
 TEST_BIN_DIR := $(BUILD_DIR)/tests
 TEST_CFLAGS := $(CFLAGS) -g -fsanitize=address,undefined $(INCLUDES)
 
-.PHONY: test test-unit test-integration test-bindings
+.PHONY: test test-unit test-integration test-bindings test-tsan
 test: all test-unit test-integration
 
 # Language-binding tests (require `make` first, plus go/cargo/python3).
@@ -103,6 +104,31 @@ test-integration: | $(BUILD_DIR)
 	$(TEST_BIN_DIR)/test_integration
 	@echo "--- running integration tests (websocket transport) ---"
 	$(TEST_BIN_DIR)/test_websocket_integration
+
+# --- concurrency tests ---
+#
+# The ASan/UBSan suite above runs every test on one thread, so it cannot
+# reach the races between the endpoint's I/O thread and user threads (the
+# per-thread payload borrow, ep->io_thread_started, the connection and
+# pending tables). These are built with ThreadSanitizer instead -- TSan and
+# ASan cannot be combined in one binary.
+TSAN_DIR := $(BUILD_DIR)/tsan
+# NL_TEST_NO_LONGJMP: TSan cannot follow setjmp/longjmp (it aborts with "can't
+# find longjmp buf"), so the harness exits on the first failure instead.
+TSAN_CFLAGS := $(CFLAGS) -g -O1 -fsanitize=thread -DNL_TEST_NO_LONGJMP $(INCLUDES)
+TSAN_SUPPRESSIONS := tests/tsan.supp
+
+.PHONY: test-tsan
+test-tsan: | $(BUILD_DIR)
+	mkdir -p $(TSAN_DIR)
+	$(CC) $(TSAN_CFLAGS) -D_GNU_SOURCE -pthread -o $(TSAN_DIR)/test_threading \
+		$(SRC) tests/integration/test_threading.c $(CRYPTO_LIBS)
+	$(CC) $(TSAN_CFLAGS) -D_GNU_SOURCE -pthread -o $(TSAN_DIR)/test_integration \
+		$(SRC) tests/integration/test_integration.c $(CRYPTO_LIBS)
+	@echo "--- running concurrency tests (ThreadSanitizer) ---"
+	TSAN_OPTIONS="suppressions=$(TSAN_SUPPRESSIONS) halt_on_error=1" $(TSAN_DIR)/test_threading
+	@echo "--- running integration tests (ThreadSanitizer) ---"
+	TSAN_OPTIONS="suppressions=$(TSAN_SUPPRESSIONS) halt_on_error=1" $(TSAN_DIR)/test_integration
 
 # --- examples ---
 examples: all | $(BUILD_DIR)

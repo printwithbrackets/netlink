@@ -307,19 +307,32 @@ what's claimed here is exactly what was verified, not more.
 environment** (a Linux container with a C toolchain, OpenSSL, Python, Go,
 and Rust):
 
-- 156 C test cases across unit tests (`tests/test_seqbuf.c`,
+- 189 C test cases across unit tests (`tests/test_seqbuf.c`,
   `test_crypto.c`, `test_fragment.c`, `test_channel.c`,
   `test_connection.c`, `test_network_simulation.c`,
-  `test_websocket.c`: 128 cases) and real-socket integration tests
-  (`tests/integration/test_integration.c`: 23 cases,
-  `tests/integration/test_websocket_integration.c`: 5 cases), all clean
+  `test_websocket.c`: 149 cases) and real-socket integration tests
+  (`tests/integration/test_integration.c`: 25 cases,
+  `tests/integration/test_websocket_integration.c`: 5 cases,
+  `tests/integration/test_threading.c`: 5 cases), all clean
   under AddressSanitizer + UndefinedBehaviorSanitizer -- no leaks, no UB.
+- **Concurrency tests under ThreadSanitizer** (`make test-tsan`, 5 cases
+  in `tests/integration/test_threading.c`). The main suite runs every
+  test on one thread, which cannot reach a race between the endpoint's
+  I/O thread and user threads -- so the concurrency claims below were
+  previously untested. TSan also can't follow `setjmp`/`longjmp`, so the
+  harness exits on first failure under `NL_TEST_NO_LONGJMP` instead.
 - `test_network_simulation.c` specifically drives thousands of messages
   through a simulated bad network (configurable packet loss, jitter/
   reordering, duplication) and verifies `RELIABLE_ORDERED` delivery stays
   complete and correctly ordered throughout -- including at 20% loss and
   25% duplication -- rather than only ever being exercised over perfect
-  localhost conditions.
+  localhost conditions. It **burst-sends** (up to 64 packets per tick,
+  gated at the ack window) instead of one packet per tick: one-per-tick
+  held in-flight around ~10 forever, which is precisely the regime where
+  a too-narrow ack bitmap and a fast-retransmit storm cannot occur. Its
+  `max_retries` is the real production bound (15) rather than an inflated
+  one, so `ASSERT_FALSE(give_up)` is no longer close to vacuous. A
+  scripted 12-consecutive-packet loss burst runs at a full window.
 - The integration tests spin up **real client and server endpoints
   communicating over actual loopback UDP sockets**, covering: the full
   encrypted handshake, capability negotiation, all four delivery modes,
@@ -428,8 +441,28 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ### Unreleased
 
+**Added**
+
+- **`make test-tsan`**, plus 5 multi-threaded tests in
+  `tests/integration/test_threading.c`: concurrent pollers on one
+  endpoint, 6 senders against one poller with a small receive window,
+  send and poll on the same endpoint, endpoint destroy racing in-flight
+  traffic, and 5 concurrent connects. The existing suite runs every test
+  on one thread and never under TSan, so it could not reach the races
+  between the endpoint's I/O thread and user threads — which is how the
+  `nl_poll_event` use-after-free below survived. `tests/tsan.supp`
+  suppresses races wholly inside OpenSSL's own threading layer (it frees
+  its lazily-allocated lock table as threads exit, concurrently with other
+  threads' crypto work); NetLink's own state is not suppressed.
+
 **Fixed**
 
+- **`ep->io_thread_started` was a non-atomic `bool`** written by the
+  creating thread after `pthread_create` and read by the I/O thread with
+  no synchronisation edge between them. Now `atomic_bool`, like the
+  adjacent `running`, and both flags are published *before*
+  `pthread_create` — storing after the create left a window in which the
+  new thread could observe them unset.
 - **The 32-bit ack bitmap was narrower than the congestion window.** An
   ack can only name 32 sequences back from the receiver's newest one,
   while the congestion window allowed 256 packets in flight
@@ -554,6 +587,20 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   receive dedupe has actually seen something; a clear `ack_valid` makes
   the receiver skip ack application entirely. Regression test:
   `test_no_ack_from_empty_lane_does_not_ack_peer_seq_zero`.
+
+**Added**
+
+- **ABI guards.** The Python and Rust bindings declare their own copies of
+  the C structs (ctypes / `#[repr(C)]`) rather than including the header,
+  so a field added on the C side and forgotten on a binding side compiles
+  cleanly in both languages and only corrupts memory at runtime — exactly
+  what happened in 1.0.0, where three `nl_config_t` fields were missing
+  from both mirrors. `include/netlink.h` now has `NL_ABI_ASSERT`
+  `_Static_assert`s pinning the 64-bit sizes of `nl_config_t` (56),
+  `nl_event_t` (192), `nl_peer_stats_t` (64), and `nl_address_t` (72),
+  and the Python test suite asserts the same numbers against the real
+  library plus reads `nl_config_default()` back through the mirror (which
+  also catches field *order* drift, where sizes agree but offsets don't).
 
 **Changed**
 

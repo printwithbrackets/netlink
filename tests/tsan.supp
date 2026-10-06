@@ -1,0 +1,23 @@
+# ThreadSanitizer suppressions for `make test-tsan`.
+#
+# OpenSSL 3 allocates its internal lock table lazily on first use and tears
+# parts of it down as threads exit. Because NetLink's I/O thread does AEAD
+# decrypt/encrypt on every packet, that lazy init/first-exit teardown always
+# runs concurrently with another thread's crypto work, and TSan reports races
+# wholly inside libcrypto's threading layer:
+#
+#   CRYPTO_THREAD_lock_free / read_lock / write_lock / unlock
+#   OPENSSL_LH_doall / OPENSSL_sk_free / OPENSSL_sk_dup
+#
+# None of these are NetLink data races: in every report one side is a
+# libcrypto frame in the main thread's endpoint teardown and the other is a
+# libcrypto frame reached from the I/O thread's decrypt path, with NetLink
+# appearing only as the caller. They are OpenSSL's internal bookkeeping and
+# cannot be fixed from here, so they are suppressed rather than left to fail
+# every run. Anything racing on NetLink's own state still reports.
+#
+# Suppress by module name as well: this build of libcrypto is stripped, so
+# some of its frames have no symbol at all and TSan reports them as a bare
+# "/usr/lib/libcrypto.so.3+0x..." offset. Those are the same internal races,
+# and a module-name pattern is the only way to match them.
+race:libcrypto.so

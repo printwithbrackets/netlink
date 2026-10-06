@@ -6,6 +6,7 @@ this is the same wire protocol a C, Go, or Rust peer would use.
 Run with: NETLINK_LIBRARY_PATH=/path/to/libnetlink.so pytest test_python_bindings.py
 (or just `pytest` if libnetlink.so is discoverable at the default build path).
 """
+import ctypes
 import os
 import sys
 import time
@@ -34,6 +35,52 @@ def wait_for(client_or_server, event_type, timeout=3.0):
 def test_version_matches_package():
     assert netlink.__version__ == "1.1.1"
     assert netlink.version() == netlink.__version__
+
+
+def test_abi_struct_sizes_match_c():
+    """The ctypes mirrors below are hand-written copies of the C structs
+    (the C header can't be included from Python). If C grows a field and the
+    mirror doesn't, both sides still compile and the mismatch only shows up
+    as memory corruption -- which is exactly what happened in 1.0.0, where
+    three nl_config_t fields were missing from this mirror and
+    nl_config_default wrote past the end of it.
+
+    The C side now has _Static_asserts on the same numbers (NL_ABI_ASSERT in
+    include/netlink.h); these are the mirror side of that guard.
+    """
+    # Mirrored 64-bit ABI sizes; see NL_ABI_ASSERT in include/netlink.h.
+    expected = {
+        "_Config": 56,
+        "_Event": 192,
+        "_PeerStats": 64,
+        "_Address": 72,
+    }
+    for name, size in expected.items():
+        actual = ctypes.sizeof(getattr(netlink, name))
+        assert actual == size, (
+            f"{name} mirror is {actual} bytes, C expects {size} -- the C struct "
+            "gained/lost a field and this mirror wasn't updated"
+        )
+
+
+def test_config_default_matches_c_defaults():
+    """Belt and braces for the ABI guard: if the mirror's field ORDER drifted
+    from C's, the sizes could still agree while nl_config_default wrote the
+    right values into the wrong offsets. Reading the defaults back through
+    the mirror catches that too.
+    """
+    cfg = netlink._Config()
+    netlink._lib.nl_config_default(ctypes.byref(cfg))
+    assert cfg.transport == netlink.Transport.UDP
+    assert cfg.channel_count == 4
+    assert cfg.max_connections == 64
+    assert cfg.connection_timeout_ms == 10000
+    assert cfg.keepalive_interval_ms == 1000
+    assert cfg.encryption_enabled is True
+    # The v2 fields, whose absence was the 1.0.0 bug: they must exist AND
+    # land on distinct nonzero-capable offsets.
+    assert cfg.max_send_bytes_per_sec == 0
+    assert cfg.recv_window_bytes == 32768
 
 
 def test_connect_and_echo():
