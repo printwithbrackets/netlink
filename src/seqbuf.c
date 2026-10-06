@@ -69,9 +69,19 @@ void nl_send_ring_ack(nl_send_ring_t *ring, uint16_t ack, nl_ack_bits_t ack_bits
         /* Newest sequence, never retransmitted: a clean RTT sample (Karn's
          * algorithm -- see the header comment for why retransmitted or
          * older-via-bitfield sequences are never used as samples). */
-        uint64_t elapsed = now_ms - ack_slot->send_time_ms;
-        *out_has_rtt_sample = true;
-        *out_rtt_sample_ms = (uint32_t)elapsed;
+        /* Discard the sample if now_ms precedes send_time_ms rather than
+         * computing the difference: unsigned subtraction wraps to ~2^64 and
+         * the uint32_t truncation lands near 4 billion ms, which would then
+         * be reported verbatim by nl_peer_rtt_ms(). now_ms can legitimately
+         * appear to go backwards -- it is supplied by the caller, so a
+         * cross-CPU timestamp or a wrapped clock source can produce it -- and
+         * clamping the result would still poison the estimator. Dropping one
+         * bad sample is cheap; a 4-billion-ms srtt is not recoverable. */
+        if (now_ms >= ack_slot->send_time_ms) {
+            uint64_t elapsed = now_ms - ack_slot->send_time_ms;
+            *out_has_rtt_sample = true;
+            *out_rtt_sample_ms = (uint32_t)elapsed;
+        }
     }
 
     if (ack_one(ring, ack)) newly++;

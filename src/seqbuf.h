@@ -105,7 +105,11 @@ bool nl_send_ring_insert(nl_send_ring_t *ring, const uint8_t *data, uint16_t len
  *
  * *out_newly_acked (optional) receives how many slots transitioned from
  * unacked to acked by this call -- the congestion controller's growth
- * signal. */
+ * signal.
+ *
+ * *out_has_rtt_sample is left false when `now_ms` precedes the slot's
+ * send_time_ms: an RTT sample is a duration, and a backwards clock reading
+ * cannot produce one. The slot is still marked acked. */
 void nl_send_ring_ack(nl_send_ring_t *ring, uint16_t ack, nl_ack_bits_t ack_bits, uint64_t now_ms,
                        bool *out_has_rtt_sample, uint32_t *out_rtt_sample_ms,
                        uint32_t *out_newly_acked);

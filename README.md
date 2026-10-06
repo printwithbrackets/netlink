@@ -307,10 +307,10 @@ what's claimed here is exactly what was verified, not more.
 environment** (a Linux container with a C toolchain, OpenSSL, Python, Go,
 and Rust):
 
-- 189 C test cases across unit tests (`tests/test_seqbuf.c`,
+- 195 C test cases across unit tests (`tests/test_seqbuf.c`,
   `test_crypto.c`, `test_fragment.c`, `test_channel.c`,
   `test_connection.c`, `test_network_simulation.c`,
-  `test_websocket.c`: 149 cases) and real-socket integration tests
+  `test_websocket.c`: 155 cases) and real-socket integration tests
   (`tests/integration/test_integration.c`: 25 cases,
   `tests/integration/test_websocket_integration.c`: 5 cases,
   `tests/integration/test_threading.c`: 5 cases), all clean
@@ -466,6 +466,17 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 **Fixed**
 
+- **An RTT sample could be computed from a backwards clock.** `now_ms` is
+  supplied by the caller, so a cross-CPU timestamp or a wrapped clock source
+  can have it precede a slot's `send_time_ms`. `now_ms - send_time_ms` then
+  underflowed on `uint64_t` and the `uint32_t` truncation landed near 4
+  billion ms — reported verbatim by `nl_peer_rtt_ms()` and folded into
+  `srtt`, from which it never recovers. The sample is now discarded (the
+  slot is still acked) rather than clamped, since clamping would still
+  poison the estimator. Regression tests:
+  `test_rtt_sample_discarded_when_now_goes_backwards` and, end to end
+  through the public stats path,
+  `test_backwards_now_does_not_poison_rtt_estimator`.
 - **`nl_poll_event` read `ep->queue_head` without holding `queue_lock`.**
   The empty-queue paths (non-blocking poll, and a timed wait that expired)
   dropped the lock and then re-read the queue head to decide whether an

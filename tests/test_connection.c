@@ -5,6 +5,15 @@
 #include <string.h>
 #include <stdlib.h>
 
+/* Test-only shims from connection.c, for asserting the deferred queue's
+ * internal ordering directly (it is internal state, not observable through
+ * the public API without driving window pressure and racing the flush).
+ * Hidden-visibility, so they are not part of the shared library's ABI. */
+nl_connection_t *nl_connection_new_for_test(void);
+bool deferred_push_for_test(nl_connection_t *conn, uint8_t channel, nl_delivery_t delivery,
+                            uint8_t priority, const uint8_t *data, size_t len,
+                            bool continuation, uint16_t frag_start, uint16_t message_id);
+
 /* ---- test harness: two connections wired together, no real socket.
  *
  * Packets are delivered by calling straight into the peer's
@@ -1116,6 +1125,159 @@ TEST(test_receive_window_charges_full_length) {
     nl_connection_destroy(sc);
 }
 
+/* Regression: an RTT sample taken with a now_ms that precedes the send
+ * timestamp underflowed to ~4 billion ms and was reported verbatim by
+ * nl_peer_rtt_ms / nl_peer_stats. Discards the sample instead, leaving the
+ * estimator at its previous value. */
+TEST(test_backwards_now_does_not_poison_rtt_estimator) {
+    harness_t ch, sh;
+    nl_connection_t *cc, *sc;
+    make_pair(&ch, &sh, &cc, &sc, 10000, 1000000 /* keepalive way beyond */);
+
+    /* A real forward round trip first, so there IS an estimate to preserve. */
+    ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED,
+                           (const uint8_t *)"a", 1, /*now_ms*/ 1000), NL_OK);
+    ch.now_ms = 1040;
+    ASSERT_EQ(harness_send(&sh, sc, 0, NL_RELIABLE_ORDERED,
+                           (const uint8_t *)"b", 1, /*now_ms*/ 1040), NL_OK);
+
+    nl_connection_stats_t before;
+    nl_connection_get_stats(cc, &before);
+    ASSERT_EQ(before.rtt_ms, 40u);
+
+    /* Now deliver an ack to the client stamped BEFORE its send: the harness
+     * routes inbound packets at peer_harness->now_ms, so wind the client's
+     * clock back to before the send it is acking. */
+    nl_send_slot_t *slot = nl_send_ring_get(
+        &cc->channels[0].lanes[NL_RELIABLE_ORDERED].send_ring, 0);
+    ASSERT_TRUE(slot != NULL);
+    ASSERT_EQ(slot->send_time_ms, 1000u);
+
+    /* Fresh send at a high timestamp, then ack it stamped earlier. */
+    ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED,
+                           (const uint8_t *)"c", 1, /*now_ms*/ 9000), NL_OK);
+    nl_send_slot_t *s1 = nl_send_ring_get(
+        &cc->channels[0].lanes[NL_RELIABLE_ORDERED].send_ring, 1);
+    ASSERT_TRUE(s1 != NULL);
+    ASSERT_EQ(s1->send_time_ms, 9000u);
+
+    /* The server replies, but the client sees it at now_ms = 8000 < 9000. */
+    sh.now_ms = 8000;
+    harness_send(&sh, sc, 0, NL_RELIABLE_ORDERED, (const uint8_t *)"d", 1, 9100);
+
+    /* The estimator must be untouched, not set to a huge value. */
+    nl_connection_stats_t after;
+    nl_connection_get_stats(cc, &after);
+    CHECK_TRUE(after.rtt_ms < 10000u);
+    CHECK_EQ(after.rtt_ms, before.rtt_ms);
+
+    nl_connection_destroy(cc);
+    nl_connection_destroy(sc);
+}
+
+/* ---- documented deferred-queue ordering invariants ----
+ *
+ * connection.h documents two invariants for the priority-sorted deferred
+ * queue: "sorted descending by priority (stable FIFO within a priority)",
+ * and "a continuation head is never displaced by later pushes". Both were
+ * implemented but untested, so a regression in the sort would only show up
+ * as out-of-order delivery under window pressure. */
+
+/* Push a known set, then read the queue back and compare each entry's
+ * payload byte -- which encodes the push order -- against the expected
+ * sequence. Asserting on the priority VALUE instead would be blind to a
+ * FIFO break: a reversed run of equal-priority messages still prints the
+ * same list of priorities, which is exactly the bug this test exists for. */
+static void assert_queue_order(nl_connection_t *conn, const uint8_t *priorities, int n,
+                               const uint8_t *expected_tags, const char *what) {
+    while (conn->deferred_head) {
+        nl_deferred_msg_t *n = conn->deferred_head;
+        conn->deferred_head = n->next;
+        free(n->data);
+        free(n);
+    }
+    conn->deferred_count = 0;
+    conn->deferred_bytes = 0;
+
+    for (int i = 0; i < n; i++) {
+        uint8_t payload[4] = { (uint8_t)(100 + i), 0, 0, 0 }; /* tag = push index */
+        ASSERT_TRUE(deferred_push_for_test(conn, 0, NL_UNRELIABLE, priorities[i],
+                                           payload, sizeof(payload), false, 0, 0));
+    }
+
+    printf("    %s: ", what);
+    for (int i = 0; i < n; i++) {
+        nl_deferred_msg_t *m = conn->deferred_head;
+        ASSERT_TRUE(m != NULL);
+        if (!m) break;
+        uint8_t tag = m->data[0];
+        printf("%u(p%u) ", m->priority, (unsigned)(tag - 100));
+        CHECK_EQ(tag, (uint8_t)(100 + expected_tags[i]));
+        conn->deferred_head = m->next;
+        free(m->data);
+        free(m);
+    }
+    printf("\n");
+    CHECK_TRUE(conn->deferred_head == NULL);
+    /* This helper drains the list by hand rather than via deferred_pop, so
+     * the counters are stale by construction; nl_connection_destroy calls
+     * deferred_free_all, which zeroes them. */
+    CHECK_EQ(conn->deferred_count, (uint32_t)n);
+}
+
+TEST(test_deferred_queue_fifo_stable_within_equal_priority) {
+    nl_connection_t *conn = nl_connection_new_for_test();
+    ASSERT_TRUE(conn != NULL);
+
+    /* All equal priority: strict FIFO, so push order 0..5 in, 0..5 out. */
+    const uint8_t same[6] = { 5, 5, 5, 5, 5, 5 };
+    const uint8_t same_out[6] = { 0, 1, 2, 3, 4, 5 };
+    assert_queue_order(conn, same, 6, same_out, "all equal (FIFO)");
+
+    /* Mixed: descending by priority, and within each priority group the
+     * original push order. Push order was 1,9,3,9,3,0,9 (tags 0..6), so
+     * the 9s keep tags 1,3,6 and the 3s keep tags 2,4. */
+    const uint8_t mixed[7] = { 1, 9, 3, 9, 3, 0, 9 };
+    const uint8_t mixed_out[7] = { 1, 3, 6, 2, 4, 0, 5 };
+    assert_queue_order(conn, mixed, 7, mixed_out, "mixed (stable desc)");
+
+    nl_connection_destroy(conn);
+}
+
+TEST(test_deferred_queue_continuation_head_never_displaced) {
+    nl_connection_t *conn = nl_connection_new_for_test();
+    ASSERT_TRUE(conn != NULL);
+
+    uint8_t payload[4] = { 0, 0, 0, 0 };
+    /* A continuation parks at the head (frag_start > 0). */
+    ASSERT_TRUE(deferred_push_for_test(conn, 0, NL_RELIABLE_ORDERED, NL_PRIORITY_LOW,
+                                       payload, sizeof(payload), true, 3, 77));
+
+    /* Now push a HIGHER priority message. It must queue BEHIND the
+     * continuation: if it went to the head, this message's remaining
+     * fragments would interleave with another message's on the same
+     * RELIABLE_ORDERED lane, breaking the ordering guarantee. */
+    ASSERT_TRUE(deferred_push_for_test(conn, 0, NL_RELIABLE_ORDERED, NL_PRIORITY_HIGH,
+                                       payload, sizeof(payload), false, 0, 0));
+    ASSERT_TRUE(deferred_push_for_test(conn, 0, NL_RELIABLE_ORDERED, NL_PRIORITY_HIGH,
+                                       payload, sizeof(payload), false, 0, 0));
+
+    ASSERT_EQ(conn->deferred_count, 3);
+    nl_deferred_msg_t *head = conn->deferred_head;
+    ASSERT_TRUE(head != NULL);
+    ASSERT_TRUE(head->continuation);
+    ASSERT_EQ(head->frag_start, 3);
+    ASSERT_EQ(head->message_id, 77);
+
+    /* Ordinary priority ordering still applies behind the continuation. */
+    nl_deferred_msg_t *second = head->next;
+    ASSERT_TRUE(second != NULL);
+    ASSERT_FALSE(second->continuation);
+    ASSERT_EQ(second->priority, NL_PRIORITY_HIGH);
+
+    nl_connection_destroy(conn);
+}
+
 int main(void) {
     printf("=== connection tests ===\n");
     RUN_TEST(test_connection_send_and_receive_roundtrip);
@@ -1143,5 +1305,8 @@ int main(void) {
     RUN_TEST(test_burst_loss_at_cwnd_above_ack_window_no_teardown);
     RUN_TEST(test_small_peer_window_does_not_park_large_message);
     RUN_TEST(test_receive_window_charges_full_length);
+    RUN_TEST(test_backwards_now_does_not_poison_rtt_estimator);
+    RUN_TEST(test_deferred_queue_fifo_stable_within_equal_priority);
+    RUN_TEST(test_deferred_queue_continuation_head_never_displaced);
     TEST_SUMMARY();
 }

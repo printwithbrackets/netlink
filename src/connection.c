@@ -172,6 +172,26 @@ static bool deferred_push(nl_connection_t *conn, uint8_t channel, nl_delivery_t 
     return true;
 }
 
+/* Test-only shims exposing the deferred-queue internals to
+ * tests/test_connection.c. The queue's ordering invariants are documented on
+ * nl_deferred_msg_t but are internal state, so they can only be asserted
+ * from a test that links connection.c directly. Not declared in a header:
+ * nothing outside the tests should be using them. */
+nl_connection_t *nl_connection_new_for_test(void) {
+    struct sockaddr_storage addr;
+    memset(&addr, 0, sizeof(addr));
+    uint8_t a[32] = {0}, b[32] = {0};
+    return nl_connection_create(1, &addr, sizeof(addr), true, 4, a, b, a, b,
+                               10000, 1000, 0);
+}
+
+bool deferred_push_for_test(nl_connection_t *conn, uint8_t channel, nl_delivery_t delivery,
+                            uint8_t priority, const uint8_t *data, size_t len,
+                            bool continuation, uint16_t frag_start, uint16_t message_id) {
+    return deferred_push(conn, channel, delivery, priority, data, len,
+                         continuation, frag_start, message_id);
+}
+
 static nl_deferred_msg_t *deferred_pop(nl_connection_t *conn) {
     nl_deferred_msg_t *m = conn->deferred_head;
     if (!m) return NULL;

@@ -486,6 +486,46 @@ TEST(test_fast_retransmit_cooldown_clears_on_ack) {
     nl_send_ring_free(&ring);
 }
 
+/* Regression: an RTT sample computed from a now_ms that went BACKWARDS
+ * underflowed. `now_ms - send_time_ms` on uint64_t with now < send wraps to
+ * ~2^64, and the (uint32_t) truncation lands near 4 billion ms -- which then
+ * feeds srtt and is reported verbatim to the app by nl_peer_rtt_ms().
+ *
+ * now_ms can legitimately appear to go backwards: the caller supplies it
+ * (the harness and the real endpoint both pass a CLOCK_MONOTONIC reading
+ * taken on a different CPU than the one that stamped send_time_ms), and a
+ * wrap of any external clock source does the same thing. A bogus sample
+ * must be discarded, not clamped -- clamping would still poison srtt. */
+TEST(test_rtt_sample_discarded_when_now_goes_backwards) {
+    nl_send_ring_t ring;
+    nl_send_ring_init(&ring);
+    uint8_t payload[] = {0xAA};
+    uint16_t seq;
+    ASSERT_TRUE(nl_send_ring_insert(&ring, payload, 1, /*send_time_ms*/ 5000, &seq));
+
+    /* now_ms = 4000: 500ms "before" the send. Must produce no sample. */
+    bool has_sample = true;
+    uint32_t sample_ms = 12345;
+    nl_send_ring_ack(&ring, seq, 0, /*now_ms*/ 4000, &has_sample, &sample_ms, NULL);
+    ASSERT_FALSE(has_sample);
+    ASSERT_EQ(sample_ms, 12345u); /* left untouched, not written with garbage */
+
+    /* Equal timestamps are not backwards: no elapsed time, but still a
+     * legitimate (zero) sample rather than a discarded one. */
+    nl_send_ring_insert(&ring, payload, 1, 7000, &seq);
+    nl_send_ring_ack(&ring, seq, 0, /*now_ms*/ 7000, &has_sample, &sample_ms, NULL);
+    ASSERT_TRUE(has_sample);
+    ASSERT_EQ(sample_ms, 0u);
+
+    /* And a forward sample still works, so the guard isn't over-broad. */
+    nl_send_ring_insert(&ring, payload, 1, 8000, &seq);
+    nl_send_ring_ack(&ring, seq, 0, /*now_ms*/ 8250, &has_sample, &sample_ms, NULL);
+    ASSERT_TRUE(has_sample);
+    ASSERT_EQ(sample_ms, 250u);
+
+    nl_send_ring_free(&ring);
+}
+
 TEST(test_recv_dedupe_rejects_duplicates) {
     nl_recv_dedupe_t d;
     nl_recv_dedupe_init(&d);
@@ -658,6 +698,7 @@ int main(void) {
     RUN_TEST(test_ack_bitmap_covers_burst_loss_at_full_cwnd);
     RUN_TEST(test_fast_retransmit_fires_once_per_hole);
     RUN_TEST(test_fast_retransmit_cooldown_clears_on_ack);
+    RUN_TEST(test_rtt_sample_discarded_when_now_goes_backwards);
     RUN_TEST(test_recv_dedupe_rejects_duplicates);
     RUN_TEST(test_recv_dedupe_out_of_order_accepted_once);
     RUN_TEST(test_recv_dedupe_too_old_rejected);
