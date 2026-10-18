@@ -6,6 +6,12 @@ void nl_channel_init(nl_channel_t *chan) {
     memset(chan, 0, sizeof(*chan));
 }
 
+void nl_channel_set_reassembly_budget(nl_channel_t *chan, uint32_t byte_budget) {
+    for (int i = 0; i < NL_LANES_PER_CHANNEL; i++) {
+        chan->lanes[i].reassembly_byte_budget = byte_budget;
+    }
+}
+
 void nl_channel_free(nl_channel_t *chan) {
     for (int i = 0; i < NL_LANES_PER_CHANNEL; i++) {
         nl_lane_t *lane = &chan->lanes[i];
@@ -103,7 +109,9 @@ nl_result_t nl_channel_send_range(nl_channel_t *chan, uint64_t now_ms, uint8_t c
             nl_put_u16(lane_payload + lp_len, i); lp_len += 2;
             nl_put_u16(lane_payload + lp_len, frag_count); lp_len += 2;
         }
-        memcpy(lane_payload + lp_len, chunk_ptr, chunk_len);
+        /* chunk_ptr may be NULL for zero-length sends (data==NULL,
+         * len==0): memcpy(NULL, 0) is UB, so guard it. */
+        if (chunk_len > 0) memcpy(lane_payload + lp_len, chunk_ptr, chunk_len);
         lp_len += chunk_len;
 
         uint16_t seq;
@@ -164,7 +172,7 @@ static void deliver_or_reassemble(nl_lane_t *lane, uint64_t now_ms, uint8_t chan
         return;
     }
     if (!lane->reassembly_init) {
-        nl_reassembly_tracker_init(&lane->reassembly);
+        nl_reassembly_tracker_init_budget(&lane->reassembly, lane->reassembly_byte_budget);
         lane->reassembly_init = true;
     }
     const uint8_t *out_data;
@@ -340,7 +348,7 @@ void nl_channel_on_receive(nl_channel_t *chan, uint64_t now_ms,
             lane->seq_frag_max_seq = seq;
         }
         if (!lane->reassembly_init) {
-            nl_reassembly_tracker_init(&lane->reassembly);
+            nl_reassembly_tracker_init_budget(&lane->reassembly, lane->reassembly_byte_budget);
             lane->reassembly_init = true;
         }
         const uint8_t *out_data;

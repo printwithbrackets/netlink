@@ -33,7 +33,7 @@ def wait_for(client_or_server, event_type, timeout=3.0):
 
 
 def test_version_matches_package():
-    assert netlink.__version__ == "1.1.1"
+    assert netlink.__version__ == "1.2.0"
     assert netlink.version() == netlink.__version__
 
 
@@ -81,6 +81,9 @@ def test_config_default_matches_c_defaults():
     # land on distinct nonzero-capable offsets.
     assert cfg.max_send_bytes_per_sec == 0
     assert cfg.recv_window_bytes == 32768
+    # Added with the event-queue byte cap: nonzero, so a mirror that forgot
+    # the field would read a neighboring field's garbage instead of this.
+    assert cfg.event_queue_max_bytes == 4 * 1024 * 1024
 
 
 def test_connect_and_echo():

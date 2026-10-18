@@ -227,7 +227,16 @@ nl_connection_t *nl_connection_create(nl_peer_id_t id, const struct sockaddr_sto
     conn->channel_count = channel_count;
     conn->channels = (nl_channel_t *)calloc(channel_count, sizeof(nl_channel_t));
     if (!conn->channels) { free(conn); return NULL; }
-    for (uint8_t i = 0; i < channel_count; i++) nl_channel_init(&conn->channels[i]);
+    for (uint8_t i = 0; i < channel_count; i++) {
+        nl_channel_init(&conn->channels[i]);
+        /* Bound this connection's attacker-pinnable reassembly memory:
+         * each lane's fragment tracker accepts at most
+         * NL_REASSEMBLY_BYTE_BUDGET_DEFAULT received bytes in flight,
+         * so the connection's worst case is channels x lanes x budget
+         * rather than unbounded. */
+        nl_channel_set_reassembly_budget(&conn->channels[i],
+                                         NL_REASSEMBLY_BYTE_BUDGET_DEFAULT);
+    }
 
     conn->last_recv_time_ms = now_ms;
     conn->last_send_time_ms = now_ms;
@@ -617,19 +626,24 @@ typedef struct {
 static void on_channel_deliver(void *ctx, uint8_t channel_id, nl_delivery_t delivery,
                                 const uint8_t *data, uint32_t len) {
     deliver_ctx_t *d = (deliver_ctx_t *)ctx;
-    d->cb->on_data(d->cb->ctx, d->peer, channel_id, delivery, data, len);
+    bool queued = d->cb->on_data(d->cb->ctx, d->peer, channel_id, delivery, data, len);
     /* Flow control: bytes handed to the event queue occupy local window
      * until nl_poll_event returns them to the app (nl_connection_consume_window).
-     * Called from on_packet with conn->lock already held. */
-    nl_connection_t *conn = d->conn;
-    /* Charge the FULL length, with no clamp to recv_window_size: the release
+     * Called from on_packet with conn->lock already held.
+     * Charge the FULL length, with no clamp to recv_window_size: the release
      * (nl_connection_consume_window) subtracts the full event length too, so
      * clamping the charge while releasing in full frees more than was ever
      * charged and recv_window_used drifts below the real outstanding bytes.
      * The receiver then keeps advertising free window it doesn't have.
      * nl_connection_adv_window() already reports 0 for any used >= size, so
      * an over-count self-limits to "window closed" rather than corrupting the
-     * arithmetic -- unlike a clamp, which corrupts it. */
+     * arithmetic -- unlike a clamp, which corrupts it.
+     *
+     * A false return from on_data means the event never reached the app
+     * (endpoint event-queue byte cap/OOM): skip the charge so the sender's
+     * window is not permanently closed by a payload the receiver dropped. */
+    if (!queued) return;
+    nl_connection_t *conn = d->conn;
     conn->recv_window_used += len;
 }
 
@@ -703,7 +717,11 @@ nl_result_t nl_connection_on_packet(nl_connection_t *conn, uint8_t type,
             if (ct_len < NL_DATA_HEADER_SIZE) { result = NL_ERR_PROTOCOL_MISMATCH; break; }
             uint8_t channel_id = plaintext[0];
             if (channel_id >= conn->channel_count) { result = NL_ERR_CHANNEL_OUT_OF_RANGE; break; }
-            if (plaintext[1] >= NL_LANES_PER_CHANNEL) break; /* malformed delivery: drop */
+            /* Validate delivery before the window update below: a malformed
+             * value must return PROTOCOL_MISMATCH without touching
+             * peer_rwnd (which would otherwise be overwritten with the
+             * zero-initialized out-param). */
+            if (plaintext[1] >= NL_LANES_PER_CHANNEL) { result = NL_ERR_PROTOCOL_MISMATCH; break; }
             retransmit_ctx_t rctx = { conn, cb };
             bool has_rtt_sample = false;
             uint32_t rtt_sample_ms = 0;

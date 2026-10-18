@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 static bool wait_for_event(nl_endpoint_t *ep, nl_event_type_t type, nl_event_t *out, int timeout_ms) {
     uint64_t deadline_iterations = (uint64_t)timeout_ms / 50 + 1;
@@ -1021,6 +1022,613 @@ TEST(test_peer_rtt_ms_and_peer_count) {
     nl_endpoint_destroy(server);
 }
 
+/* Regression (P1-7): an empty nl_connect host must be rejected with
+ * NL_ERR_INVALID_ARGUMENT rather than silently defaulting to 127.0.0.1. */
+TEST(test_connect_empty_host_rejected) {
+    nl_config_t cfg; nl_config_default(&cfg);
+    nl_endpoint_t *client = NULL;
+    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+
+    nl_address_t empty;
+    memset(&empty, 0, sizeof(empty));
+    empty.port = 34732;
+    empty.family = NL_AF_UNSPEC;
+    nl_peer_id_t peer = 0;
+    ASSERT_EQ(nl_connect(client, &empty, &peer), NL_ERR_INVALID_ARGUMENT);
+
+    nl_endpoint_destroy(client);
+}
+
+/* Regression (P1-3): zero-length sends (data==NULL, len==0) must not
+ * pass NULL to memcpy, even with a zero length (UB), and must round-trip
+ * as an empty DATA event. */
+TEST(test_zero_length_send_roundtrips) {
+    nl_config_t cfg; nl_config_default(&cfg);
+    nl_endpoint_t *server = NULL, *client = NULL;
+    nl_address_t bind_addr = addr("127.0.0.1", 34731);
+    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+
+    nl_peer_id_t client_peer;
+    ASSERT_EQ(nl_connect(client, &bind_addr, &client_peer), NL_OK);
+    nl_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 3000));
+    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 3000));
+
+    ASSERT_EQ(nl_send(client, client_peer, 0, NL_RELIABLE_ORDERED, NULL, 0), NL_OK);
+    ASSERT_TRUE(wait_for_event(server, NL_EVENT_DATA, &ev, 3000));
+    ASSERT_EQ(ev.data_len, 0u);
+    /* ev.data is NULL for empty payloads (no allocation); just don't crash. */
+
+    nl_endpoint_destroy(client);
+    nl_endpoint_destroy(server);
+}
+
+/* Test-only visibility into the pending handshake table and the event
+ * queue (defined in endpoint.c, not part of the public ABI). */
+#include "../test_helpers.h"
+
+/* Build a well-formed CONNECT_REQUEST with caller-chosen identity fields. */
+static void build_connect_request(uint8_t *req, uint64_t connid, uint8_t seed) {
+    memset(req, 0, NL_CONNECT_REQUEST_SIZE);
+    req[0] = NL_PKT_CONNECT_REQUEST;
+    nl_put_u32(req + 1, NL_MAGIC);
+    nl_put_u16(req + 5, NL_PROTOCOL_VERSION);
+    req[7] = 4; /* channel_count */
+    nl_put_u64(req + 8, connid);
+    for (int i = 0; i < 32; i++) req[16 + i] = (uint8_t)(i * 7 + seed);  /* client pubkey */
+    for (int i = 0; i < 16; i++) req[48 + i] = (uint8_t)(i * 11 + seed); /* client nonce */
+    nl_put_u32(req + 64, NL_CAP_DEFAULT);
+}
+
+/* Regression: a handshake whose magic or protocol version does not match
+ * must get an explicit CONNECT_DENIED(PROTOCOL_MISMATCH), not silence --
+ * v1 clients rely on the explicit deny to surface a useful error. */
+TEST(test_server_denies_protocol_mismatch) {
+    nl_config_t cfg; nl_config_default(&cfg);
+    nl_endpoint_t *server = NULL;
+    nl_address_t bind_addr = addr("127.0.0.1", 34810);
+    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+
+    int raw = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    ASSERT_TRUE(raw >= 0);
+    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+    setsockopt(raw, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(bind_addr.port);
+    server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    /* Wrong protocol version. */
+    uint8_t req[NL_CONNECT_REQUEST_SIZE];
+    build_connect_request(req, 0xAAAA0001, 1);
+    nl_put_u16(req + 5, NL_PROTOCOL_VERSION + 1);
+    ASSERT_TRUE(sendto(raw, req, sizeof(req), 0,
+                       (struct sockaddr *)&server_addr, sizeof(server_addr)) >= 0);
+    uint8_t resp[256];
+    ssize_t n = recv(raw, resp, sizeof(resp), 0);
+    ASSERT_TRUE(n >= (ssize_t)NL_CONNECT_DENIED_SIZE);
+    ASSERT_EQ(resp[0], NL_PKT_CONNECT_DENIED);
+    ASSERT_EQ(resp[1], NL_DENY_PROTOCOL_MISMATCH);
+
+    /* Wrong magic, right version. */
+    build_connect_request(req, 0xAAAA0002, 2);
+    nl_put_u32(req + 1, NL_MAGIC + 1);
+    ASSERT_TRUE(sendto(raw, req, sizeof(req), 0,
+                       (struct sockaddr *)&server_addr, sizeof(server_addr)) >= 0);
+    n = recv(raw, resp, sizeof(resp), 0);
+    ASSERT_TRUE(n >= (ssize_t)NL_CONNECT_DENIED_SIZE);
+    ASSERT_EQ(resp[0], NL_PKT_CONNECT_DENIED);
+    ASSERT_EQ(resp[1], NL_DENY_PROTOCOL_MISMATCH);
+
+    close(raw);
+    nl_endpoint_destroy(server);
+}
+
+/* The client side of the same contract: a CONNECT_DENIED carrying the
+ * protocol-mismatch reason must surface as NL_EVENT_CONNECT_FAILED with
+ * NL_ERR_PROTOCOL_MISMATCH (not a generic deny), and must consume the
+ * pending handshake entry. */
+TEST(test_client_surfaces_protocol_mismatch_deny) {
+    nl_config_t cfg; nl_config_default(&cfg);
+    nl_endpoint_t *client = NULL;
+    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+
+    /* Fake server: a bound UDP socket that answers the first REQUEST with
+     * a DENIED(PROTOCOL_MISMATCH) and nothing else. */
+    int raw = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    ASSERT_TRUE(raw >= 0);
+    struct sockaddr_in fake;
+    memset(&fake, 0, sizeof(fake));
+    fake.sin_family = AF_INET;
+    fake.sin_port = htons(34811);
+    fake.sin_addr.s_addr = inet_addr("127.0.0.1");
+    ASSERT_EQ(bind(raw, (struct sockaddr *)&fake, sizeof(fake)), 0);
+    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+    setsockopt(raw, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    nl_address_t server_addr = addr("127.0.0.1", 34811);
+    nl_peer_id_t peer = 0;
+    ASSERT_EQ(nl_connect(client, &server_addr, &peer), NL_OK);
+
+    uint8_t req[256];
+    struct sockaddr_storage from; socklen_t from_len = sizeof(from);
+    ssize_t n = recvfrom(raw, req, sizeof(req), 0, (struct sockaddr *)&from, &from_len);
+    ASSERT_TRUE(n >= (ssize_t)NL_CONNECT_REQUEST_SIZE);
+    ASSERT_EQ(req[0], NL_PKT_CONNECT_REQUEST);
+
+    uint8_t denied[NL_CONNECT_DENIED_SIZE] = { NL_PKT_CONNECT_DENIED, NL_DENY_PROTOCOL_MISMATCH };
+    ASSERT_TRUE(sendto(raw, denied, sizeof(denied), 0,
+                       (struct sockaddr *)&from, from_len) >= 0);
+
+    nl_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECT_FAILED, &ev, 3000));
+    ASSERT_EQ(ev.disconnect_reason, NL_ERR_PROTOCOL_MISMATCH);
+    /* The failed handshake must have released its pending slot. */
+    ASSERT_EQ(nl_endpoint_pending_used_for_test(client), 0);
+
+    close(raw);
+    nl_endpoint_destroy(client);
+}
+
+/* Cookie rejection: a CONNECT_RESPONSE whose cookie does not match the
+ * one the server issued must be dropped silently (no connection, no
+ * ACCEPTED), and the server must still complete the handshake when the
+ * honest response arrives -- the bogus one must not burn the pending
+ * entry or poison the cookie comparison. */
+TEST(test_spoofed_connect_response_rejected) {
+    nl_config_t cfg; nl_config_default(&cfg);
+    nl_endpoint_t *server = NULL;
+    nl_address_t bind_addr = addr("127.0.0.1", 34812);
+    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+
+    int raw = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    ASSERT_TRUE(raw >= 0);
+    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+    setsockopt(raw, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(bind_addr.port);
+    server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    uint8_t req[NL_CONNECT_REQUEST_SIZE];
+    build_connect_request(req, 0xBBBB0001, 3);
+    ASSERT_TRUE(sendto(raw, req, sizeof(req), 0,
+                       (struct sockaddr *)&server_addr, sizeof(server_addr)) >= 0);
+
+    uint8_t challenge[256];
+    ssize_t n = recv(raw, challenge, sizeof(challenge), 0);
+    ASSERT_TRUE(n >= (ssize_t)NL_CONNECT_CHALLENGE_SIZE);
+    ASSERT_EQ(challenge[0], NL_PKT_CONNECT_CHALLENGE);
+    /* CHALLENGE: type(1) server_pub(32) server_nonce(16) cookie(16) caps(4). */
+    uint8_t cookie[16];
+    memcpy(cookie, challenge + 1 + 32 + 16, 16);
+
+    /* Spoofed response: right pubkey/nonce echo, corrupted cookie. */
+    uint8_t resp[NL_CONNECT_RESPONSE_SIZE];
+    resp[0] = NL_PKT_CONNECT_RESPONSE;
+    memcpy(resp + 1, cookie, 16);
+    resp[1] ^= 0xFF; /* corrupt the cookie */
+    memcpy(resp + 17, req + 16, 32);  /* client pubkey echo */
+    memcpy(resp + 49, req + 48, 16);  /* client nonce echo */
+    ASSERT_TRUE(sendto(raw, resp, sizeof(resp), 0,
+                       (struct sockaddr *)&server_addr, sizeof(server_addr)) >= 0);
+
+    /* Nothing must come back but CHALLENGE retransmits: no ACCEPTED may
+     * be produced for a response that failed the cookie check. */
+    for (int i = 0; i < 6; i++) {
+        uint8_t buf[256];
+        ssize_t m = recv(raw, buf, sizeof(buf), 0);
+        if (m < 1) break; /* timed out: good, nothing more is coming */
+        ASSERT_FALSE(buf[0] == NL_PKT_CONNECT_ACCEPTED);
+    }
+
+    /* The honest response must still complete the handshake: the spoofed
+     * one must not have released or corrupted the pending entry. */
+    resp[0] = NL_PKT_CONNECT_RESPONSE;
+    memcpy(resp + 1, cookie, 16);
+    ASSERT_TRUE(sendto(raw, resp, sizeof(resp), 0,
+                       (struct sockaddr *)&server_addr, sizeof(server_addr)) >= 0);
+
+    uint8_t accepted[256];
+    n = recv(raw, accepted, sizeof(accepted), 0);
+    ASSERT_TRUE(n >= 1);
+    ASSERT_EQ(accepted[0], NL_PKT_CONNECT_ACCEPTED);
+
+    close(raw);
+    nl_endpoint_destroy(server);
+}
+
+/* Handshake timeout: a server that never answers must produce
+ * NL_EVENT_CONNECT_FAILED with NL_ERR_TIMEOUT once the pending entry
+ * expires (NL_PENDING_TIMEOUT_MS), not hang forever. */
+TEST(test_connect_timeout_when_server_silent) {
+    nl_config_t cfg; nl_config_default(&cfg);
+    nl_endpoint_t *client = NULL;
+    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+
+    /* A black hole: bound, never reads, never replies. */
+    int raw = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    ASSERT_TRUE(raw >= 0);
+    struct sockaddr_in sink;
+    memset(&sink, 0, sizeof(sink));
+    sink.sin_family = AF_INET;
+    sink.sin_port = htons(34813);
+    sink.sin_addr.s_addr = inet_addr("127.0.0.1");
+    ASSERT_EQ(bind(raw, (struct sockaddr *)&sink, sizeof(sink)), 0);
+
+    nl_address_t server_addr = addr("127.0.0.1", 34813);
+    nl_peer_id_t peer = 0;
+    ASSERT_EQ(nl_connect(client, &server_addr, &peer), NL_OK);
+
+    nl_event_t ev;
+    /* NL_PENDING_TIMEOUT_MS is 5000; allow generous margin for scheduler
+     * delay under sanitizers. */
+    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECT_FAILED, &ev, 10000));
+    ASSERT_EQ(ev.disconnect_reason, NL_ERR_TIMEOUT);
+    ASSERT_EQ(nl_endpoint_pending_used_for_test(client), 0);
+
+    close(raw);
+    nl_endpoint_destroy(client);
+}
+
+/* Handshake rate limiting: a flood of CONNECT_REQUESTs must stop being
+ * answered once the per-window budget is spent (silently dropped, no
+ * amplify-on-flood), while still answering the first few. */
+TEST(test_handshake_rate_limited) {
+    nl_config_t cfg; nl_config_default(&cfg);
+    nl_endpoint_t *server = NULL;
+    nl_address_t bind_addr = addr("127.0.0.1", 34814);
+    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+
+    int raw = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    ASSERT_TRUE(raw >= 0);
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 300000 };
+    setsockopt(raw, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(bind_addr.port);
+    server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    /* Well above NL_RATE_LIMIT_MAX_PER_WINDOW (200), all in one window.
+     * Distinct connid/pubkey/nonce per request so each is a fresh
+     * handshake, not a retransmit of one. */
+    const int flood = 300;
+    uint8_t req[NL_CONNECT_REQUEST_SIZE];
+    for (int i = 0; i < flood; i++) {
+        build_connect_request(req, (uint64_t)(0xCC000000u + (uint32_t)i), (uint8_t)(i + 1));
+        ASSERT_TRUE(sendto(raw, req, sizeof(req), 0,
+                           (struct sockaddr *)&server_addr, sizeof(server_addr)) >= 0);
+    }
+
+    /* Count FRESH challenges, not raw datagrams: every live pending entry
+     * retransmits its CHALLENGE every 250ms, so the raw count grows with
+     * time and says nothing about the limiter. A retransmit repeats the
+     * entry's server_nonce verbatim, so counting distinct nonces counts
+     * distinct admitted handshakes. */
+    #define HS_RATE_MAX_NONCES 512
+    uint8_t nonces[HS_RATE_MAX_NONCES][16];
+    int fresh = 0;
+    uint8_t buf[256];
+    for (;;) {
+        ssize_t n = recv(raw, buf, sizeof(buf), 0);
+        if (n < 0) break;
+        if (n >= NL_CONNECT_CHALLENGE_SIZE && buf[0] == NL_PKT_CONNECT_CHALLENGE) {
+            int seen = 0;
+            for (int i = 0; i < fresh; i++) {
+                if (memcmp(nonces[i], buf + 1 + 32, 16) == 0) { seen = 1; break; }
+            }
+            if (!seen && fresh < HS_RATE_MAX_NONCES) {
+                memcpy(nonces[fresh], buf + 1 + 32, 16);
+                fresh++;
+            }
+        }
+    }
+
+    /* Sanity: the limiter must not have swallowed everything. */
+    ASSERT_TRUE(fresh >= 1);
+    /* The flood must not have been fully answered. */
+    ASSERT_TRUE(fresh < flood);
+    /* And must respect the documented per-window cap (plus small slack
+     * for a window boundary race mid-flood, same as the discovery test). */
+    ASSERT_TRUE(fresh <= 210);
+
+    close(raw);
+    nl_endpoint_destroy(server);
+}
+
+/* ---- event-queue byte cap (event_queue_max_bytes) ---- */
+
+/* A hostile peer flooding DATA must not push the endpoint-wide event
+ * queue past the configured cap, since nothing was drained during the
+ * flood and every 64-byte payload was queued or rejected under the cap. */
+#define H1_FLOOD_PORT 34790
+#define H1_MSG_CAP 2048
+#define H1_MSG_LEN 64
+#define H1_FLOOD_BURSTS 12
+#define H1_FLOOD_BURST_SIZE 400
+
+typedef struct {
+    nl_endpoint_t *ep; /* the (never destroyed) client sends from here */
+    nl_peer_id_t peer;
+    atomic_bool stop;
+} h1_flood_ctx_t;
+
+static void *h1_flood_main(void *arg) {
+    h1_flood_ctx_t *c = (h1_flood_ctx_t *)arg;
+    uint8_t payload[H1_MSG_LEN];
+    memset(payload, 0xB7, sizeof(payload));
+    for (int burst = 0; burst < H1_FLOOD_BURSTS && !atomic_load(&c->stop); burst++) {
+        for (int i = 0; i < H1_FLOOD_BURST_SIZE && !atomic_load(&c->stop); i++) {
+            if (nl_send(c->ep, c->peer, 0, NL_UNRELIABLE, payload, sizeof(payload)) != NL_OK) {
+                break; /* window/queue closed: continue to the next burst */
+            }
+        }
+        usleep(10 * 1000);
+    }
+    return NULL;
+}
+
+TEST(test_event_queue_cap_bounds_hostile_flood) {
+    nl_config_t cfg; nl_config_default(&cfg);
+    cfg.event_queue_max_bytes = H1_MSG_CAP;
+    nl_endpoint_t *server = NULL, *client = NULL;
+    nl_address_t bind_addr = addr("127.0.0.1", H1_FLOOD_PORT);
+    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+
+    nl_peer_id_t client_peer;
+    ASSERT_EQ(nl_connect(client, &bind_addr, &client_peer), NL_OK);
+    nl_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 5000));
+    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 5000));
+
+    /* The queue must have grown while floored, but the total is the
+     * invariant: at flood end the queue holds at least a burst's worth
+     * (proving the flood actually landed and testing that rejection
+     * starts working), and never more than the cap. */
+    h1_flood_ctx_t fc;
+    memset(&fc, 0, sizeof(fc));
+    fc.ep = client;
+    fc.peer = client_peer;
+    atomic_init(&fc.stop, false);
+    pthread_t flood;
+    ASSERT_EQ(pthread_create(&flood, NULL, h1_flood_main, &fc), 0);
+    pthread_join(flood, NULL);
+
+    size_t bytes = nl_endpoint_event_queue_bytes_for_test(server);
+    printf("    queue bytes after flood: %zu of cap %d\n", bytes, H1_MSG_CAP);
+    ASSERT_TRUE(bytes > 0);
+    ASSERT_TRUE(bytes <= (size_t)H1_MSG_CAP);
+
+    /* Draining opens room again: stop the flooder, poll the queue empty,
+     * and confirm the cap did not wedge the queue (bytes return to ~0).
+     * Whether ordinary traffic still flows with a small cap is covered by
+     * test_event_queue_cap_legit_traffic_flows; a post-flood send from
+     * THIS connection is out of scope here, because a one-way unreliable
+     * flood legitimately leaves the sender parked in its own stale-window
+     * deferred queue until the peer sends, which is a behavior of the
+     * window protocol, not of the event cap. */
+    for (int i = 0; i < 400; i++) {
+        nl_event_t ev2;
+        if (!nl_poll_event(server, &ev2, 20)) break;
+    }
+    usleep(100 * 1000);
+    for (int i = 0; i < 100; i++) {
+        nl_event_t ev2;
+        if (!nl_poll_event(server, &ev2, 20)) break;
+    }
+    ASSERT_TRUE(nl_endpoint_event_queue_bytes_for_test(server) < (size_t)H1_MSG_LEN);
+
+    nl_endpoint_destroy(client);
+    nl_endpoint_destroy(server);
+}
+
+/* A small cap must not break ordinary draining traffic either: with the
+ * cap far below what one message burst would occupy, a regular
+ * request/response still round-trips (events are consumed as fast as
+ * they are produced). */
+TEST(test_event_queue_cap_legit_traffic_flows) {
+    nl_config_t cfg; nl_config_default(&cfg);
+    cfg.event_queue_max_bytes = H1_MSG_CAP;
+    nl_endpoint_t *server = NULL, *client = NULL;
+    nl_address_t bind_addr = addr("127.0.0.1", H1_FLOOD_PORT + 1);
+    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+
+    nl_peer_id_t client_peer;
+    ASSERT_EQ(nl_connect(client, &bind_addr, &client_peer), NL_OK);
+    nl_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 5000));
+    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 5000));
+    nl_peer_id_t server_peer = ev.peer;
+
+    for (int i = 0; i < 20; i++) {
+        const char request[32] = { 0 }; /* content just needs to round-trip */
+        ASSERT_EQ(nl_send(client, client_peer, 0, NL_RELIABLE_ORDERED,
+                          (const uint8_t *)request, sizeof(request)), NL_OK);
+        ASSERT_TRUE(wait_for_event(server, NL_EVENT_DATA, &ev, 5000));
+        ASSERT_EQ(ev.data_len, sizeof(request));
+        ASSERT_EQ(nl_send(server, server_peer, 0, NL_RELIABLE_ORDERED,
+                          (const uint8_t *)request, sizeof(request)), NL_OK);
+        ASSERT_TRUE(wait_for_event(client, NL_EVENT_DATA, &ev, 5000));
+        ASSERT_EQ(ev.data_len, sizeof(request));
+    }
+
+    nl_endpoint_destroy(client);
+    nl_endpoint_destroy(server);
+}
+
+/* ---- server-side channel clamp (H2) ---- */
+#define H2_CLUSTER_PORT 34972
+
+/* The server must clamp the negotiated channel count down to ITS config,
+ * regardless of what the client requests: a client can ask for the 32
+ * (NL_MAX_CHANNELS) and the server with fewer configured channels must
+ * serve fewer per-connection buffers, not attacker-inflated ones. */
+TEST(test_server_clamps_negotiated_channel_count) {
+    nl_config_t server_cfg; nl_config_default(&server_cfg);
+    server_cfg.channel_count = 2;          /* server's own max */
+    nl_config_t client_cfg; nl_config_default(&client_cfg);
+    client_cfg.channel_count = NL_MAX_CHANNELS; /* client asks for max */
+
+    nl_address_t bind_addr = addr("127.0.0.1", H2_CLUSTER_PORT);
+    nl_event_t ev;
+    nl_endpoint_t *server = NULL, *client = NULL;
+    ASSERT_EQ(nl_server_create(&bind_addr, &server_cfg, &server), NL_OK);
+    ASSERT_EQ(nl_client_create(&client_cfg, &client), NL_OK);
+    nl_peer_id_t client_peer;
+    ASSERT_EQ(nl_connect(client, &bind_addr, &client_peer), NL_OK);
+    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 5000));
+    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 5000));
+    nl_peer_id_t server_peer = ev.peer;
+
+    /* Channel 1 (inside the server's clamp): normal operation. */
+    const char *in_clamp = "within";
+    ASSERT_EQ(nl_send(client, client_peer, 1, NL_UNRELIABLE,
+                      (const uint8_t *)in_clamp, strlen(in_clamp)), NL_OK);
+    ASSERT_TRUE(wait_for_event(server, NL_EVENT_DATA, &ev, 5000));
+    ASSERT_EQ(ev.channel, 1);
+    ASSERT_MEM_EQ(ev.data, in_clamp, strlen(in_clamp));
+
+    /* Channel 3 (outside the server's clamp of 2, but legal for the
+     * client's negotiated request of 32): the server-side connection was
+     * built with the clamped count and must not have buffers for it. */
+    const char *out_of_clamp = "beyond";
+    ASSERT_EQ(nl_send(client, client_peer, 3, NL_UNRELIABLE,
+                      (const uint8_t *)out_of_clamp, strlen(out_of_clamp)), NL_OK);
+    /* Drain briefly and confirm nothing for channel 3 ever lands. */
+    for (int i = 0; i < 30; i++) {
+        if (!nl_poll_event(server, &ev, 20)) continue;
+        ASSERT_TRUE(ev.event_type != NL_EVENT_DATA || ev.channel < 2);
+    }
+    /* No late event: after the drain window, poll once more to confirm
+     * the queue is empty. */
+    ASSERT_TRUE(!nl_poll_event(server, &ev, 500));
+
+    /* Reverse direction on channel 1 still works from the (clamped)
+     * server, proving the connection stayed healthy. */
+    ASSERT_EQ(nl_send(server, server_peer, 1, NL_UNRELIABLE,
+                      (const uint8_t *)in_clamp, strlen(in_clamp)), NL_OK);
+    ASSERT_TRUE(wait_for_event(client, NL_EVENT_DATA, &ev, 5000));
+    ASSERT_EQ(ev.channel, 1);
+
+    nl_endpoint_destroy(client);
+    nl_endpoint_destroy(server);
+}
+
+/* Pending-table pressure must not steal a live handshake's slot: M1 (the
+ * eviction-preference fix in acquire_pending_slot_locked). A legit client
+ * that keeps retransmitting its REQUEST (so the server marks its pending
+ * entry progressed) must survive a full-table fake-REQUEST flood, while
+ * fake one-shot entries remain evictable so the table stays available.
+ * Before the fix, plain created_ms LRU evicted exactly the pre-flood
+ * handshake. */
+TEST(test_pending_eviction_protects_live_handshake) {
+    nl_config_t cfg; nl_config_default(&cfg);
+    nl_endpoint_t *server = NULL;
+    nl_address_t bind_addr = addr("127.0.0.1", 34974);
+    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(bind_addr.port);
+    server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    /* Live handshake: send the REQUEST, then again immediately (the
+     * existing-entry path marks the reply refreshed in the server's
+     * pending table). */
+    int raw_a = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    ASSERT_TRUE(raw_a >= 0);
+    struct timeval tv_a = { .tv_sec = 0, .tv_usec = 150000 };
+    setsockopt(raw_a, SOL_SOCKET, SO_RCVTIMEO, &tv_a, sizeof(tv_a));
+    uint8_t req_a[NL_CONNECT_REQUEST_SIZE];
+    build_connect_request(req_a, 0x1A2B0001ULL, 200);
+    for (int k = 0; k < 2; k++) {
+        ASSERT_TRUE(sendto(raw_a, req_a, sizeof(req_a), 0,
+                           (struct sockaddr *)&server_addr, sizeof(server_addr)) >= 0);
+    }
+    uint8_t nonce_a[16] = {0};
+    int got_a = 0;
+    for (int k = 0; k < 2 && got_a < 1; k++) {
+        uint8_t buf[256];
+        ssize_t n = recv(raw_a, buf, sizeof(buf), 0);
+        if (n >= NL_CONNECT_CHALLENGE_SIZE && buf[0] == NL_PKT_CONNECT_CHALLENGE) {
+            memcpy(nonce_a, buf + 1 + 32, 16);
+            got_a = 1;
+        }
+    }
+    ASSERT_TRUE(got_a); /* the live handshake must be set up */
+
+    /* Flood: 128 distinct fake identities, ONE REQUEST each (never
+     * followed up). Together with the refreshed live handshake that
+     * overfills the 128-slot pending table, so the very next acquire has
+     * to evict someone: with plain created_ms LRU the victim is the
+     * pre-flood live handshake; with the fix the victim is the oldest
+     * fake (no fake ever refreshes). All within one 200-request rate
+     * window (130 datagrams used). */
+    int flood_raw = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    ASSERT_TRUE(flood_raw >= 0);
+    uint8_t req_f[NL_CONNECT_REQUEST_SIZE];
+    for (int i = 0; i < 128; i++) {
+        build_connect_request(req_f, 0xFFF00000ULL + (uint64_t)i, (uint8_t)(i + 1));
+        ASSERT_TRUE(sendto(flood_raw, req_f, sizeof(req_f), 0,
+                           (struct sockaddr *)&server_addr, sizeof(server_addr)) >= 0);
+    }
+    /* Give the IO thread a chance to consume the burst and evict (and,
+     * with the old code, grab the live handshake's slot). Also let the
+     * rate-limit window roll over so the post-flood client below is not
+     * silently dropped by the flood's budget. */
+    usleep(1100 * 1000);
+
+    /* A third, genuinely new client must still get in: the eviction
+     * preference falls on stale fake entries, not on "deny the world". */
+    int raw_f = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    ASSERT_TRUE(raw_f >= 0);
+    struct timeval tval_f = { .tv_sec = 2, .tv_usec = 0 };
+    setsockopt(raw_f, SOL_SOCKET, SO_RCVTIMEO, &tval_f, sizeof(tval_f));
+    uint8_t req_c[NL_CONNECT_REQUEST_SIZE];
+    build_connect_request(req_c, 0x2CEF0001ULL, 77);
+    ASSERT_TRUE(sendto(raw_f, req_c, sizeof(req_c), 0,
+                       (struct sockaddr *)&server_addr, sizeof(server_addr)) >= 0);
+    uint8_t cbuf[256];
+    ssize_t cn = recv(raw_f, cbuf, sizeof(cbuf), 0);
+    ASSERT_TRUE(cn >= NL_CONNECT_CHALLENGE_SIZE);
+    ASSERT_EQ(cbuf[0], NL_PKT_CONNECT_CHALLENGE);
+
+    /* The punchline: the live handshake's CHALLENGE keeps being
+     * retransmitted (server_nonce unchanged) through the flood -- with
+     * the old eviction the pre-flood entry was the LRU victim and died
+     * here. Watch for >1 extra challenge arriving (the server's retry
+     * cadence is 250ms; 1.6s spans >4 rounds). */
+    struct timespec t_start; clock_gettime(CLOCK_MONOTONIC, &t_start);
+    uint64_t deadline = (uint64_t)t_start.tv_sec * 1000000000ULL + (uint64_t)t_start.tv_nsec + 1600000000ULL;
+    int a_retx = 0;
+    for (;;) {
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        if ((uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec > deadline) break;
+        uint8_t abuf[256];
+        ssize_t n = recv(raw_a, abuf, sizeof(abuf), 0);
+        if (n >= NL_CONNECT_CHALLENGE_SIZE && abuf[0] == NL_PKT_CONNECT_CHALLENGE &&
+            memcmp(abuf + 1 + 32, nonce_a, 16) == 0) {
+            a_retx++;
+        }
+    }
+    CHECK_TRUE(a_retx >= 2);
+
+    close(raw_a);
+    close(flood_raw);
+    close(raw_f);
+    nl_endpoint_destroy(server);
+}
+
 int main(void) {
     printf("=== integration tests (real UDP sockets) ===\n");
     RUN_TEST(test_server_challenge_retransmit_roundtrips_at_full_length);
@@ -1048,5 +1656,16 @@ int main(void) {
     RUN_TEST(test_duplicate_connect_same_address_rejected);
     RUN_TEST(test_max_connections_clamped_to_internal_cap);
     RUN_TEST(test_server_name_copied_at_create_time);
+    RUN_TEST(test_zero_length_send_roundtrips);
+    RUN_TEST(test_connect_empty_host_rejected);
+    RUN_TEST(test_server_denies_protocol_mismatch);
+    RUN_TEST(test_client_surfaces_protocol_mismatch_deny);
+    RUN_TEST(test_spoofed_connect_response_rejected);
+    RUN_TEST(test_connect_timeout_when_server_silent);
+    RUN_TEST(test_handshake_rate_limited);
+    RUN_TEST(test_pending_eviction_protects_live_handshake);
+    RUN_TEST(test_event_queue_cap_bounds_hostile_flood);
+    RUN_TEST(test_event_queue_cap_legit_traffic_flows);
+    RUN_TEST(test_server_clamps_negotiated_channel_count);
     TEST_SUMMARY();
 }

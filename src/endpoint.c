@@ -54,6 +54,13 @@
 #define NL_RATE_LIMIT_WINDOW_MS 1000
 #define NL_RATE_LIMIT_MAX_PER_WINDOW 200
 #define NL_IO_POLL_INTERVAL_MS 50
+/* WebSocket link lifetimes: a connecting link gets NL_WS_CONNECT_TIMEOUT_
+ * MS to finish TCP + HTTP upgrade + the NL handshake; after that any
+ * link that has not moved a byte for NL_WS_IDLE_TIMEOUT_MS is closed.
+ * Lives are enforced by the IO thread's reap sweep (ws_reap_links); see
+ * also the last_activity_ms notes on ws_link_t. */
+#define NL_WS_CONNECT_TIMEOUT_MS 10000
+#define NL_WS_IDLE_TIMEOUT_MS 60000
 /* Handshake retransmit cadence. UDP is lossy; a single lost REQUEST,
  * CHALLENGE, or RESPONSE would otherwise stall connect until the pending
  * timeout. Matches NL_HANDSHAKE_RETRY_MS in connection.c for ACCEPTED. */
@@ -78,6 +85,14 @@ typedef struct ws_link {
     char client_key[25];      /* Sec-WebSocket-Key we sent (client only) */
     nl_ws_decoder_t decoder;
     uint64_t created_ms;
+    /* Read-side activity marker for the IO thread's reap sweep: bumped
+     * whenever this link moved bytes (TCP data in, upgrade request out).
+     * Without it, a peer that stalls at any pre-NL stage (TCP connected
+     * but no HTTP request, HTTP sent but no 101, no NL handshake after
+     * the 101) holds its socket/file descriptor and decoder memory for
+     * as long as the TCP connection itself lives. Written only by the IO
+     * thread, read by the IO thread's reap sweep: no locks involved. */
+    uint64_t last_activity_ms;
 } ws_link_t;
 
 /* ---- address helpers ---- */
@@ -142,7 +157,11 @@ static bool resolve_address(const nl_address_t *addr, bool passive, int socktype
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%u", addr->port);
 
-    const char *host = addr->host[0] ? addr->host : (passive ? NULL : "127.0.0.1");
+    /* Empty host: valid for a server bind (NULL = any address), but never
+     * for a client dial -- silently defaulting to 127.0.0.1 hid caller
+     * bugs. Reject instead. */
+    if (!passive && addr->host[0] == '\0') return false;
+    const char *host = addr->host[0] ? addr->host : NULL;
 
     struct addrinfo *res = NULL;
     int rc = getaddrinfo(host, port_str, &hints, &res);
@@ -187,6 +206,13 @@ typedef struct {
     uint8_t retry_packet[NL_CONNECT_MAX_PACKET_SIZE];
     uint16_t retry_packet_len;
     uint64_t last_retry_ms;
+    /* True once the entry's peer RE-SENT its REQUEST and the server
+     * refreshed the challenge in the existing-entry path. Never set by
+     * the server's own challenge-retransmit loop (that touches
+     * last_retry_ms too), so it marks the handshake as live and shields
+     * it from flood-pressure eviction: see acquire_pending_slot_locked.
+     * memset-zeroed by release, false for fresh entries. */
+    bool req_refreshed;
 } pending_t;
 
 static uint64_t now_ms(void) {
@@ -245,11 +271,24 @@ struct nl_endpoint {
     event_node_t *queue_head, *queue_tail;
     pthread_mutex_t queue_lock;
     pthread_cond_t queue_cond;
+    /* Set by nl_endpoint_destroy (under queue_lock) to wake threads blocked
+     * in nl_poll_event: wait loops check it alongside queue_head so a
+     * destroy never leaves a waiter blocked forever, and never destroys
+     * queue_cond underneath a waiter (destroy waits for active_pollers to
+     * drain before freeing). */
+    bool shutdown;
+    int active_pollers; /* threads currently inside nl_poll_event, guarded by queue_lock */
     /* Payloads currently borrowed by the application via nl_poll_event,
      * one per polling thread (see borrow_node_t). Each entry also carries
      * the metadata needed to release that payload's receive-window charge
      * when the borrow ends -- flow control's "app consumed" signal. */
     borrow_node_t *borrows;
+    /* Total payload bytes of queued, undispatched events, and the cap on
+     * them (nl_config_t.event_queue_max_bytes resolved: 0 -> the library
+     * default). Both guarded by queue_lock; released events account in
+     * push_event/nl_poll_event. */
+    uint64_t event_queue_bytes;
+    uint32_t event_queue_cap;
 
     /* TCP listen socket for NL_TRANSPORT_WEBSOCKET servers (NL_INVALID_
      * SOCKET when using UDP or on clients). */
@@ -297,24 +336,50 @@ static void release_pending_by_connid(nl_endpoint_t *ep, nl_peer_id_t connid, pe
 
 /* ---- event queue push/pop ---- */
 
-static void push_event(nl_endpoint_t *ep, nl_event_t ev, const uint8_t *data, uint32_t len) {
+/* Queue one event. Returns TRUE if the event was queued and may be
+ * charged for by the connection's receive-window accounting; FALSE if it
+ * was not handed to the application (payload allocation failed, or the
+ * endpoint-wide event_queue_max_bytes cap was hit -- see NL_EVENT_QUEUE_
+ * UNLIMITED in netlink.h).
+ *
+ * The event_queue_bytes total and the cap live in the endpoint, both
+ * guarded by queue_lock. Nothing is charged/byte-counted for an event that
+ * is refused, so the endpoint rejects the NEW event rather than dropping
+ * already-queued ones: queued events must never silently vanish (a
+ * CONNECTED/DISCONNECTED that did), and refusing the new event instead
+ * lets nl_connection_on_packet keep its receive-window charge un-added
+ * (via on_channel_deliver) so the sender's window self-limits.
+ *
+ * Callers may hold connections_lock (the DATA path runs under it), so
+ * this never takes connections_lock itself. */
+static bool push_event(nl_endpoint_t *ep, nl_event_t ev, const uint8_t *data, uint32_t len) {
     event_node_t *node = (event_node_t *)calloc(1, sizeof(event_node_t));
-    if (!node) return; /* OOM: drop the event rather than crash */
+    if (!node) return false; /* OOM: drop the event rather than crash */
     node->pub = ev;
     node->pub.data = NULL;
     node->pub.data_len = 0;
     if (len > 0 && data) {
         node->payload = (uint8_t *)malloc(len);
-        if (!node->payload) { free(node); return; }
+        if (!node->payload) { free(node); return false; }
         memcpy(node->payload, data, len);
         node->payload_len = len;
     }
     pthread_mutex_lock(&ep->queue_lock);
+    if (ep->event_queue_cap != NL_EVENT_QUEUE_UNLIMITED &&
+        ep->event_queue_bytes + (uint64_t)len > (uint64_t)ep->event_queue_cap) {
+        /* Refuse the new event instead of dropping queued ones. */
+        pthread_mutex_unlock(&ep->queue_lock);
+        free(node->payload);
+        free(node);
+        return false;
+    }
     node->next = NULL;
     if (ep->queue_tail) ep->queue_tail->next = node; else ep->queue_head = node;
     ep->queue_tail = node;
+    ep->event_queue_bytes += (uint64_t)len;
     pthread_cond_signal(&ep->queue_cond);
     pthread_mutex_unlock(&ep->queue_lock);
+    return true;
 }
 
 /* ---- connection table helpers (caller must hold connections_lock) ---- */
@@ -404,6 +469,37 @@ static void ws_close_link(nl_endpoint_t *ep, ws_link_t *target) {
         }
     }
     pthread_mutex_unlock(&ep->ws_links_lock);
+}
+
+static void ws_link_drop_peer_state(nl_endpoint_t *ep, const struct sockaddr_storage *addr);
+
+/* Close WebSocket links past their timeouts (NL_WS_CONNECT_TIMEOUT_MS
+ * while connecting, NL_WS_IDLE_TIMEOUT_MS otherwise). IO thread only:
+ * pointers are validated as live-list members under the lock and are
+ * never freed by anyone else (ws_drain_dead is our job), so closing them
+ * after unlock is safe -- a concurrent ws_close_link by a user thread
+ * just becomes a no-op found=false. */
+static void ws_reap_links(nl_endpoint_t *ep, uint64_t now) {
+    ws_link_t *victims[NL_WS_LINK_MAX];
+    int n_victims = 0;
+
+    pthread_mutex_lock(&ep->ws_links_lock);
+    for (ws_link_t *l = ep->ws_links; l; l = l->next) {
+        uint64_t idle = now - l->last_activity_ms;
+        bool overdue = (now - l->created_ms > NL_WS_CONNECT_TIMEOUT_MS &&
+                        !l->upgraded) ||
+                       idle > NL_WS_IDLE_TIMEOUT_MS;
+        if (overdue && n_victims < NL_WS_LINK_MAX) victims[n_victims++] = l;
+    }
+    pthread_mutex_unlock(&ep->ws_links_lock);
+
+    for (int i = 0; i < n_victims; i++) {
+        struct sockaddr_storage a = victims[i]->addr;
+        ws_close_link(ep, victims[i]);
+        /* Tear down NL state for this peer (if any). Safe: we hold no
+         * connections or pending locks. */
+        ws_link_drop_peer_state(ep, &a);
+    }
 }
 
 /* Free every dead link. IO thread calls this at the end of each cycle;
@@ -551,7 +647,7 @@ static void ep_send_wire(void *ctx, nl_peer_id_t peer, const uint8_t *packet, si
     ep_send_nl(c->ep, &c->conn->addr, c->conn->addr_len, packet, len);
 }
 
-static void ep_on_data(void *ctx, nl_peer_id_t peer, uint8_t channel, nl_delivery_t delivery,
+static bool ep_on_data(void *ctx, nl_peer_id_t peer, uint8_t channel, nl_delivery_t delivery,
                         const uint8_t *data, uint32_t len) {
     (void)delivery;
     conn_ctx_t *c = (conn_ctx_t *)ctx;
@@ -559,7 +655,9 @@ static void ep_on_data(void *ctx, nl_peer_id_t peer, uint8_t channel, nl_deliver
     ev.event_type = NL_EVENT_DATA;
     ev.peer = peer;
     ev.channel = channel;
-    push_event(c->ep, ev, data, len);
+    /* False means the endpoint's event cap refused the event: on_channel_
+     * deliver then keeps the rejector's receive-window charge un-added. */
+    return push_event(c->ep, ev, data, len);
 }
 
 /* Called while connections_lock is ALREADY held (see file header). Must
@@ -620,15 +718,27 @@ static pending_t *acquire_pending_slot_locked(nl_endpoint_t *ep, uint64_t now) {
     for (int i = 0; i < NL_MAX_PENDING; i++) {
         if (!ep->pending[i].in_use) return &ep->pending[i];
     }
-    /* Table full: evict the oldest rather than reject outright, bounding
-     * memory/state under a handshake flood while staying available. */
-    int oldest = 0;
-    for (int i = 1; i < NL_MAX_PENDING; i++) {
-        if (ep->pending[i].created_ms < ep->pending[oldest].created_ms) oldest = i;
+    /* Table full: evict the oldest entry that has NEVER been progressed
+     * (req_refreshed false). A live handshake is refreshed the moment its
+     * peer retransmits the REQUEST (existing-entry path in
+     * handle_connect_request, at most NL_HANDSHAKE_RETRY_MS in the
+     * making), so a never-refreshed entry is almost certainly a one-shot
+     * flood packet whose "client" never followed up. Plain created_ms LRU
+     * here would instead pick the entry built BEFORE the flood -- a
+     * live, retx-armed handshake -- and 200 fake REQUESTs/s turned the
+     * whole table over every ~0.6s, starving legit handshakes even with
+     * HMAC cookies. If EVERY entry is progressed (all live, or a
+     * retx-consistent attacker), deny the new request via NULL rather
+     * than steal a slot that may be mid-RESPONSE. */
+    int victim = -1;
+    for (int i = 0; i < NL_MAX_PENDING; i++) {
+        if (ep->pending[i].req_refreshed) continue;
+        if (victim < 0 || ep->pending[i].created_ms < ep->pending[victim].created_ms) victim = i;
     }
-    release_pending_locked(&ep->pending[oldest]);
+    if (victim < 0) return NULL;
+    release_pending_locked(&ep->pending[victim]);
     (void)now;
-    return &ep->pending[oldest];
+    return &ep->pending[victim];
 }
 
 static pending_t *find_pending_by_addr_locked(nl_endpoint_t *ep, const struct sockaddr_storage *addr,
@@ -670,6 +780,44 @@ static void release_pending_by_connid(nl_endpoint_t *ep, nl_peer_id_t connid, pe
         }
     }
     pthread_mutex_unlock(&ep->pending_lock);
+}
+
+/* Test-only (declared in tests/test_helpers.h): number of in-use pending
+ * handshake slots. Lets regression tests assert a failed connect doesn't
+ * leak its entry. Also not ABI: exported only so tests can read endpoint
+ * internals. */
+int nl_endpoint_pending_used_for_test(nl_endpoint_t *ep) {
+    if (!ep) return 0;
+    int n = 0;
+    pthread_mutex_lock(&ep->pending_lock);
+    for (int i = 0; i < NL_MAX_PENDING; i++) if (ep->pending[i].in_use) n++;
+    pthread_mutex_unlock(&ep->pending_lock);
+    return n;
+}
+
+/* Test-only (declared in tests/test_helpers.h): total payload bytes
+ * currently queued endpoint-wide (the event-level cap target). Not ABI:
+ * exported only so tests can assert the event_queue_max_bytes invariant
+ * and that legit traffic still fits. */
+size_t nl_endpoint_event_queue_bytes_for_test(nl_endpoint_t *ep) {
+    if (!ep) return 0;
+    pthread_mutex_lock(&ep->queue_lock);
+    size_t n = (size_t)ep->event_queue_bytes;
+    pthread_mutex_unlock(&ep->queue_lock);
+    return n;
+}
+
+/* Test-only (declared in tests/test_helpers.h): number of currently live
+ * WebSocket links on either side. Lets regression tests assert the link
+ * reap sweep actually closes pre-upgrade links (M2). Not ABI: exported
+ * only so tests can read endpoint internals. */
+int nl_endpoint_ws_links_used_for_test(nl_endpoint_t *ep) {
+    if (!ep) return 0;
+    int n = 0;
+    pthread_mutex_lock(&ep->ws_links_lock);
+    for (ws_link_t *l = ep->ws_links; l; l = l->next) n++;
+    pthread_mutex_unlock(&ep->ws_links_lock);
+    return n;
 }
 
 static void expire_pending(nl_endpoint_t *ep, uint64_t now) {
@@ -854,9 +1002,21 @@ static void handle_connect_request(nl_endpoint_t *ep, const uint8_t *buf, size_t
         return;
     }
 
+    /* Negotiate the channel count down to what THIS server was configured
+     * to serve: a client can ask for up to NL_MAX_CHANNELS (32), and
+     * honoring it would multiply this connection's per-channel buffers
+     * (channels x lanes x reassembly slots) at attacker-controlled cost,
+     * unrelated to the server's own configured limit. Clamping to
+     * max(client request, server config) mirrors how the handshake
+     * negotiates capability bits (AND of both) and max_connections
+     * (server-truth): the peer's request never raises server-side limits.
+     * The client still allocates its own requested count for its side;
+     * DATA on a channel the server did not negotiate is dropped by the
+     * receiver's channel-bounds check. */
     uint8_t channel_count = req_channels;
-    if (channel_count == 0 || channel_count > NL_MAX_CHANNELS) {
-        channel_count = ep->config.channel_count ? ep->config.channel_count : 4;
+    if (channel_count == 0 || channel_count > NL_MAX_CHANNELS ||
+        channel_count > ep->config.channel_count) {
+        channel_count = ep->config.channel_count;
     }
 
     pthread_mutex_lock(&ep->pending_lock);
@@ -874,12 +1034,22 @@ static void handle_connect_request(nl_endpoint_t *ep, const uint8_t *buf, size_t
         struct sockaddr_storage faddr = *from;
         socklen_t flen = from_len;
         existing->last_retry_ms = now;
+        existing->req_refreshed = true;
         pthread_mutex_unlock(&ep->pending_lock);
         ep_send_nl(ep, &faddr, flen, copy, clen);
         return;
     }
 
     pending_t *p = acquire_pending_slot_locked(ep, now);
+    if (!p) {
+        /* Table full of too-young entries (eviction refused, see
+         * acquire_pending_slot_locked). Deny explicitly rather than
+         * silently dropping: clients learn the truth immediately, and the
+         * rate limiter above bounds the reply volume. */
+        pthread_mutex_unlock(&ep->pending_lock);
+        send_denied(ep, from, from_len, NL_DENY_SERVER_FULL);
+        return;
+    }
     p->my_keypair = nl_keypair_generate();
     if (!p->my_keypair) { memset(p, 0, sizeof(*p)); pthread_mutex_unlock(&ep->pending_lock); return; }
     p->in_use = true;
@@ -1328,9 +1498,20 @@ static bool ws_handle_message(nl_endpoint_t *ep, ws_link_t *link, uint8_t opcode
 /* After TCP is readable on a WS link: complete HTTP upgrade if needed,
  * then decode frames and dispatch NL packets. Returns false if the link
  * should be closed. */
+/* Max 2KB recv chunks one link may cost the IO thread per ready cycle.
+ * The recv loop below otherwise drains the socket until EAGAIN, so a
+ * peer that feeds its TCP connection as fast as we can decrypt would
+ * monopolize the single IO thread and starve every other link and the
+ * UDP socket for as long as it keeps sending. poll() is level-triggered,
+ * so anything the peer sent beyond the cap is still picked up next
+ * cycle. */
+#define NL_WS_READ_CHUNKS_PER_CYCLE 32
+
 static bool ws_read_link(nl_endpoint_t *ep, ws_link_t *link, uint64_t now) {
     uint8_t chunk[NL_WS_RECV_CHUNK];
+    int chunks = 0;
     for (;;) {
+        if (++chunks > NL_WS_READ_CHUNKS_PER_CYCLE) break; /* resumed next poll cycle */
         ssize_t n = recv(link->sock, chunk, sizeof(chunk), 0);
         if (n == 0) return false; /* orderly shutdown */
         if (n < 0) {
@@ -1338,6 +1519,7 @@ static bool ws_read_link(nl_endpoint_t *ep, ws_link_t *link, uint64_t now) {
             if (e == EAGAIN || e == EWOULDBLOCK) return true;
             return false;
         }
+        link->last_activity_ms = now;
 
         if (!link->upgraded) {
             if (link->http_len + (size_t)n > NL_WS_HTTP_MAX) return false;
@@ -1400,8 +1582,10 @@ static bool ws_read_link(nl_endpoint_t *ep, ws_link_t *link, uint64_t now) {
             if (r < 0) return false;
             if (!ws_handle_message(ep, link, op, msg, mlen, now)) return false;
         }
-        /* Loop for more TCP data until EAGAIN. */
+        /* Loop for more TCP data until EAGAIN or the per-cycle chunk cap
+         * (fair share: see NL_WS_READ_CHUNKS_PER_CYCLE). */
     }
+    return true;
 }
 
 /* Client-only: nonblocking TCP connect completed (POLLOUT). */
@@ -1426,6 +1610,7 @@ static bool ws_client_finish_connect(nl_endpoint_t *ep, ws_link_t *link) {
     }
     link->http_len = 0;
     link->client_sent_request = true;
+    link->last_activity_ms = now_ms();
     (void)ep;
     return true;
 }
@@ -1455,6 +1640,7 @@ static void ws_accept_one(nl_endpoint_t *ep) {
     link->addr_len = alen;
     link->is_server_side = true;
     link->created_ms = now_ms();
+    link->last_activity_ms = link->created_ms;
     nl_ws_decoder_init(&link->decoder);
     nl_socket_set_nonblocking(s);
 
@@ -1604,6 +1790,7 @@ static void *io_thread_main(void *arg) {
         tick_all_connections(ep, now);
         retry_pending_handshakes(ep, now);
         expire_pending(ep, now);
+        ws_reap_links(ep, now);
         /* Free links closed this cycle (and any moved to dead by user
          * threads) only after we're done using their pointers. */
         ws_drain_dead(ep);
@@ -1636,6 +1823,13 @@ static nl_endpoint_t *endpoint_alloc(bool is_server, const nl_config_t *cfg) {
     ep->config.capabilities |= NL_CAP_FLOW_CONTROL;
     if (ep->config.recv_window_bytes > NL_RECV_WINDOW_MAX)
         ep->config.recv_window_bytes = NL_RECV_WINDOW_MAX;
+    /* Resolve the event-queue byte cap: 0 (hand-rolled config) behaves as
+     * the library default; the UNLIMITED sentinel restores 1.1.x behavior
+     * explicitly. */
+    ep->event_queue_cap = ep->config.event_queue_max_bytes
+                              ? ep->config.event_queue_max_bytes
+                              : NL_EVENT_QUEUE_MAX_BYTES_DEFAULT;
+    ep->event_queue_bytes = 0;
     if (cfg->server_name) {
         strncpy(ep->server_name_buf, cfg->server_name, NL_SERVER_NAME_MAX - 1);
         ep->server_name_buf[NL_SERVER_NAME_MAX - 1] = '\0';
@@ -1646,6 +1840,8 @@ static nl_endpoint_t *endpoint_alloc(bool is_server, const nl_config_t *cfg) {
     ep->sock = NL_INVALID_SOCKET;
     ep->listen_sock = NL_INVALID_SOCKET;
     ep->discovery_sock = NL_INVALID_SOCKET;
+    ep->shutdown = false;
+    ep->active_pollers = 0;
     atomic_init(&ep->running, false);
     atomic_init(&ep->io_thread_started, false);
     nl_crypto_random(ep->server_secret, 32);
@@ -1821,6 +2017,8 @@ nl_result_t nl_client_create(const nl_config_t *cfg, nl_endpoint_t **out_endpoin
 
 nl_result_t nl_connect(nl_endpoint_t *ep, const nl_address_t *server_addr, nl_peer_id_t *out_peer) {
     if (!ep || !server_addr || !out_peer || ep->is_server) return NL_ERR_INVALID_ARGUMENT;
+    /* Empty host never defaults to 127.0.0.1: the caller must name an address. */
+    if (server_addr->host[0] == '\0') return NL_ERR_INVALID_ARGUMENT;
 
     int socktype = (ep->config.transport == NL_TRANSPORT_WEBSOCKET) ? SOCK_STREAM : SOCK_DGRAM;
     struct sockaddr_storage addr; socklen_t addr_len; int family;
@@ -1868,6 +2066,7 @@ nl_result_t nl_connect(nl_endpoint_t *ep, const nl_address_t *server_addr, nl_pe
         return NL_ERR_ALREADY_CONNECTED;
     }
     pending_t *p = acquire_pending_slot_locked(ep, now_ms());
+    if (!p) { nl_keypair_free(kp); pthread_mutex_unlock(&ep->pending_lock); return NL_ERR_SERVER_FULL; }
     p->in_use = true;
     p->role = PENDING_CLIENT_AWAIT_CHALLENGE;
     memcpy(&p->addr, &addr, sizeof(addr));
@@ -1916,6 +2115,7 @@ nl_result_t nl_connect(nl_endpoint_t *ep, const nl_address_t *server_addr, nl_pe
         link->is_server_side = false;
         link->client_connecting = in_progress;
         link->created_ms = now_ms();
+        link->last_activity_ms = link->created_ms;
         nl_ws_decoder_init(&link->decoder);
         if (!in_progress) {
             /* Connected immediately (rare for nonblocking, but possible
@@ -1926,6 +2126,11 @@ nl_result_t nl_connect(nl_endpoint_t *ep, const nl_address_t *server_addr, nl_pe
             pthread_mutex_unlock(&ep->pending_lock);
             if (!ws_client_finish_connect(ep, link)) {
                 ws_close_link(ep, link);
+                /* finish_connect may have already dropped peer state (which
+                 * releases the pending entry + pushes CONNECT_FAILED); if
+                 * not (e.g. request-build failure), release it here so the
+                 * slot doesn't leak until the 5s pending timeout. */
+                release_pending_by_connid(ep, connid, PENDING_CLIENT_AWAIT_CHALLENGE);
                 return NL_ERR_SOCKET;
             }
             *out_peer = connid;
@@ -1974,11 +2179,36 @@ nl_result_t nl_disconnect(nl_endpoint_t *ep, nl_peer_id_t peer) {
 
 void nl_endpoint_destroy(nl_endpoint_t *ep) {
     if (!ep) return;
+    /* Contract (see include/netlink.h): no other thread may be inside any
+     * nl_* call on `ep` when destroy is invoked, with one exception: a
+     * thread already blocked in nl_poll_event at that moment is woken and
+     * returned safely (it then re-checks its own loop condition before
+     * calling in again). The steps below make that exception hold: set
+     * shutdown under queue_lock and broadcast, so waiters leave instead of
+     * blocking on a cond that is destroyed further down, and only free the
+     * endpoint once every in-flight poller has fully exited (drain on
+     * active_pollers == 0 below). Because each poller's decrement is its
+     * last ep-touching operation (see poller_exit), drain completion means
+     * no poller will touch ep again. */
+    pthread_mutex_lock(&ep->queue_lock);
+    ep->shutdown = true;
+    pthread_cond_broadcast(&ep->queue_cond);
+    pthread_mutex_unlock(&ep->queue_lock);
     atomic_store(&ep->running, false);
     /* pthread_join on a never-started thread is UB; construction-failure
      * paths free via endpoint_free without joining, and destroy only
      * reaches here after a successful start_io_thread. */
     if (atomic_load(&ep->io_thread_started)) pthread_join(ep->io_thread, NULL);
+    /* Wait for blocked pollers to observe shutdown and exit: freeing
+     * queue_cond/connections while a poller still touches them is UB. */
+    for (;;) {
+        pthread_mutex_lock(&ep->queue_lock);
+        int n = ep->active_pollers;
+        pthread_mutex_unlock(&ep->queue_lock);
+        if (n <= 0) break;
+        struct timespec ts = { 0, 1000000L }; /* 1ms */
+        nanosleep(&ts, NULL);
+    }
     endpoint_free(ep);
 }
 
@@ -2019,6 +2249,18 @@ static void consume_window_for_borrows(nl_endpoint_t *ep, borrow_node_t *borrows
     }
 }
 
+/* Drop out of nl_poll_event: must be the LAST ep-touching operation on
+ * every exit path. nl_endpoint_destroy drains on active_pollers == 0 and
+ * then frees the endpoint, so any ep access after the decrement would race
+ * a concurrent destroy (lock a destroyed mutex, read freed borrows); the
+ * decrement therefore moves to here, after consume_window_for_borrows and
+ * after the borrow booking. Takes only queue_lock, no nesting. */
+static void poller_exit(nl_endpoint_t *ep) {
+    pthread_mutex_lock(&ep->queue_lock);
+    ep->active_pollers--;
+    pthread_mutex_unlock(&ep->queue_lock);
+}
+
 bool nl_poll_event(nl_endpoint_t *ep, nl_event_t *out, int timeout_ms) {
     if (!ep || !out) return false;
 
@@ -2028,6 +2270,7 @@ bool nl_poll_event(nl_endpoint_t *ep, nl_event_t *out, int timeout_ms) {
     borrow_node_t *release = NULL, *release_tail = NULL;
 
     pthread_mutex_lock(&ep->queue_lock);
+    ep->active_pollers++;
     {
         /* The app is done with whatever it borrowed from previous polls:
          * free it and release the connection's receive-window charge so the
@@ -2047,6 +2290,13 @@ bool nl_poll_event(nl_endpoint_t *ep, nl_event_t *out, int timeout_ms) {
             release_tail = b;
         }
     }
+    if (ep->shutdown) {
+        pthread_cond_broadcast(&ep->queue_cond);
+        pthread_mutex_unlock(&ep->queue_lock);
+        consume_window_for_borrows(ep, release);
+        poller_exit(ep); /* last ep touch */
+        return false;
+    }
 
     if (!ep->queue_head) {
         /* Whether we ended up with an event must be decided WHILE HOLDING
@@ -2060,27 +2310,31 @@ bool nl_poll_event(nl_endpoint_t *ep, nl_event_t *out, int timeout_ms) {
             /* Nothing queued and we must not block. */
             pthread_mutex_unlock(&ep->queue_lock);
         } else if (timeout_ms < 0) {
-            while (!ep->queue_head) pthread_cond_wait(&ep->queue_cond, &ep->queue_lock);
-            got_event = (ep->queue_head != NULL); /* still holding queue_lock */
+            while (!ep->queue_head && !ep->shutdown) pthread_cond_wait(&ep->queue_cond, &ep->queue_lock);
+            got_event = (ep->queue_head != NULL && !ep->shutdown); /* still holding queue_lock */
+            if (!got_event) pthread_mutex_unlock(&ep->queue_lock);
         } else {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
             ts.tv_sec += timeout_ms / 1000;
             ts.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
             if (ts.tv_nsec >= 1000000000L) { ts.tv_sec += 1; ts.tv_nsec -= 1000000000L; }
-            while (!ep->queue_head) {
+            while (!ep->queue_head && !ep->shutdown) {
                 if (pthread_cond_timedwait(&ep->queue_cond, &ep->queue_lock, &ts) != 0) break;
             }
-            got_event = (ep->queue_head != NULL); /* still holding queue_lock */
+            got_event = (ep->queue_head != NULL && !ep->shutdown); /* still holding queue_lock */
             if (!got_event) pthread_mutex_unlock(&ep->queue_lock);
         }
 
         if (!got_event) {
-            /* Timed out / non-blocking empty: still release this thread's
-             * previous payload's window charge -- the app finished with it
-             * by calling poll. connections_lock may nest under nothing here
-             * (queue_lock already dropped). */
+            /* Timed out / non-blocking empty / shutdown: still release this
+             * thread's previous payload's window charge -- the app finished
+             * with it by calling poll. connections_lock may nest under
+             * nothing here (queue_lock already dropped). The decrement is
+             * deferred to poller_exit so destroy cannot free the endpoint
+             * while this consume still touches it. */
             consume_window_for_borrows(ep, release);
+            poller_exit(ep); /* last ep touch */
             return false;
         }
         /* Event arrived while waiting: still hold queue_lock, dequeued below. */
@@ -2089,33 +2343,59 @@ bool nl_poll_event(nl_endpoint_t *ep, nl_event_t *out, int timeout_ms) {
     event_node_t *node = ep->queue_head;
     ep->queue_head = node->next;
     if (!ep->queue_head) ep->queue_tail = NULL;
+    ep->event_queue_bytes -= (uint64_t)node->payload_len;
     pthread_mutex_unlock(&ep->queue_lock);
 
     consume_window_for_borrows(ep, release);
 
     *out = node->pub;
     if (node->payload) {
+        /* Book the borrow under queue_lock: a concurrent poll must not
+         * observe a torn list. If the bookkeeping allocation fails, do NOT
+         * hand out an untracked payload (it would leak and its window
+         * charge would never be released): free it and report no event.
+         * OOM-injection for this calloc is not feasible without a test
+         * allocator, so this path is documented rather than unit-tested;
+         * the normal path is covered by every DATA round-trip test. */
+        borrow_node_t *b = (borrow_node_t *)calloc(1, sizeof(borrow_node_t));
+        if (!b) {
+            uint32_t plen = node->payload_len;
+            nl_peer_id_t ppeer = node->pub.peer;
+            bool is_data = (node->pub.event_type == NL_EVENT_DATA);
+            free(node->payload);
+            free(node);
+            out->data = NULL;
+            out->data_len = 0;
+            /* The dropped event never reaches the app, so release its
+             * receive-window charge now rather than leaking window. */
+            if (is_data && plen > 0) {
+                pthread_mutex_lock(&ep->connections_lock);
+                nl_connection_t *c = find_connection_locked(ep, ppeer);
+                if (c) nl_connection_consume_window(c, plen);
+                pthread_mutex_unlock(&ep->connections_lock);
+            }
+            poller_exit(ep); /* last ep touch */
+            return false;
+        }
         out->data = node->payload;
         out->data_len = node->payload_len;
-        /* Book the borrow under queue_lock: a concurrent poll must not
-         * observe a torn list. If the bookkeeping allocation fails we still
-         * hand the payload over and just leak it -- the alternative (freeing
-         * it now) would return a dangling out->data. */
-        borrow_node_t *b = (borrow_node_t *)calloc(1, sizeof(borrow_node_t));
-        if (b) {
-            b->data = node->payload;
-            b->len = (uint32_t)node->payload_len;
-            b->peer = node->pub.peer;
-            b->is_data = (node->pub.event_type == NL_EVENT_DATA);
-            b->owner = pthread_self();
-            pthread_mutex_lock(&ep->queue_lock);
-            b->next = ep->borrows;
-            ep->borrows = b;
-            pthread_mutex_unlock(&ep->queue_lock);
-        }
+        b->data = node->payload;
+        b->len = (uint32_t)node->payload_len;
+        b->peer = node->pub.peer;
+        b->is_data = (node->pub.event_type == NL_EVENT_DATA);
+        b->owner = pthread_self();
+        pthread_mutex_lock(&ep->queue_lock);
+        b->next = ep->borrows;
+        ep->borrows = b;
+        /* poller_exit shares this critical section: the decrement is the
+         * last ep touch, so destroy cannot start freeing while this poll
+         * still registers its borrow. */
+        ep->active_pollers--;
+        pthread_mutex_unlock(&ep->queue_lock);
     } else {
         out->data = NULL;
         out->data_len = 0;
+        poller_exit(ep);
     }
     free(node);
     return true;

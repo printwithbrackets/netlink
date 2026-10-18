@@ -58,7 +58,8 @@ reimplementations that happen to agree today.
   thread; `nl_send()` and `nl_poll_event()` can be called from any thread,
   including concurrently from several, without external locking. A polled
   event's payload is borrowed to the calling thread only — other threads
-  polling in the meantime never free it.
+  polling in the meantime never free it. Destroying the endpoint wakes a
+  thread blocked in `nl_poll_event()` and that poll returns false.
 - **IPv6 support**, dual-stack where the OS allows it (implemented and
   exercised in code review; see [Testing](#testing) for why it couldn't
   be run to completion in this project's own dev sandbox).
@@ -113,12 +114,13 @@ reimplementations that happen to agree today.
 
 ```c
 #include <netlink.h>
+#include <stdio.h>
 
 nl_config_t cfg;
 nl_config_default(&cfg);
 
 nl_address_t addr = {0};
-strcpy(addr.host, "0.0.0.0");
+snprintf(addr.host, sizeof(addr.host), "%s", "0.0.0.0");
 addr.port = 9000;
 
 nl_endpoint_t *server;
@@ -128,7 +130,10 @@ while (1) {
     nl_event_t ev;
     if (!nl_poll_event(server, &ev, 100)) continue;
     if (ev.event_type == NL_EVENT_DATA) {
-        nl_send(server, ev.peer, ev.channel, NL_RELIABLE_ORDERED, ev.data, ev.data_len); // echo
+        if (nl_send(server, ev.peer, ev.channel, NL_RELIABLE_ORDERED,
+                    ev.data, ev.data_len) != NL_OK) {
+            fprintf(stderr, "echo send failed\n");
+        }
     }
 }
 ```
@@ -149,7 +154,7 @@ nl_config_default(&cfg);
 cfg.transport = NL_TRANSPORT_WEBSOCKET;
 
 nl_address_t addr = {0};
-strcpy(addr.host, "0.0.0.0");
+snprintf(addr.host, sizeof(addr.host), "%s", "0.0.0.0");
 addr.port = 9001;
 
 nl_endpoint_t *server;
@@ -239,6 +244,12 @@ src/
   connection.{h,c}          One established peer: encryption keys, the
                             channel array, and the mutex that makes
                             concurrent nl_send()/receive/tick safe.
+  util.c                     Version string, error strings, and
+                              nl_config_default -- the small public
+                              surface with no better home.
+  socket_compat.h             Winsock/POSIX socket shims (the _WIN32
+                               branch is written but not CI-tested, see
+                               the file header).
   endpoint.c                  Sockets, the background I/O thread, the
                                connect handshake state machine, the
                                connection table, and the event queue --
@@ -307,15 +318,15 @@ what's claimed here is exactly what was verified, not more.
 environment** (a Linux container with a C toolchain, OpenSSL, Python, Go,
 and Rust):
 
-- 195 C test cases across unit tests (`tests/test_seqbuf.c`,
+- 212 C test cases across unit tests (`tests/test_seqbuf.c`,
   `test_crypto.c`, `test_fragment.c`, `test_channel.c`,
   `test_connection.c`, `test_network_simulation.c`,
-  `test_websocket.c`: 155 cases) and real-socket integration tests
-  (`tests/integration/test_integration.c`: 25 cases,
-  `tests/integration/test_websocket_integration.c`: 5 cases,
-  `tests/integration/test_threading.c`: 5 cases), all clean
+  `test_websocket.c`: 160 cases) and real-socket integration tests
+  (`tests/integration/test_integration.c`: 36 cases,
+  `tests/integration/test_websocket_integration.c`: 8 cases,
+  `tests/integration/test_threading.c`: 8 cases), all clean
   under AddressSanitizer + UndefinedBehaviorSanitizer -- no leaks, no UB.
-- **Concurrency tests under ThreadSanitizer** (`make test-tsan`, 6 cases
+- **Concurrency tests under ThreadSanitizer** (`make test-tsan`, 8 cases
   in `tests/integration/test_threading.c` plus the integration suite).
   The main suite runs every test on one thread, which cannot reach a race
   between the endpoint's I/O thread and user threads -- so the concurrency
@@ -346,7 +357,7 @@ and Rust):
   server-full denial, and the previously untested introspection APIs
   (`nl_peer_address`, `nl_peer_rtt_ms`, `nl_peer_count`, `nl_send_ex`,
   `nl_error_string`).
-- The **Python bindings** (9 tests), **Go bindings** (10 tests via
+- The **Python bindings** (11 tests), **Go bindings** (10 tests via
   `go test`), and **Rust bindings** (11 tests via `cargo test`), each
   exercised the same way: real `Server` + `Client` over real sockets,
   covering echo, all delivery modes, fragmentation, priority/`send_ex`,
@@ -358,7 +369,7 @@ and Rust):
 - The **WebSocket transport** (`NL_TRANSPORT_WEBSOCKET`): HTTP upgrade +
   encrypted NetLink handshake + reliable/unordered/unreliable delivery
   and fragmentation over loopback TCP, exercised by
-  `tests/integration/test_websocket_integration.c` (5 cases).
+  `tests/integration/test_websocket_integration.c` (8 cases).
 
 **Written but not compiled/run here, for lack of toolchain/platform:**
 
@@ -440,16 +451,17 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Changelog
 
-### Unreleased
+### 1.2.0 (2026-10-18)
 
 **Added**
 
-- **`make test-tsan`**, plus 5 multi-threaded tests in
+- **`make test-tsan`**, plus 8 multi-threaded tests in
   `tests/integration/test_threading.c`: concurrent pollers on one
   endpoint, 6 senders against one poller with a small receive window,
   send and poll on the same endpoint, a non-blocking poll spinning against
-  a concurrent producer, endpoint destroy racing in-flight traffic, and 5
-  concurrent connects. The existing suite runs every test on one thread
+  a concurrent producer, endpoint destroy racing in-flight traffic, 5
+  concurrent connects, and a blocked infinite poll woken by endpoint
+  destroy. The existing suite runs every test on one thread
   and never under TSan, so it could not reach the races between the
   endpoint's I/O thread and user threads — which is how both the
   `nl_poll_event` use-after-free below and a queue-head data race
@@ -464,7 +476,84 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   NetLink. It is now narrowed to OpenSSL's own symbols, with the reasoning
   and the NetLink frames that must *not* be added recorded inline.
 
+- **Endpoint event-queue byte cap.** New `nl_config_t.event_queue_max_bytes`
+  (default ~4 MB, `NL_EVENT_QUEUE_UNLIMITED` = 0xFFFFFFFFu to restore the
+  1.1.x behavior): a hostile peer flooding DATA previously grew the
+  endpoint-wide event queue without limit. When the queued payload bytes
+  hit the cap, further events -- including connection and disconnect
+  events, which carry no payload -- are rejected under `queue_lock`
+  instead of queued, and the connection is not charged receive-window
+  bytes for a payload no application ever sees, so a full queue cannot
+  wedge a sender's flow control. Regression tests:
+  `test_event_queue_cap_bounds_hostile_flood` (flood of 400-message
+  bursts drains and reclaims) and
+  `test_event_queue_cap_legit_traffic_flows` (bidirectional traffic with
+  a 2048-byte cap), both asserting the byte counter through the
+  test-only `nl_endpoint_event_queue_bytes_for_test`.
+- **Server-side channel-count clamp.** A client's CONNECT_REQUEST named
+  any channel count 1..32 and the server honored exactly that,
+  allocating attacker-chosen per-connection channel/lane buffers
+  unrelated to the server's own configuration. The handshake now
+  negotiates `min(requested, server config.channel_count)` server-side
+  (the client keeps its own count for its side; DATA on channels beyond
+  the server's clamped side is dropped by the receiver's channel bounds
+  check, same as protocol mismatches today). Regression test:
+  `test_server_clamps_negotiated_channel_count`.
+- **Per-connection reassembly byte budget.** Each connection's fragment
+  trackers now carry `NL_REASSEMBLY_BYTE_BUDGET_DEFAULT` (one
+  NL_MAX_MESSAGE_SIZE + slack): an incomplete message charges its full
+  declared size at slot acquisition, and messages that would exceed the
+  budget are rejected without displacing in-flight ones, so fragments
+  spread across message ids cannot pin more than one maximum-size
+  message. Tracker buffers are also allocated at the message's declared
+  size (`fragment_count x NL_FRAGMENT_CHUNK_SIZE`) instead of a fixed
+  256 KB, so the common small case costs kilobytes per tracker rather
+  than always-max. Regression tests:
+  `test_reassembly_byte_budget_rejects_overcommitted_spread`,
+  `test_reassembly_byte_budget_rejects_single_oversized_message`,
+  `test_reassembly_byte_budget_does_not_reject_max_size_message`.
+- **WebSocket link lifetimes.** Links (either side) now have a connecting
+  timeout (NL_WS_CONNECT_TIMEOUT_MS, 10s) and an idle timeout
+  (NL_WS_IDLE_TIMEOUT_MS, 60s): a raw TCP peer that lands on a
+  WebSocket port and never completes the upgrade previously held its
+  socket + decoder memory forever. An active session keeps its link fed
+  by keepalives, so healthy idle connections are untouched. Regression
+  test: `test_ws_reaps_pre_upgrade_links`.
+- **WebSocket read fairness.** One link's feed loop is capped at
+  NL_WS_READ_CHUNKS_PER_CYCLE (32 x 2KB) recv chunks per ready cycle:
+  a peer feeding its TCP connection as fast as packets could be
+  decrypted otherwise monopolizes the single I/O thread. poll() is
+  level-triggered so the rest resumes next cycle.
+- **Pending-table eviction prefers unprogressed entries.** When the
+  pending handshake table fills, the eviction victim is now the oldest
+  entry that has never been progressed (no retransmitted-REQUEST
+  refresh) instead of plain created_ms LRU: the LRU victim was exactly
+  the pre-flood live handshake, so 200 fake REQUESTs/s turned the table
+  over every ~0.6s and starved legit handshakes even with HMAC cookies.
+  Regression test: `test_pending_eviction_protects_live_handshake`
+  (expect a retx-armed handshake to keep receiving challenges across a
+  full-table flood -- it fails against the old eviction, verified).
+
 **Fixed**
+
+- **Destroy could free the endpoint under a still-exiting poller.**
+  In `nl_poll_event`, `active_pollers` was decremented and `queue_lock`
+  dropped before the poller's last endpoint touches (the borrow-window
+  release and borrow booking re-lock endpoint mutexes), so
+  `nl_endpoint_destroy`'s drain loop (waiting only for
+  `active_pollers == 0`) could free everything underneath a poller that
+  was merely preempted in that window. The decrement now happens in a
+  `poller_exit()` helper called as the last epoll-touching operation on
+  every return path. Regression test:
+  `test_threading_destroy_wakes_poll_exit_racers` under TSan (3
+  consecutive clean runs; it reports the `pthread_mutex_destroy` vs
+  `pthread_mutex_lock` race against the old code).
+- **Deferred-queue byte bound changed mid-1.0.0.** The
+  `NL_DEFERRED_MAX_BYTES` bound is `NL_MAX_MESSAGE_SIZE + 64 KB`
+  (~320 KB) per connection, not the "64 KB" implied before (the bound
+  was raised so a full maximum-size message can always fit in the
+  deferred queue below the window). The `nl_send` docstring and the
+  priority bounds above now state the real number.
 
 - **An RTT sample could be computed from a backwards clock.** `now_ms` is
   supplied by the caller, so a cross-CPU timestamp or a wrapped clock source
@@ -618,6 +707,52 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   receive dedupe has actually seen something; a clear `ack_valid` makes
   the receiver skip ack application entirely. Regression test:
   `test_no_ack_from_empty_lane_does_not_ack_peer_seq_zero`.
+- **Destroying an endpoint left threads blocked in
+  `nl_poll_event(timeout = -1)` hanging.** The wait loop woke only on a
+  queued event. A blocked poller never returned, and destroy went on to
+  free `queue_cond` underneath it. Destroy now sets a shutdown flag and
+  broadcasts under `queue_lock`, the wait loops check that flag alongside
+  the queue head, and destroy waits for in-flight pollers to drain before
+  freeing. A blocked poll returns false once shutdown is observed.
+  Regression test: `test_threading_destroy_wakes_blocked_poll`.
+- **`nl_connect` silently dialed 127.0.0.1 when `server_addr.host` was
+  empty.** The resolve helper fell back to that literal for client
+  sockets, hiding caller bugs. An empty host is now
+  `NL_ERR_INVALID_ARGUMENT` (a server bind still accepts an empty host
+  as "any address"). Regression test:
+  `test_connect_empty_host_rejected`.
+- **A zero-length send passed NULL to `memcpy`.** `nl_send(..., NULL, 0)`
+  reached the fragment encoder, where `memcpy(dst, NULL, 0)` is undefined
+  behavior even at length zero. The copy is now guarded, and an empty
+  payload round-trips as a zero-length DATA event. Regression test:
+  `test_zero_length_send_roundtrips`.
+- **A DATA packet with a malformed delivery value corrupted the peer's
+  receive window.** The packet was dropped without setting a result. The
+  zero-initialized out-param then overwrote `peer_rwnd`, and the sender
+  saw a closed window no later advertisement would reopen. Malformed
+  delivery now returns `NL_ERR_PROTOCOL_MISMATCH` before any window
+  bookkeeping. Regression test:
+  `test_malformed_delivery_does_not_clobber_peer_window`.
+- **`nl_ws_encode` accepted reserved opcodes.** The old check only
+  rejected opcodes above 0xF, but RFC 6455 reserves 0x3-0x7 and 0xB-0xF
+  and a peer must drop frames that use them. Encoding is now an allowlist
+  of the six defined opcodes. Regression test:
+  `test_frame_encode_rejects_reserved_opcodes`.
+- **A WebSocket connect that failed synchronously leaked its
+  pending-handshake slot.** The immediate-connect path released the entry
+  only if `ws_client_finish_connect` dropped peer state. A request-build
+  failure held the slot until the 5 s pending expiry. The failure path
+  now releases it explicitly. Regression test:
+  `test_ws_failed_connect_does_not_leak_pending`.
+- **`nl_poll_event` handed out an untracked payload when borrow
+  bookkeeping ran out of memory.** The old fallback returned the event
+  and leaked the buffer. Its receive-window charge was then never
+  released. The event is now dropped (poll returns false, payload freed,
+  charge released) rather than handing out a buffer no later poll can
+  reclaim.
+- **`nl_version_string()` was a hardcoded literal.** It is now expanded
+  from `NL_VERSION_MAJOR/MINOR/PATCH`. The string can no longer drift
+  from the header. `test_version_string_matches_macros` covers it.
 
 **Added**
 
@@ -640,6 +775,13 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   `NL_ACK_PAYLOAD_SIZE` 10 → 11, then `ack_bits` widened from `u32` to
   `u64` (`NL_DATA_HEADER_SIZE` 14 → 18, `NL_ACK_PAYLOAD_SIZE` 11 → 15).
   **`NL_PROTOCOL_VERSION` bumped 3 → 5.**
+- CI now checks Go (`gofmt -l`) and Rust (`cargo fmt --check`) formatting,
+  and `make test-bindings` runs the Python suite under pytest first with
+  the plain-script runner as a fallback. `CFLAGS`/`LDFLAGS` supplied on
+  the command line or in the environment are appended to the required
+  defaults instead of replacing them. The C examples validate their port
+  argument, reject oversized hostnames instead of truncating silently,
+  and check `nl_send`'s return value.
 
 ### 1.1.1 (2026-09-25)
 
@@ -739,8 +881,9 @@ negotiation -- each with regression tests.
 - **Priority/QoS.** New `nl_send_ex(..., priority)` (and
   `NL_PRIORITY_*` constants). Deferred messages are sorted descending by
   priority (stable FIFO within a priority) and flushed highest-first as
-  window/rate budget opens. Bounds: 128 messages / 64 KB per connection;
-  overflow returns `NL_ERR_QUEUE_FULL`.
+  window/rate budget opens. Bounds: 128 messages /
+  (NL_MAX_MESSAGE_SIZE + 64 KB) payload bytes per connection; overflow
+  returns `NL_ERR_QUEUE_FULL`.
 - **Capability negotiation.** REQUEST and CHALLENGE carry a u32
   `NL_CAP_*` bitmask (`NL_CAP_FLOW_CONTROL`, `NL_CAP_PRIORITY`,
   `NL_CAP_RATE_LIMIT`); both sides store the intersection and expose it

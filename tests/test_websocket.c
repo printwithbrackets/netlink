@@ -52,6 +52,25 @@ TEST(test_frame_encode_rejects_tiny_output_buffer) {
     ASSERT_EQ(n, 0);
 }
 
+TEST(test_frame_encode_rejects_reserved_opcodes) {
+    const uint8_t payload[] = { 1, 2, 3 };
+    uint8_t out[16];
+    const uint8_t reserved[] = { 0x3, 0x4, 0x5, 0x6, 0x7, 0xB, 0xC, 0xD, 0xE, 0xF };
+    for (size_t i = 0; i < sizeof(reserved); i++) {
+        ASSERT_EQ(nl_ws_encode(reserved[i], payload, sizeof(payload), false, out, sizeof(out)), 0);
+        ASSERT_EQ(nl_ws_encode(reserved[i], payload, sizeof(payload), true, out, sizeof(out)), 0);
+    }
+    /* Defined opcodes still encode. */
+    const uint8_t allowed[] = {
+        NL_WS_OPCODE_CONT, NL_WS_OPCODE_TEXT, NL_WS_OPCODE_BINARY,
+        NL_WS_OPCODE_CLOSE, NL_WS_OPCODE_PING, NL_WS_OPCODE_PONG,
+    };
+    for (size_t i = 0; i < sizeof(allowed); i++) {
+        /* Control frames carry <=125 bytes; use 3 bytes so all pass. */
+        ASSERT_TRUE(nl_ws_encode(allowed[i], payload, sizeof(payload), false, out, sizeof(out)) > 0);
+    }
+}
+
 /* ---- frame decoding ---- */
 
 TEST(test_frame_decode_roundtrip_unmasked) {
@@ -262,6 +281,146 @@ TEST(test_handshake_rejects_not_101) {
         "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
 }
 
+TEST(test_frame_size_rejects_over_max) {
+    /* The size helper is the gate for both encode paths: anything past
+     * NL_WS_MAX_MESSAGE must be refused before a buffer is chosen. */
+    ASSERT_EQ(nl_ws_frame_size(NL_WS_MAX_MESSAGE + 1, false), 0);
+    ASSERT_EQ(nl_ws_frame_size(NL_WS_MAX_MESSAGE + 1, true), 0);
+    ASSERT_EQ(nl_ws_frame_size(0xFFFFFFFFFFFFFFFFULL, false), 0);
+    /* The boundary itself is still legal. 4096 >= 126, so it uses the
+     * 16-bit extended length form (4-byte header), not the 2-byte one. */
+    ASSERT_EQ(nl_ws_frame_size(NL_WS_MAX_MESSAGE, false), 4 + (size_t)NL_WS_MAX_MESSAGE);
+    /* And encode agrees with frame_size at the boundary. */
+    uint8_t *payload = (uint8_t *)malloc(NL_WS_MAX_MESSAGE);
+    ASSERT_TRUE(payload != NULL);
+    memset(payload, 0x5A, NL_WS_MAX_MESSAGE);
+    uint8_t *out = (uint8_t *)malloc(NL_WS_MAX_MESSAGE + 16);
+    ASSERT_TRUE(out != NULL);
+    ASSERT_EQ(nl_ws_encode(NL_WS_OPCODE_BINARY, payload, NL_WS_MAX_MESSAGE, false,
+                           out, NL_WS_MAX_MESSAGE + 16),
+              4 + (size_t)NL_WS_MAX_MESSAGE);
+    ASSERT_EQ(nl_ws_encode(NL_WS_OPCODE_BINARY, payload, NL_WS_MAX_MESSAGE + 1, false,
+                           out, NL_WS_MAX_MESSAGE + 16),
+              0);
+    free(payload);
+    free(out);
+}
+
+TEST(test_frame_decode_64bit_length_header) {
+    /* A frame using the 64-bit length form (indicator 127) for a small
+     * payload: header is 10 bytes, then the payload. The 127 decode path
+     * must accept lengths within our max, not just reject big ones. */
+    uint8_t frame[16];
+    frame[0] = 0x82;                 /* FIN + binary */
+    frame[1] = 0x7F;                 /* 64-bit length indicator */
+    memset(frame + 2, 0, 7);
+    frame[9] = 5;                    /* length = 5, big-endian u64 */
+    memcpy(frame + 10, "hello", 5);
+
+    nl_ws_decoder_t d;
+    nl_ws_decoder_init(&d);
+    ASSERT_EQ(nl_ws_decoder_feed(&d, frame, 15), 0);
+    uint8_t out[16];
+    size_t out_len = 0;
+    uint8_t opcode = 0;
+    ASSERT_EQ(nl_ws_decoder_next(&d, &opcode, out, sizeof(out), &out_len), 1);
+    ASSERT_EQ(opcode, NL_WS_OPCODE_BINARY);
+    ASSERT_EQ(out_len, 5);
+    ASSERT_MEM_EQ(out, "hello", 5);
+    nl_ws_decoder_free(&d);
+}
+
+TEST(test_frame_decode_rejects_unfinished_control_frame) {
+    /* RFC 6455 5.5: control frames must not be fragmented. A ping with
+     * FIN=0 is a protocol error and must poison the decoder. */
+    uint8_t frame[] = { 0x09, 0x01, 'x' }; /* FIN=0 ping, len 1 */
+    nl_ws_decoder_t d;
+    nl_ws_decoder_init(&d);
+    nl_ws_decoder_feed(&d, frame, sizeof(frame));
+    uint8_t out[8];
+    size_t out_len = 0;
+    uint8_t opcode = 0;
+    ASSERT_EQ(nl_ws_decoder_next(&d, &opcode, out, sizeof(out), &out_len), -1);
+    nl_ws_decoder_free(&d);
+}
+
+TEST(test_frame_decode_rejects_oversized_control_frame) {
+    /* Control frames are capped at 125 payload bytes; a ping claiming 126
+     * via the 16-bit length form must be rejected. */
+    uint8_t frame[] = { 0x89, 126, 0x00, 126 }; /* FIN+ping, 16-bit len 126 */
+    nl_ws_decoder_t d;
+    nl_ws_decoder_init(&d);
+    nl_ws_decoder_feed(&d, frame, sizeof(frame));
+    uint8_t out[8];
+    size_t out_len = 0;
+    uint8_t opcode = 0;
+    ASSERT_EQ(nl_ws_decoder_next(&d, &opcode, out, sizeof(out), &out_len), -1);
+    nl_ws_decoder_free(&d);
+}
+
+TEST(test_frame_decode_rejects_new_data_opcode_mid_fragmentation) {
+    /* A fragmented message must continue with CONT frames: a new data
+     * opcode (text) arriving while a binary message is still open is a
+     * protocol error (RFC 6455 5.4). */
+    uint8_t f1[] = { 0x02, 0x01, 'h' }; /* FIN=0 binary */
+    uint8_t f2[] = { 0x81, 0x01, 'x' }; /* FIN=1 text (not CONT) */
+    nl_ws_decoder_t d;
+    nl_ws_decoder_init(&d);
+    nl_ws_decoder_feed(&d, f1, sizeof(f1));
+    nl_ws_decoder_feed(&d, f2, sizeof(f2));
+    uint8_t out[8];
+    size_t out_len = 0;
+    uint8_t opcode = 0;
+    ASSERT_EQ(nl_ws_decoder_next(&d, &opcode, out, sizeof(out), &out_len), -1);
+    nl_ws_decoder_free(&d);
+}
+
+TEST(test_frame_decode_rejects_continuation_without_start) {
+    /* A CONT frame with no open fragmented message is a protocol error. */
+    uint8_t frame[] = { 0x80, 0x01, 'z' }; /* FIN=1 continuation */
+    nl_ws_decoder_t d;
+    nl_ws_decoder_init(&d);
+    nl_ws_decoder_feed(&d, frame, sizeof(frame));
+    uint8_t out[8];
+    size_t out_len = 0;
+    uint8_t opcode = 0;
+    ASSERT_EQ(nl_ws_decoder_next(&d, &opcode, out, sizeof(out), &out_len), -1);
+    nl_ws_decoder_free(&d);
+}
+
+TEST(test_decoder_stays_poisoned_after_error) {
+    /* After a protocol violation the decoder must be permanently poisoned:
+     * both feed and next keep returning -1, so a caller that keeps using
+     * it cannot be tricked into treating later bytes as valid frames. */
+    uint8_t bad[] = { 0xC2, 0x00 }; /* RSV bits set */
+    uint8_t good[] = { 0x82, 0x01, 'x' }; /* would be valid on its own */
+    nl_ws_decoder_t d;
+    nl_ws_decoder_init(&d);
+    nl_ws_decoder_feed(&d, bad, sizeof(bad));
+    uint8_t out[8];
+    size_t out_len = 0;
+    uint8_t opcode = 0;
+    ASSERT_EQ(nl_ws_decoder_next(&d, &opcode, out, sizeof(out), &out_len), -1);
+    /* Poisoned: feeding more bytes (even valid ones) must not recover. */
+    ASSERT_EQ(nl_ws_decoder_feed(&d, good, sizeof(good)), -1);
+    ASSERT_EQ(nl_ws_decoder_next(&d, &opcode, out, sizeof(out), &out_len), -1);
+    nl_ws_decoder_free(&d);
+}
+
+TEST(test_frame_decode_rejects_small_msg_cap) {
+    /* A caller-supplied buffer smaller than the message must be an error,
+     * never a silent truncation of attacker-controlled data. */
+    uint8_t frame[] = { 0x82, 0x05, 'h', 'e', 'l', 'l', 'o' };
+    nl_ws_decoder_t d;
+    nl_ws_decoder_init(&d);
+    nl_ws_decoder_feed(&d, frame, sizeof(frame));
+    uint8_t out[4]; /* one byte too small */
+    size_t out_len = 0;
+    uint8_t opcode = 0;
+    ASSERT_EQ(nl_ws_decoder_next(&d, &opcode, out, sizeof(out), &out_len), -1);
+    nl_ws_decoder_free(&d);
+}
+
 TEST(test_http_header_complete_detects_crlfcrlf) {
     size_t end = 0;
     ASSERT_FALSE(nl_ws_http_header_complete("GET / HTTP/1.1\r\n", 17, &end));
@@ -276,6 +435,7 @@ int main(void) {
     RUN_TEST(test_frame_encode_masked_binary_small);
     RUN_TEST(test_frame_encode_16bit_length);
     RUN_TEST(test_frame_encode_rejects_tiny_output_buffer);
+    RUN_TEST(test_frame_encode_rejects_reserved_opcodes);
     RUN_TEST(test_frame_decode_roundtrip_unmasked);
     RUN_TEST(test_frame_decode_masked_client_frame);
     RUN_TEST(test_frame_decode_byte_at_a_time);
@@ -290,5 +450,13 @@ int main(void) {
     RUN_TEST(test_handshake_rejects_wrong_accept_from_server);
     RUN_TEST(test_handshake_rejects_not_101);
     RUN_TEST(test_http_header_complete_detects_crlfcrlf);
+    RUN_TEST(test_frame_size_rejects_over_max);
+    RUN_TEST(test_frame_decode_64bit_length_header);
+    RUN_TEST(test_frame_decode_rejects_unfinished_control_frame);
+    RUN_TEST(test_frame_decode_rejects_oversized_control_frame);
+    RUN_TEST(test_frame_decode_rejects_new_data_opcode_mid_fragmentation);
+    RUN_TEST(test_frame_decode_rejects_continuation_without_start);
+    RUN_TEST(test_decoder_stays_poisoned_after_error);
+    RUN_TEST(test_frame_decode_rejects_small_msg_cap);
     TEST_SUMMARY();
 }

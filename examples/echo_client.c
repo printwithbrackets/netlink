@@ -5,9 +5,20 @@
 #include <stdlib.h>
 #include <string.h>
 
+static uint16_t parse_port(const char *s, uint16_t dflt) {
+    if (!s) return dflt;
+    char *end = NULL;
+    unsigned long v = strtoul(s, &end, 10);
+    if (end == s || *end != '\0' || v > 65535) {
+        fprintf(stderr, "invalid port '%s', using %u\n", s, dflt);
+        return dflt;
+    }
+    return (uint16_t)v;
+}
+
 int main(int argc, char **argv) {
     const char *host = argc > 1 ? argv[1] : "127.0.0.1";
-    uint16_t port = argc > 2 ? (uint16_t)atoi(argv[2]) : 9000;
+    uint16_t port = argc > 2 ? parse_port(argv[2], 9000) : 9000;
 
     nl_config_t cfg;
     nl_config_default(&cfg);
@@ -21,7 +32,11 @@ int main(int argc, char **argv) {
 
     nl_address_t server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
-    strncpy(server_addr.host, host, sizeof(server_addr.host) - 1);
+    if (snprintf(server_addr.host, sizeof(server_addr.host), "%s", host) >= (int)sizeof(server_addr.host)) {
+        fprintf(stderr, "host name too long (max %zu bytes)\n", sizeof(server_addr.host) - 1);
+        nl_endpoint_destroy(client);
+        return 1;
+    }
     server_addr.port = port;
     server_addr.family = NL_AF_UNSPEC;
 
@@ -59,7 +74,9 @@ int main(int argc, char **argv) {
                 nl_endpoint_destroy(client);
                 return 1;
             case NL_EVENT_DATA:
-                printf("Echo received on channel %u: %.*s\n", ev.channel, (int)ev.data_len, (const char *)ev.data);
+                printf("Echo received on channel %u: ", ev.channel);
+                if (ev.data_len > 0 && ev.data) fwrite(ev.data, 1, ev.data_len, stdout);
+                printf("\n");
                 echoes_received++;
                 if (echoes_received >= total_messages) {
                     nl_disconnect(client, server);

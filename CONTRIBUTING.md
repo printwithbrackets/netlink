@@ -1,7 +1,7 @@
 # Contributing to NetLink
 
 Thanks for considering a contribution. This project prioritizes
-correctness and security over speed of development -- please read the
+correctness and security over speed of development; please read the
 notes below before opening a PR.
 
 ## Ground rules
@@ -31,7 +31,7 @@ make test                                     # unit tests + real-socket integra
 
 Unit tests build with `-fsanitize=address,undefined`. A change that
 introduces a memory or undefined-behavior issue should fail loudly under
-these sanitizers -- please don't disable them to get a PR green.
+these sanitizers and please don't disable them to get a PR green.
 
 ### Adding a test
 
@@ -47,11 +47,14 @@ these sanitizers -- please don't disable them to get a PR green.
 ## Code style
 
 - C11, portable POSIX (the WIN32 branches in `socket_compat.h` are
-  written but not CI-tested here -- see the file header). Please don't
+  written but not CI-tested here, see the file header). Please don't
   introduce compiler-specific extensions.
 - No warnings. Every source file here compiles clean under
   `-Wall -Wextra`; new code should too.
-- Comments explain *why*, not *what* -- especially for anything
+- Go and Rust binding code is formatted with `gofmt` and `rustfmt`
+  respectively. CI and `make test-bindings` fail on unformatted files
+  (`gofmt -l .`, `cargo fmt --check`). Run them before pushing.
+- Comments explain *why*, not *what*, especially for anything
   security-relevant (nonce construction, replay windows, cookie
   verification). If you had to think hard about why an ordering of
   operations matters, write that reasoning down.
@@ -60,7 +63,7 @@ these sanitizers -- please don't disable them to get a PR green.
 
 The C core (`src/`) is the single source of truth for the wire protocol.
 Bindings (`bindings/python`, `bindings/go`, `bindings/rust`) should be
-thin wrappers over the stable C ABI in `include/netlink.h` -- they must
+thin wrappers over the stable C ABI in `include/netlink.h` and they must
 not reimplement any protocol logic. If a binding's struct layout doesn't
 match the C header, that's a bug in the binding, not a reason to add
 protocol logic on the binding side.
@@ -85,7 +88,7 @@ If you find a vulnerability (a way to bypass authentication, forge a
 packet, cause unbounded memory growth from attacker-controlled input,
 etc.), please open an issue describing it. Given this is a reference
 implementation rather than a hardened production deployment used at
-scale, there isn't yet a formal private disclosure process -- use your
+scale, there isn't yet a formal private disclosure process, so use your
 judgment about severity, and feel free to flag in the issue title if you
 think it warrants care in how details are shared.
 

@@ -1,21 +1,8 @@
 // Package netlink provides Go bindings for the NetLink C library via cgo.
 //
-// IMPORTANT: unlike the Python bindings in this repository (which were
-// built and tested against the real compiled library as part of this
-// project), this Go binding could not be compiled or run in the
-// environment that produced it -- no Go toolchain was available. It is
-// written carefully against the same stable C ABI (include/netlink.h)
-// that the Python bindings were verified against byte-for-byte, and the
-// cgo patterns used here are standard, but you should treat it as
-// needing its first real build/test pass, not as pre-verified the way
-// the C core and Python bindings are. Please file an issue (or better, a
-// PR with `go build`/`go vet` output) if something doesn't line up.
-//
 // Build requirements: the netlink C library must be built first (`make`
 // in the repository root produces build/libnetlink.a / .so), and its
-// headers must be reachable from the cgo preamble below -- adjust the
-// CFLAGS/LDFLAGS paths for your setup, or use pkg-config once a .pc file
-// is added (see the roadmap in the top-level README).
+// headers must be reachable from the cgo preamble below.
 package netlink
 
 /*
@@ -29,6 +16,7 @@ import "C"
 import (
 	"errors"
 	"fmt"
+	"math"
 	"time"
 	"unsafe"
 )
@@ -111,7 +99,16 @@ func newError(code C.nl_result_t) error {
 	return &Error{Code: int(code), Message: msg}
 }
 
-// Config mirrors nl_config_t, with Go-friendly defaults via NewConfig.
+// Transport mirrors nl_transport_t.
+type Transport int
+
+const (
+	TransportUDP       Transport = 0
+	TransportWebSocket Transport = 1
+)
+
+// Config mirrors nl_config_t, with Go-friendly defaults via NewConfig
+// (populated from nl_config_default so it tracks the C defaults).
 type Config struct {
 	ChannelCount        uint8
 	MaxConnections      uint32
@@ -120,10 +117,19 @@ type Config struct {
 	EncryptionEnabled   bool
 	ServerName          string
 	Family              AddressFamily
+	Transport           Transport
+	MaxSendBytesPerSec  uint32
+	RecvWindowBytes     uint32
+	// EventQueueMaxBytes is the global byte cap on queued event payloads;
+	// 0 = library default (NL_EVENT_QUEUE_MAX_BYTES_DEFAULT),
+	// 0xFFFFFFFF = unlimited.
+	EventQueueMaxBytes uint32
+	Capabilities       uint32
 }
 
 // NewConfig returns a Config populated with the library's defaults
-// (4 channels, 64 max connections, 10s timeout, 1s keepalive, encryption on).
+// (via nl_config_default: 4 channels, 64 max connections, 10s timeout,
+// 1s keepalive, encryption on, plus transport/window/capabilities).
 func NewConfig() Config {
 	var raw C.nl_config_t
 	C.nl_config_default(&raw)
@@ -133,7 +139,12 @@ func NewConfig() Config {
 		ConnectionTimeoutMs: uint32(raw.connection_timeout_ms),
 		KeepaliveIntervalMs: uint32(raw.keepalive_interval_ms),
 		EncryptionEnabled:   bool(raw.encryption_enabled),
-		Family:              AFUnspec,
+		Family:              AddressFamily(raw.family),
+		Transport:           Transport(raw.transport),
+		MaxSendBytesPerSec:  uint32(raw.max_send_bytes_per_sec),
+		RecvWindowBytes:     uint32(raw.recv_window_bytes),
+		EventQueueMaxBytes:  uint32(raw.event_queue_max_bytes),
+		Capabilities:        uint32(raw.capabilities),
 	}
 }
 
@@ -146,6 +157,11 @@ func (c Config) toC() (C.nl_config_t, *C.char) {
 	raw.keepalive_interval_ms = C.uint32_t(c.KeepaliveIntervalMs)
 	raw.encryption_enabled = C.bool(c.EncryptionEnabled)
 	raw.family = C.nl_af_t(c.Family)
+	raw.transport = C.nl_transport_t(c.Transport)
+	raw.max_send_bytes_per_sec = C.uint32_t(c.MaxSendBytesPerSec)
+	raw.recv_window_bytes = C.uint32_t(c.RecvWindowBytes)
+	raw.event_queue_max_bytes = C.uint32_t(c.EventQueueMaxBytes)
+	raw.capabilities = C.uint32_t(c.Capabilities)
 	var nameCStr *C.char
 	if c.ServerName != "" {
 		nameCStr = C.CString(c.ServerName) // caller must free after nl_server_create returns
@@ -154,8 +170,11 @@ func (c Config) toC() (C.nl_config_t, *C.char) {
 	return raw, nameCStr
 }
 
-func addressToC(host string, port uint16, family AddressFamily) (C.nl_address_t, *C.char) {
+func addressToC(host string, port uint16, family AddressFamily) (C.nl_address_t, error) {
 	var addr C.nl_address_t
+	if len(host) >= len(addr.host) {
+		return addr, &Error{Code: -1, Message: "invalid argument"}
+	}
 	cHost := C.CString(host)
 	defer C.free(unsafe.Pointer(cHost))
 	// nl_address_t.host is a fixed-size char[64] array, not a pointer --
@@ -164,6 +183,17 @@ func addressToC(host string, port uint16, family AddressFamily) (C.nl_address_t,
 	addr.port = C.uint16_t(port)
 	addr.family = C.nl_af_t(family)
 	return addr, nil
+}
+
+func clampTimeoutMs(d time.Duration) C.int {
+	if d < 0 {
+		return -1
+	}
+	ms := d.Milliseconds()
+	if ms > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	return C.int(ms)
 }
 
 // Event mirrors nl_event_t, with `Data` copied into a Go-owned []byte
@@ -235,10 +265,7 @@ func (e *Endpoint) SendEx(peer PeerID, channel uint8, delivery Delivery, data []
 // blocks forever; zero returns immediately if nothing is queued.
 func (e *Endpoint) PollEvent(timeout time.Duration) (Event, bool) {
 	var raw C.nl_event_t
-	ms := C.int(-1)
-	if timeout >= 0 {
-		ms = C.int(timeout.Milliseconds())
-	}
+	ms := clampTimeoutMs(timeout)
 	ok := C.nl_poll_event(e.handle, &raw, ms)
 	if !bool(ok) {
 		return Event{}, false
@@ -307,7 +334,10 @@ type Server struct {
 // NewServer binds a UDP socket at host:port and starts accepting
 // connections in a background thread.
 func NewServer(host string, port uint16, cfg Config) (*Server, error) {
-	addr, _ := addressToC(host, port, cfg.Family)
+	addr, err := addressToC(host, port, cfg.Family)
+	if err != nil {
+		return nil, err
+	}
 	cCfg, nameCStr := cfg.toC()
 	if nameCStr != nil {
 		defer C.free(unsafe.Pointer(nameCStr))
@@ -350,7 +380,10 @@ func NewClient(cfg Config) (*Client, error) {
 // the peer id that will be used for this connection once established;
 // wait for an EventConnected (or EventConnectFailed) via PollEvent.
 func (c *Client) Connect(host string, port uint16) (PeerID, error) {
-	addr, _ := addressToC(host, port, AFUnspec)
+	addr, err := addressToC(host, port, AFUnspec)
+	if err != nil {
+		return 0, err
+	}
 	var peer C.nl_peer_id_t
 	res := C.nl_connect(c.handle, &addr, &peer)
 	if err := newError(res); err != nil {
@@ -362,7 +395,7 @@ func (c *Client) Connect(host string, port uint16) (PeerID, error) {
 // ProbeLAN broadcasts a discovery probe; replies arrive as
 // EventDiscoveryReply events over subsequent PollEvent calls.
 func (c *Client) ProbeLAN(discoveryPort uint16, timeout time.Duration) error {
-	return newError(C.nl_discovery_probe(c.handle, C.uint16_t(discoveryPort), C.int(timeout.Milliseconds())))
+	return newError(C.nl_discovery_probe(c.handle, C.uint16_t(discoveryPort), clampTimeoutMs(timeout)))
 }
 
 // WaitConnected blocks (polling internally) until the connection succeeds

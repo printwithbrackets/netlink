@@ -1,8 +1,16 @@
 #include "../include/netlink.h"
 #include <string.h>
 
+#define NL_STR_(x) #x
+#define NL_STR(x) NL_STR_(x)
+
 const char *nl_version_string(void) {
-    return "1.1.1";
+    /* Built from the NL_VERSION_* macros so the string can never drift
+     * from the header (see test_version_string_matches_macros). */
+    static const char ver[] = NL_STR(NL_VERSION_MAJOR) "."
+                              NL_STR(NL_VERSION_MINOR) "."
+                              NL_STR(NL_VERSION_PATCH);
+    return ver;
 }
 
 const char *nl_error_string(nl_result_t code) {
@@ -42,5 +50,6 @@ void nl_config_default(nl_config_t *cfg) {
     cfg->server_name = NULL;
     cfg->max_send_bytes_per_sec = 0; /* unlimited */
     cfg->recv_window_bytes = 32768;
+    cfg->event_queue_max_bytes = NL_EVENT_QUEUE_MAX_BYTES_DEFAULT;
     cfg->capabilities = NL_CAP_DEFAULT;
 }

@@ -15,6 +15,14 @@ TEST(test_fragment_count_needed_rejects_oversized) {
     ASSERT_EQ(nl_fragment_count_needed(NL_MAX_MESSAGE_SIZE + 1), 0);
 }
 
+TEST(test_fragment_count_needed_exact_max_size_boundary) {
+    /* The documented maximum (256 KB) must still be sendable and must
+     * land exactly on the fragment cap: 262144 / 1024 = 256. One byte
+     * more is rejected (covered above); the boundary itself must not be. */
+    ASSERT_EQ(NL_MAX_MESSAGE_SIZE, (size_t)NL_MAX_FRAGMENTS * NL_FRAGMENT_CHUNK_SIZE);
+    ASSERT_EQ(nl_fragment_count_needed(NL_MAX_MESSAGE_SIZE), NL_MAX_FRAGMENTS);
+}
+
 TEST(test_fragment_get_chunk_splits_correctly) {
     size_t total = NL_FRAGMENT_CHUNK_SIZE + 100;
     uint8_t *data = (uint8_t *)malloc(total);
@@ -245,10 +253,76 @@ TEST(test_reassembly_message_id_reuse_after_completion) {
     nl_reassembly_tracker_free(&t);
 }
 
+TEST(test_reassembly_byte_budget_rejects_overcommitted_spread) {
+    /* A budgeted tracker must reject a new message whose declared size is
+     * beyond the remaining budget, even though slots exist -- the budget
+     * is about PINNED BYTES, not slot count, and the reserve is charged
+     * per message at acquisition (count x chunk, the full buffer size). */
+    nl_reassembly_tracker_t t;
+    nl_reassembly_tracker_init_budget(&t, 2048); /* exactly one 2-fragment message */
+    uint8_t full[NL_FRAGMENT_CHUNK_SIZE]; memset(full, 0, sizeof(full));
+    const uint8_t *out; uint32_t out_len;
+
+    /* The first in-flight message reserves the whole 2KB budget. */
+    ASSERT_EQ(nl_reassembly_feed(&t, 0, 1, 0, 2, full, sizeof(full), &out, &out_len), NL_REASSEMBLE_PENDING);
+    /* Second message: over budget, must not evict the in-flight one. */
+    ASSERT_EQ(nl_reassembly_feed(&t, 0, 2, 0, 2, full, sizeof(full), &out, &out_len), NL_REASSEMBLE_INVALID);
+
+    /* Completing a message releases its reserve back to the budget... */
+    ASSERT_EQ(nl_reassembly_feed(&t, 0, 1, 1, 2, full, 3, &out, &out_len), NL_REASSEMBLE_COMPLETE);
+    /* ...so a new message fits again. */
+    ASSERT_EQ(nl_reassembly_feed(&t, 0, 2, 0, 2, full, sizeof(full), &out, &out_len), NL_REASSEMBLE_PENDING);
+
+    nl_reassembly_tracker_free(&t);
+}
+
+TEST(test_reassembly_byte_budget_rejects_single_oversized_message) {
+    /* The reserve is the message's FULL declared size, so a message
+     * claiming more bytes than the budget allows cannot even start: the
+     * peer cannot drip its fragments in one at a time to exceed the
+     * budget mid-message. */
+    nl_reassembly_tracker_t t;
+    nl_reassembly_tracker_init_budget(&t, 1500);
+    uint8_t full[NL_FRAGMENT_CHUNK_SIZE]; memset(full, 0, sizeof(full));
+    const uint8_t *out; uint32_t out_len;
+
+    /* 3 fragments x 1024 = 3072 > 1500: rejected at acquisition. */
+    ASSERT_EQ(nl_reassembly_feed(&t, 0, 7, 0, 3, full, sizeof(full), &out, &out_len), NL_REASSEMBLE_INVALID);
+
+    nl_reassembly_tracker_free(&t);
+}
+
+TEST(test_reassembly_byte_budget_does_not_reject_max_size_message) {
+    /* The default budget must accommodate a full maximum-size message. */
+    ASSERT_TRUE(NL_REASSEMBLY_BYTE_BUDGET_DEFAULT > NL_MAX_MESSAGE_SIZE);
+
+    nl_reassembly_tracker_t t;
+    nl_reassembly_tracker_init_budget(&t, NL_REASSEMBLY_BYTE_BUDGET_DEFAULT);
+    uint8_t chunk[NL_FRAGMENT_CHUNK_SIZE]; memset(chunk, 0, sizeof(chunk));
+    const uint8_t *out; uint32_t out_len;
+    uint16_t count = nl_fragment_count_needed(NL_MAX_MESSAGE_SIZE);
+    ASSERT_TRUE(count > 0);
+    /* Feed the last fragment first (worst case for byte-reservation order),
+     * then enough full chunks to complete -- total in flight must stay
+     * within the budget for the message to ever complete. */
+    uint16_t last_index = (uint16_t)(count - 1);
+    ASSERT_EQ(nl_reassembly_feed(&t, 0, 42, last_index, count, chunk, NL_FRAGMENT_CHUNK_SIZE, &out, &out_len),
+              NL_REASSEMBLE_PENDING);
+    for (uint16_t i = 0; i < last_index; i++) {
+        uint16_t chunk_len = NL_FRAGMENT_CHUNK_SIZE;
+        nl_reassemble_result_t r = nl_reassembly_feed(&t, 0, 42, i, count, chunk, chunk_len, &out, &out_len);
+        ASSERT_EQ(r, (i == last_index - 1) ? NL_REASSEMBLE_COMPLETE : NL_REASSEMBLE_PENDING);
+    }
+    ASSERT_EQ(out_len, NL_MAX_MESSAGE_SIZE);
+
+    nl_reassembly_tracker_free(&t);
+}
+
 int main(void) {
     printf("=== fragment tests ===\n");
     RUN_TEST(test_fragment_count_needed_basic);
     RUN_TEST(test_fragment_count_needed_rejects_oversized);
+    RUN_TEST(test_fragment_count_needed_exact_max_size_boundary);
     RUN_TEST(test_fragment_get_chunk_splits_correctly);
     RUN_TEST(test_reassembly_single_fragment_message);
     RUN_TEST(test_reassembly_multi_fragment_in_order);
@@ -263,5 +337,8 @@ int main(void) {
     RUN_TEST(test_reassembly_bounded_concurrent_slots_evicts_oldest);
     RUN_TEST(test_reassembly_expiry_reclaims_stale_slot);
     RUN_TEST(test_reassembly_message_id_reuse_after_completion);
+    RUN_TEST(test_reassembly_byte_budget_rejects_overcommitted_spread);
+    RUN_TEST(test_reassembly_byte_budget_rejects_single_oversized_message);
+    RUN_TEST(test_reassembly_byte_budget_does_not_reject_max_size_message);
     TEST_SUMMARY();
 }

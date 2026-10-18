@@ -3,8 +3,8 @@
 Rust FFI bindings for [NetLink](../../README.md).
 
 **Testing status:** built and passing real-socket integration tests
-(`cargo test`) against the compiled C library. CI runs `cargo build` and
-`cargo test` on every push.
+(`cargo test`) against the compiled C library. CI runs a `rustfmt` check,
+`cargo build`, and `cargo test` on every push.
 
 ## Setup
 

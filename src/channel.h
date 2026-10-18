@@ -62,6 +62,10 @@ typedef struct {
     bool          seq_frag_active;
     nl_reassembly_tracker_t reassembly;  /* any mode carrying fragmented messages */
     bool          reassembly_init;
+    /* Declared-size cap on in-flight reassembly messages this lane's
+     * tracker may hold (0 = unlimited, unit tests). Written by
+     * nl_channel_set_reassembly_budget before any fragment can be fed. */
+    uint32_t      reassembly_byte_budget;
 } nl_lane_t;
 
 typedef struct {
@@ -70,6 +74,13 @@ typedef struct {
 
 void nl_channel_init(nl_channel_t *chan);
 void nl_channel_free(nl_channel_t *chan);
+
+/* Cap the total declared-size sum of in-flight reassembly messages
+ * across this channel's lanes: a message that would exceed it is
+ * rejected by the lane's reassembly tracker
+ * (see nl_reassembly_tracker_init_budget). Must be called before any
+ * fragment is fed. */
+void nl_channel_set_reassembly_budget(nl_channel_t *chan, uint32_t byte_budget);
 
 /* Called when an outgoing reliable packet on this channel might need
  * retransmitting. Scans all reliable lanes' send rings for unacked entries

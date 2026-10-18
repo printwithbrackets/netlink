@@ -13,6 +13,12 @@
  *     growing unboundedly).
  *   - incomplete reassemblies older than NL_REASSEMBLY_TIMEOUT_MS are
  *     reclaimed even without eviction pressure.
+ *   - the total in-flight reassembly size is budgeted per tracker
+ *     (byte_budget): an incomplete message charges its full declared size
+ *     at acquisition, and messages that would exceed the budget are
+ *     rejected without displacing in-flight ones, so a hostile peer
+ *     cannot multiply per-connection reassembly memory by spreading
+ *     fragments across concurrent message ids.
  *
  * Fragmentation is meaningful with any delivery mode, but for UNRELIABLE
  * modes the loss of a single fragment discards the whole message (there is
@@ -29,6 +35,16 @@
 
 #define NL_REASSEMBLY_SLOTS 4        /* concurrent in-flight messages per tracker */
 #define NL_REASSEMBLY_TIMEOUT_MS 8000
+
+/* Per-tracker budget on the SUM of the declared sizes (reserved at
+ * acquisition) of in-flight reassembly messages. Sized so a single
+ * maximum-size message can always reassemble, while a hostile peer
+ * cannot pin arbitrarily more than that by spreading fragments across
+ * concurrent message ids. nl_reassembly_tracker_init leaves the budget
+ * unlimited (0) for unit tests; real connections apply this default in
+ * nl_connection_create. */
+#define NL_REASSEMBLY_BYTE_BUDGET_DEFAULT \
+    ((uint32_t)NL_MAX_MESSAGE_SIZE + 2 * (uint32_t)NL_FRAGMENT_CHUNK_SIZE)
 
 /* Maximum application payload bytes carried by a single wire fragment. */
 #define NL_FRAGMENT_CHUNK_SIZE 1024
@@ -52,17 +68,31 @@ typedef struct {
     uint16_t fragment_count;
     uint16_t received_count;
     uint32_t total_len;      /* known once the last fragment (with a short chunk) arrives, else estimated */
+    uint32_t received_bytes; /* payload bytes accepted into this slot so far */
     bool     total_len_known;
     uint64_t first_seen_ms;
     bool    *fragment_received;  /* heap array, fragment_count entries */
-    uint8_t *data;                /* heap buffer, NL_MAX_MESSAGE_SIZE */
+    uint8_t *data;                /* heap buffer, sized to the declared message (see fragment.c) */
+    size_t   data_capacity;       /* allocated size of data, kept across messages */
+    uint32_t reserved_bytes;      /* fragment_count x chunk size, charged to the tracker's budget */
 } nl_reassembly_slot_t;
 
 typedef struct {
     nl_reassembly_slot_t slots[NL_REASSEMBLY_SLOTS];
+    /* Sum of reserved_bytes across ACTIVE slots. When acquiring a new
+     * message would push this past byte_budget (if nonzero), the message
+     * is rejected: a hostile peer cannot keep unboundedly many reassembly
+     * buffers pinned by spreading fragments across message ids. */
+    uint32_t in_flight_bytes;
+    uint32_t byte_budget; /* 0 = unlimited (unit tests, plain tracker init) */
 } nl_reassembly_tracker_t;
 
 void nl_reassembly_tracker_init(nl_reassembly_tracker_t *t);
+
+/* Same, with a per-tracker budget on the declared-size sum of in-flight
+ * reassembly messages (0 = unlimited). Called by connection setup so each
+ * connection's reassembly buffers stay within its own budget. */
+void nl_reassembly_tracker_init_budget(nl_reassembly_tracker_t *t, uint32_t byte_budget);
 void nl_reassembly_tracker_free(nl_reassembly_tracker_t *t);
 
 typedef enum {

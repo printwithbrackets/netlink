@@ -68,8 +68,8 @@ extern "C" {
 /* ----------------------------------------------------------------------- */
 
 #define NL_VERSION_MAJOR 1
-#define NL_VERSION_MINOR 1
-#define NL_VERSION_PATCH 1
+#define NL_VERSION_MINOR 2
+#define NL_VERSION_PATCH 0
 
 /* Wire protocol version. Bumped whenever the on-the-wire packet format
  * changes in an incompatible way. Peers with different values refuse to
@@ -238,12 +238,44 @@ typedef struct {
      * the endpoint will buffer before telling them to stop). 0 = default
      * (32768), clamped to 65535 to fit the u16 wire field. */
     uint32_t       recv_window_bytes;
+    /* Global byte cap on event payload bytes queued endpoint-wide across
+     * all connections (sum of the payload lengths of events not yet
+     * consumed with nl_poll_event). When a new event would push the total
+     * above the cap, that event is REJECTED (not queued) and the sender
+     * keeps its receive-window charge for it, so its flow-control window
+     * stays closed first. This caps the memory one hostile peer -- or a
+     * burst across all peers -- can pin in the queue; draining with
+     * nl_poll_event opens room again. Queued events already accepted are
+     * never dropped by this limit.
+     *
+     * 0 = library default (NL_EVENT_QUEUE_MAX_BYTES_DEFAULT, sized at
+     * roughly the default configuration's peak: 64 connections x the
+     * 32768-byte default receive window, rounded up). NL_EVENT_QUEUE_
+     * UNLIMITED restores the effectively unbounded queue of 1.1.x
+     * explicitly. Note events other than NL_EVENT_DATA carry a zero
+     * payload length and fit freely, but under a full queue they are
+     * rejected like any other event until the queue drains below the cap. */
+    uint32_t       event_queue_max_bytes;
     /* Capability bits advertised in the handshake (0 = NL_CAP_DEFAULT).
      * NL_CAP_FLOW_CONTROL is always forced on. */
     uint32_t       capabilities;
 } nl_config_t;
 
-/* 64 bytes would be the pre-v2 size; 56 is with all three v2 fields. */
+/* Sane default for nl_config_t.event_queue_max_bytes (0 means "this"
+ * value): ~2x the default configuration's peak queued bytes
+ * (64 connections x the 32768-byte default receive window), leaving
+ * headroom for per-thread payload borrows, which are charged to the
+ * connection but never sit in the queue itself. Raise it alongside
+ * max_connections/recv_window_bytes in configs that use bigger values. */
+#define NL_EVENT_QUEUE_MAX_BYTES_DEFAULT (4u * 1024u * 1024u)
+/* Set nl_config_t.event_queue_max_bytes to this to restore the 1.1.x
+ * effectively unbounded event queue explicitly. */
+#define NL_EVENT_QUEUE_UNLIMITED 0xFFFFFFFFu
+
+/* 64 bytes would be the pre-v2 size; 56 is with all three v2 fields AND
+ * event_queue_max_bytes (a trailing-alignment pad slot absorbs the v2
+ * extension, so the 64-bit size was already 56 -- the mirror-side asserts
+ * below are what actually catches a forgotten field on either side). */
 NL_ABI_ASSERT(sizeof(nl_config_t) == 56,
               "nl_config_t changed size -- update the Python/Rust mirrors "
               "and their size assertions (they mirror this struct by hand)");
@@ -305,7 +337,8 @@ NL_API nl_result_t nl_client_create(const nl_config_t *cfg,
 /* Begin connecting to a remote server. Non-blocking; results in an
  * NL_EVENT_CONNECTED or NL_EVENT_CONNECT_FAILED event. Returns
  * NL_ERR_ALREADY_CONNECTED if a handshake to this address is already in
- * flight or a connection to it already exists. */
+ * flight or a connection to it already exists. An empty server_addr.host
+ * is NL_ERR_INVALID_ARGUMENT (it never defaults to 127.0.0.1). */
 NL_API nl_result_t nl_connect(nl_endpoint_t *ep, const nl_address_t *server_addr,
                                nl_peer_id_t *out_peer);
 
@@ -313,7 +346,15 @@ NL_API nl_result_t nl_connect(nl_endpoint_t *ep, const nl_address_t *server_addr
 NL_API nl_result_t nl_disconnect(nl_endpoint_t *ep, nl_peer_id_t peer);
 
 /* Shut down the endpoint, stop threads, free all resources.
- * Any peer handles from this endpoint become invalid. */
+ * Any peer handles from this endpoint become invalid.
+ *
+ * Contract: no other thread may be inside any nl_* call on `ep` when
+ * destroy is invoked, with one exception: threads already blocked in
+ * nl_poll_event at that moment (any timeout, including -1) are woken and
+ * return false safely, so they never touch ep memory after destroy frees
+ * it. A poll that is mid-return when destroy starts also completes its
+ * final bookkeeping before destroy's wait-for-pollers finishes, so queued
+ * payloads and the queue itself cannot be freed under an exiting poller. */
 NL_API void nl_endpoint_destroy(nl_endpoint_t *ep);
 
 /* ----------------------------------------------------------------------- */
@@ -324,11 +365,15 @@ NL_API void nl_endpoint_destroy(nl_endpoint_t *ep);
  * Thread-safe: may be called concurrently from multiple threads, including
  * concurrently with nl_poll_event(). Copies `data` internally; the caller's
  * buffer may be reused/freed immediately after this returns.
+ * `data` may be NULL when len is 0 (a valid, deliverable empty message).
  *
  * Equivalent to nl_send_ex(..., NL_PRIORITY_NORMAL). The send may be
  * deferred internally (congestion window, peer receive window, or rate
  * limit) and still return NL_OK -- NL_ERR_QUEUE_FULL is only returned
- * when the per-connection deferred queue itself is full. */
+ * when the per-connection deferred queue itself is full. The deferred
+ * queue is bounded per connection to 128 messages AND
+ * NL_MAX_MESSAGE_SIZE + 64KB of payload bytes (both bound the memory a
+ * sender's own application can allocate against a stalled peer). */
 NL_API nl_result_t nl_send(nl_endpoint_t *ep, nl_peer_id_t peer, uint8_t channel,
                             nl_delivery_t delivery, const uint8_t *data, size_t len);
 
@@ -347,7 +392,11 @@ NL_API nl_result_t nl_send_ex(nl_endpoint_t *ep, nl_peer_id_t peer, uint8_t chan
  * borrowed to the CALLING THREAD: it stays valid until that same thread's
  * next call to nl_poll_event, or until the endpoint is destroyed. Other
  * threads polling in the meantime never free it. Copy the bytes if you need
- * them longer. */
+ * them longer.
+ *
+ * If nl_endpoint_destroy is called while this call is blocked (any timeout,
+ * including -1), it wakes the blocked poller and the call returns false;
+ * see the destroy contract on nl_endpoint_destroy. */
 NL_API bool nl_poll_event(nl_endpoint_t *ep, nl_event_t *out, int timeout_ms);
 
 /* ----------------------------------------------------------------------- */
@@ -373,7 +422,7 @@ NL_API uint32_t nl_peer_count(nl_endpoint_t *ep);
  * counts, retransmissions (RTO-triggered and fast-retransmit combined),
  * duplicate/replayed packets rejected, and RTT statistics (smoothed RTT,
  * smoothed RTT variance, and the currently-derived retransmit timeout --
- * see the README's Architecture section for the estimation algorithm).
+ * see the README's Features section for the estimation algorithm).
  * Useful for in-game network diagnostics ("Ping: 42ms, Loss: 0.7%") or
  * server-side monitoring. */
 typedef struct {

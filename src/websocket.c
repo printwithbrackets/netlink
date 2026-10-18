@@ -48,7 +48,13 @@ size_t nl_ws_frame_size(size_t payload_len, bool mask) {
 size_t nl_ws_encode(uint8_t opcode, const uint8_t *payload, size_t payload_len,
                     bool mask, uint8_t *out, size_t out_cap) {
     if (!out) return 0;
-    if (opcode > 0xF) return 0;
+    /* Allowlist only the opcodes RFC6455 defines: data (0x0-0x2) and
+     * control (0x8-0xA). Reserved 0x3-0x7 / 0xB-0xF must never go on the
+     * wire (a peer would have to drop them as protocol errors). */
+    if (opcode != NL_WS_OPCODE_CONT && opcode != NL_WS_OPCODE_TEXT &&
+        opcode != NL_WS_OPCODE_BINARY && opcode != NL_WS_OPCODE_CLOSE &&
+        opcode != NL_WS_OPCODE_PING && opcode != NL_WS_OPCODE_PONG)
+        return 0;
     /* Control frames must be FIN and <= 125 (RFC 6455 §5.5). */
     if (opcode >= 0x8) {
         if (payload_len > 125) return 0;

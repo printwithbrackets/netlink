@@ -43,10 +43,16 @@ fn main() {
 
         match ev.event_type {
             EventType::Connected => {
-                println!("[+] peer {} connected from {}:{}", ev.peer, ev.from_host, ev.from_port);
+                println!(
+                    "[+] peer {} connected from {}:{}",
+                    ev.peer, ev.from_host, ev.from_port
+                );
             }
             EventType::Disconnected => {
-                println!("[-] peer {} disconnected ({:?})", ev.peer, ev.disconnect_reason);
+                println!(
+                    "[-] peer {} disconnected ({:?})",
+                    ev.peer, ev.disconnect_reason
+                );
             }
             EventType::Data => {
                 println!(
@@ -57,7 +63,9 @@ fn main() {
                 );
                 // Echo back reliably-ordered regardless of how it arrived,
                 // mirroring the C, Python, and Go examples for consistency.
-                if let Err(e) = server.send(ev.peer, ev.channel, Delivery::ReliableOrdered, &ev.data) {
+                if let Err(e) =
+                    server.send(ev.peer, ev.channel, Delivery::ReliableOrdered, &ev.data)
+                {
                     eprintln!("send failed: {}", e);
                 }
             }

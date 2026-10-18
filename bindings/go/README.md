@@ -4,7 +4,7 @@ Go (cgo) bindings for [NetLink](../../README.md).
 
 **Testing status:** built, vetted, and passing real-socket integration
 tests (`go test ./...`) against the compiled C library. CI runs
-`go build`, `go vet`, and `go test` on every push.
+`go build`, `go vet`, a `gofmt` check, and `go test` on every push.
 
 ## Setup
 

@@ -1,13 +1,7 @@
 //! Rust bindings for the NetLink C library.
 //!
-//! **Testing status:** the C core and Python bindings in this repository
-//! were built and run in the environment that produced them, including a
-//! full test suite over real sockets. This Rust binding was **not** -- no
-//! Rust toolchain was available in that environment. It's written
-//! carefully against the same C ABI (`include/netlink.h`) the Python
-//! bindings were verified against byte-for-byte, but treat it as needing
-//! its first real `cargo build && cargo test` pass rather than
-//! pre-verified. Contributions confirming (or fixing) it are very welcome.
+//! Thin wrapper over the stable C ABI (`include/netlink.h`); covered by
+//! real-socket tests (`cargo test`).
 //!
 //! # Example
 //! ```no_run
@@ -58,6 +52,7 @@ mod raw {
         // Fields added with protocol v2 (keep in sync with nl_config_t).
         pub max_send_bytes_per_sec: u32,
         pub recv_window_bytes: u32,
+        pub event_queue_max_bytes: u32,
         pub capabilities: u32,
     }
 
@@ -86,8 +81,15 @@ mod raw {
             cfg: *const nl_config_t,
             out_endpoint: *mut *mut nl_endpoint_t,
         ) -> c_int;
-        pub fn nl_client_create(cfg: *const nl_config_t, out_endpoint: *mut *mut nl_endpoint_t) -> c_int;
-        pub fn nl_connect(ep: *mut nl_endpoint_t, server_addr: *const nl_address_t, out_peer: *mut u64) -> c_int;
+        pub fn nl_client_create(
+            cfg: *const nl_config_t,
+            out_endpoint: *mut *mut nl_endpoint_t,
+        ) -> c_int;
+        pub fn nl_connect(
+            ep: *mut nl_endpoint_t,
+            server_addr: *const nl_address_t,
+            out_peer: *mut u64,
+        ) -> c_int;
         pub fn nl_disconnect(ep: *mut nl_endpoint_t, peer: u64) -> c_int;
         pub fn nl_endpoint_destroy(ep: *mut nl_endpoint_t);
 
@@ -108,10 +110,18 @@ mod raw {
             len: usize,
             priority: u8,
         ) -> c_int;
-        pub fn nl_poll_event(ep: *mut nl_endpoint_t, out: *mut nl_event_t, timeout_ms: c_int) -> bool;
+        pub fn nl_poll_event(
+            ep: *mut nl_endpoint_t,
+            out: *mut nl_event_t,
+            timeout_ms: c_int,
+        ) -> bool;
 
         pub fn nl_discovery_enable(ep: *mut nl_endpoint_t, discovery_port: u16) -> c_int;
-        pub fn nl_discovery_probe(ep: *mut nl_endpoint_t, discovery_port: u16, timeout_ms: c_int) -> c_int;
+        pub fn nl_discovery_probe(
+            ep: *mut nl_endpoint_t,
+            discovery_port: u16,
+            timeout_ms: c_int,
+        ) -> c_int;
 
         pub fn nl_peer_rtt_ms(ep: *mut nl_endpoint_t, peer: u64) -> u32;
         pub fn nl_peer_count(ep: *mut nl_endpoint_t) -> u32;
@@ -225,13 +235,24 @@ fn check(code: c_int) -> Result<(), NetLinkError> {
                 CStr::from_ptr(ptr).to_string_lossy().into_owned()
             }
         };
-        Err(NetLinkError { code: code as i32, message: msg })
+        Err(NetLinkError {
+            code: code as i32,
+            message: msg,
+        })
     }
 }
 
+/// Transport selection (mirrors `nl_transport_t`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    Udp = 0,
+    WebSocket = 1,
+}
+
 /// Endpoint configuration. Use `Config::default()` for the library's
-/// defaults (4 channels, 64 max connections, 10s idle timeout, 1s
-/// keepalive, encryption on).
+/// defaults (via `nl_config_default`: 4 channels, 64 max connections,
+/// 10s idle timeout, 1s keepalive, encryption on, plus transport/window/
+/// capabilities).
 #[derive(Debug, Clone)]
 pub struct Config {
     pub channel_count: u8,
@@ -240,6 +261,14 @@ pub struct Config {
     pub keepalive_interval_ms: u32,
     pub encryption_enabled: bool,
     pub server_name: Option<String>,
+    pub family: i32,
+    pub transport: Transport,
+    pub max_send_bytes_per_sec: u32,
+    pub recv_window_bytes: u32,
+    /// Global byte cap on queued event payloads; 0 = library default
+    /// (NL_EVENT_QUEUE_MAX_BYTES_DEFAULT), 0xFFFFFFFF = unlimited.
+    pub event_queue_max_bytes: u32,
+    pub capabilities: u32,
 }
 
 impl Default for Config {
@@ -255,6 +284,16 @@ impl Default for Config {
                 keepalive_interval_ms: raw_cfg.keepalive_interval_ms,
                 encryption_enabled: raw_cfg.encryption_enabled,
                 server_name: None,
+                family: raw_cfg.family,
+                transport: if raw_cfg.transport == 1 {
+                    Transport::WebSocket
+                } else {
+                    Transport::Udp
+                },
+                max_send_bytes_per_sec: raw_cfg.max_send_bytes_per_sec,
+                recv_window_bytes: raw_cfg.recv_window_bytes,
+                event_queue_max_bytes: raw_cfg.event_queue_max_bytes,
+                capabilities: raw_cfg.capabilities,
             }
         }
     }
@@ -272,6 +311,12 @@ impl Config {
         raw_cfg.connection_timeout_ms = self.connection_timeout_ms;
         raw_cfg.keepalive_interval_ms = self.keepalive_interval_ms;
         raw_cfg.encryption_enabled = self.encryption_enabled;
+        raw_cfg.family = self.family;
+        raw_cfg.transport = self.transport as c_int;
+        raw_cfg.max_send_bytes_per_sec = self.max_send_bytes_per_sec;
+        raw_cfg.recv_window_bytes = self.recv_window_bytes;
+        raw_cfg.event_queue_max_bytes = self.event_queue_max_bytes;
+        raw_cfg.capabilities = self.capabilities;
         if let Some(name) = &self.server_name {
             let cstr = CString::new(name.as_str()).unwrap_or_default();
             raw_cfg.server_name = cstr.as_ptr();
@@ -281,7 +326,18 @@ impl Config {
     }
 }
 
-fn make_address(host: &str, port: u16) -> raw::nl_address_t {
+fn clamp_timeout_ms(timeout: Duration) -> c_int {
+    let ms = timeout.as_millis().min(i32::MAX as u128) as c_int;
+    ms
+}
+
+fn make_address(host: &str, port: u16) -> Result<raw::nl_address_t, NetLinkError> {
+    if host.len() >= 64 {
+        return Err(NetLinkError {
+            code: -1,
+            message: "invalid argument".to_string(),
+        });
+    }
     let mut addr = raw::nl_address_t {
         host: [0 as c_char; 64],
         port,
@@ -292,7 +348,7 @@ fn make_address(host: &str, port: u16) -> raw::nl_address_t {
     for i in 0..n {
         addr.host[i] = bytes[i] as c_char;
     }
-    addr
+    Ok(addr)
 }
 
 /// A received event. `data` is an owned copy (the underlying C buffer is
@@ -361,9 +417,28 @@ unsafe impl Sync for Endpoint {}
 impl Endpoint {
     /// Enqueue `data` for delivery to `peer` on `channel` with the given
     /// delivery guarantee. Safe to call from any thread.
-    pub fn send(&self, peer: PeerId, channel: u8, delivery: Delivery, data: &[u8]) -> Result<(), NetLinkError> {
-        let ptr = if data.is_empty() { std::ptr::null() } else { data.as_ptr() };
-        let res = unsafe { raw::nl_send(self.handle, peer, channel, delivery as c_int, ptr, data.len()) };
+    pub fn send(
+        &self,
+        peer: PeerId,
+        channel: u8,
+        delivery: Delivery,
+        data: &[u8],
+    ) -> Result<(), NetLinkError> {
+        let ptr = if data.is_empty() {
+            std::ptr::null()
+        } else {
+            data.as_ptr()
+        };
+        let res = unsafe {
+            raw::nl_send(
+                self.handle,
+                peer,
+                channel,
+                delivery as c_int,
+                ptr,
+                data.len(),
+            )
+        };
         check(res)
     }
 
@@ -378,8 +453,22 @@ impl Endpoint {
         data: &[u8],
         priority: u8,
     ) -> Result<(), NetLinkError> {
-        let ptr = if data.is_empty() { std::ptr::null() } else { data.as_ptr() };
-        let res = unsafe { raw::nl_send_ex(self.handle, peer, channel, delivery as c_int, ptr, data.len(), priority) };
+        let ptr = if data.is_empty() {
+            std::ptr::null()
+        } else {
+            data.as_ptr()
+        };
+        let res = unsafe {
+            raw::nl_send_ex(
+                self.handle,
+                peer,
+                channel,
+                delivery as c_int,
+                ptr,
+                data.len(),
+                priority,
+            )
+        };
         check(res)
     }
 
@@ -392,7 +481,7 @@ impl Endpoint {
     /// `poll_event` call.
     pub fn poll_event(&self, timeout: Duration) -> Option<Event> {
         let mut raw_ev = unsafe { std::mem::zeroed::<raw::nl_event_t>() };
-        let ms = timeout.as_millis().min(i32::MAX as u128) as c_int;
+        let ms = clamp_timeout_ms(timeout);
         let got = unsafe { raw::nl_poll_event(self.handle, &mut raw_ev, ms) };
         if got {
             Some(event_from_raw(&raw_ev))
@@ -440,7 +529,11 @@ impl Endpoint {
     pub fn peer_capabilities(&self, peer: PeerId) -> Option<u32> {
         let mut caps: u32 = 0;
         let ok = unsafe { raw::nl_peer_capabilities(self.handle, peer, &mut caps) };
-        if ok { Some(caps) } else { None }
+        if ok {
+            Some(caps)
+        } else {
+            None
+        }
     }
 }
 
@@ -468,13 +561,15 @@ impl std::ops::Deref for Server {
 impl Server {
     /// Bind to `host:port` and start accepting connections in a background thread.
     pub fn new(host: &str, port: u16, config: Config) -> Result<Self, NetLinkError> {
-        let addr = make_address(host, port);
+        let addr = make_address(host, port)?;
         let mut name_storage = None;
         let raw_cfg = config.to_raw(&mut name_storage);
         let mut handle: *mut raw::nl_endpoint_t = std::ptr::null_mut();
         let res = unsafe { raw::nl_server_create(&addr, &raw_cfg, &mut handle) };
         check(res)?;
-        Ok(Server { inner: Endpoint { handle } })
+        Ok(Server {
+            inner: Endpoint { handle },
+        })
     }
 
     /// Start responding to LAN discovery broadcasts on `discovery_port`.
@@ -502,14 +597,16 @@ impl Client {
         let mut handle: *mut raw::nl_endpoint_t = std::ptr::null_mut();
         let res = unsafe { raw::nl_client_create(&raw_cfg, &mut handle) };
         check(res)?;
-        Ok(Client { inner: Endpoint { handle } })
+        Ok(Client {
+            inner: Endpoint { handle },
+        })
     }
 
     /// Begin connecting to `host:port`. Returns immediately with the peer
     /// id that will identify this connection; wait for `Connected` (or
     /// `ConnectFailed`) via `poll_event` or `wait_connected`.
     pub fn connect(&mut self, host: &str, port: u16) -> Result<PeerId, NetLinkError> {
-        let addr = make_address(host, port);
+        let addr = make_address(host, port)?;
         let mut peer: u64 = 0;
         let res = unsafe { raw::nl_connect(self.inner.handle, &addr, &mut peer) };
         check(res)?;
@@ -520,7 +617,7 @@ impl Client {
     /// events over subsequent `poll_event` calls.
     pub fn probe_lan(&self, discovery_port: u16, timeout: Duration) -> Result<(), NetLinkError> {
         check(unsafe {
-            raw::nl_discovery_probe(self.inner.handle, discovery_port, timeout.as_millis() as c_int)
+            raw::nl_discovery_probe(self.inner.handle, discovery_port, clamp_timeout_ms(timeout))
         })
     }
 
@@ -530,16 +627,25 @@ impl Client {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if let Some(ev) = self.inner.poll_event(Duration::from_millis(100)) {
-                if ev.event_type == EventType::Connected || ev.event_type == EventType::ConnectFailed {
+                if ev.event_type == EventType::Connected
+                    || ev.event_type == EventType::ConnectFailed
+                {
                     return Ok(ev);
                 }
             }
         }
-        Err(NetLinkError { code: -12, message: "timed out waiting to connect".to_string() })
+        Err(NetLinkError {
+            code: -12,
+            message: "timed out waiting to connect".to_string(),
+        })
     }
 }
 
-/// Returns the library's version string (e.g. "1.1.1").
+/// Returns the library's version string (e.g. "1.2.0").
 pub fn version() -> String {
-    unsafe { CStr::from_ptr(raw::nl_version_string()).to_string_lossy().into_owned() }
+    unsafe {
+        CStr::from_ptr(raw::nl_version_string())
+            .to_string_lossy()
+            .into_owned()
+    }
 }

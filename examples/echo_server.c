@@ -10,8 +10,19 @@
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
+static uint16_t parse_port(const char *s, uint16_t dflt) {
+    if (!s) return dflt;
+    char *end = NULL;
+    unsigned long v = strtoul(s, &end, 10);
+    if (end == s || *end != '\0' || v > 65535) {
+        fprintf(stderr, "invalid port '%s', using %u\n", s, dflt);
+        return dflt;
+    }
+    return (uint16_t)v;
+}
+
 int main(int argc, char **argv) {
-    uint16_t port = argc > 1 ? (uint16_t)atoi(argv[1]) : 9000;
+    uint16_t port = argc > 1 ? parse_port(argv[1], 9000) : 9000;
 
     setvbuf(stdout, NULL, _IOLBF, 0); /* line-buffer even when redirected, so logs show up promptly */
     signal(SIGINT, on_signal);
@@ -23,7 +34,7 @@ int main(int argc, char **argv) {
 
     nl_address_t bind_addr;
     memset(&bind_addr, 0, sizeof(bind_addr));
-    strncpy(bind_addr.host, "0.0.0.0", sizeof(bind_addr.host) - 1);
+    snprintf(bind_addr.host, sizeof(bind_addr.host), "%s", "0.0.0.0");
     bind_addr.port = port;
     bind_addr.family = NL_AF_INET;
 
@@ -57,7 +68,11 @@ int main(int argc, char **argv) {
                 /* Echo back reliably-ordered regardless of how it arrived,
                  * for simplicity; a real app would usually mirror the
                  * original delivery mode. */
-                nl_send(server, ev.peer, ev.channel, NL_RELIABLE_ORDERED, ev.data, ev.data_len);
+                if (nl_send(server, ev.peer, ev.channel, NL_RELIABLE_ORDERED,
+                            ev.data, ev.data_len) != NL_OK) {
+                    fprintf(stderr, "echo send to peer %llu failed\n",
+                            (unsigned long long)ev.peer);
+                }
                 break;
             default:
                 break;

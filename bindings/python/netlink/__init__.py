@@ -32,7 +32,7 @@ import time
 from dataclasses import dataclass
 from typing import Iterator, Optional
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 
 __all__ = [
     "Delivery", "EventType", "AddressFamily", "Transport", "Priority",
@@ -162,6 +162,7 @@ class _Config(ctypes.Structure):
         # Fields added with protocol v2 (keep in sync with nl_config_t).
         ("max_send_bytes_per_sec", ctypes.c_uint32),
         ("recv_window_bytes", ctypes.c_uint32),
+        ("event_queue_max_bytes", ctypes.c_uint32),
         ("capabilities", ctypes.c_uint32),
     ]
 
@@ -259,7 +260,7 @@ def _check(code: int) -> None:
 
 
 def version() -> str:
-    """Return the loaded C library's version string (e.g. "1.1.1")."""
+    """Return the loaded C library's version string (e.g. "1.2.0")."""
     raw = _lib.nl_version_string()
     return raw.decode("utf-8") if raw else ""
 
@@ -283,7 +284,7 @@ class Event:
     @staticmethod
     def _from_raw(raw: _Event) -> "Event":
         data = b""
-        if raw.event_type == EventType.DATA.value and raw.data_len > 0:
+        if raw.event_type == EventType.DATA.value and raw.data_len > 0 and raw.data:
             data = bytes(ctypes.cast(raw.data, ctypes.POINTER(ctypes.c_uint8 * raw.data_len)).contents)
         address = None
         if raw.from_address.host:
@@ -324,6 +325,12 @@ class Config:
     encryption_enabled: bool = True
     server_name: str = ""
     family: AddressFamily = AddressFamily.UNSPEC
+    transport: Transport = Transport.UDP
+    max_send_bytes_per_sec: int = 0
+    recv_window_bytes: int = 32768
+    # 0 = C default (NL_EVENT_QUEUE_MAX_BYTES_DEFAULT); 0xFFFFFFFF = unlimited.
+    event_queue_max_bytes: int = 0
+    capabilities: int = CapFlowControl | CapPriority | CapRateLimit
 
     def _to_raw(self) -> _Config:
         raw = _Config()
@@ -334,14 +341,33 @@ class Config:
         raw.keepalive_interval_ms = self.keepalive_interval_ms
         raw.encryption_enabled = self.encryption_enabled
         raw.family = int(self.family)
+        raw.transport = int(self.transport)
+        raw.max_send_bytes_per_sec = self.max_send_bytes_per_sec
+        raw.recv_window_bytes = self.recv_window_bytes
+        raw.event_queue_max_bytes = self.event_queue_max_bytes
+        raw.capabilities = self.capabilities
         self._name_buf = self.server_name.encode("utf-8")  # keep alive: c_char_p doesn't own it
         raw.server_name = self._name_buf if self.server_name else None
         return raw
 
 
+_INT_MAX = 2 ** 31 - 1
+
+
+def _timeout_ms(timeout: float) -> int:
+    """Clamp a seconds timeout to a C int milliseconds (INT_MAX)."""
+    if timeout < 0:
+        return -1
+    ms = int(timeout * 1000)
+    return min(ms, _INT_MAX)
+
+
 def _make_address(host: str, port: int, family: AddressFamily = AddressFamily.UNSPEC) -> _Address:
+    raw = host.encode("utf-8")
+    if len(raw) >= 64:
+        raise NetLinkError(-1)  # NL_ERR_INVALID_ARGUMENT: host must fit in 64-byte buffer
     addr = _Address()
-    addr.host = host.encode("utf-8")
+    addr.host = raw
     addr.port = port
     addr.family = int(family)
     return addr
@@ -369,7 +395,7 @@ class Endpoint:
     def poll(self, timeout: float = 0.0) -> Optional[Event]:
         """Poll for a single event. timeout is in seconds; negative blocks forever."""
         raw = _Event()
-        timeout_ms = -1 if timeout < 0 else int(timeout * 1000)
+        timeout_ms = _timeout_ms(timeout)
         if _lib.nl_poll_event(self._handle, ctypes.byref(raw), timeout_ms):
             return Event._from_raw(raw)
         return None
@@ -463,7 +489,7 @@ class Client(Endpoint):
         return peer.value
 
     def probe_lan(self, discovery_port: int, timeout: float = 1.0) -> None:
-        _check(_lib.nl_discovery_probe(self._handle, discovery_port, int(timeout * 1000)))
+        _check(_lib.nl_discovery_probe(self._handle, discovery_port, _timeout_ms(timeout)))
 
     def wait_connected(self, timeout: float = 5.0) -> Event:
         """Block until CONNECTED or CONNECT_FAILED, or raise TimeoutError."""

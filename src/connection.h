@@ -82,8 +82,14 @@ typedef struct nl_deferred_msg {
 /* A generic sink for events/packets a connection needs to hand back up to
  * the endpoint (queueing an event, or sending bytes on the wire). Kept as
  * function pointers + a context so connection.c has zero dependency on
- * endpoint.c's internals. */
-typedef void (*nl_conn_deliver_event_fn)(void *ctx, nl_peer_id_t peer, uint8_t channel,
+ * endpoint.c's internals.
+ *
+ * on_data returns true when the event was queued. A false return means the
+ * event was NOT handed to the application (hooked, for example, by
+ * push_event under the endpoint's global event-queue byte cap): in that
+ * case the connection must not charge its receive window for the payload,
+ * because no application-visible copy exists to release it. */
+typedef bool (*nl_conn_deliver_event_fn)(void *ctx, nl_peer_id_t peer, uint8_t channel,
                                           nl_delivery_t delivery, const uint8_t *data, uint32_t len);
 typedef void (*nl_conn_disconnected_fn)(void *ctx, nl_peer_id_t peer, nl_result_t reason);
 typedef void (*nl_conn_send_wire_fn)(void *ctx, nl_peer_id_t peer, const uint8_t *packet, size_t len);

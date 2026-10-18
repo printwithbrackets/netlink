@@ -544,6 +544,144 @@ TEST(test_threading_concurrent_connects) {
     nl_endpoint_destroy(server);
 }
 
+/* Regression (P0-1): destroying an endpoint while a thread is blocked in
+ * nl_poll_event(timeout=-1) must wake the waiter instead of hanging forever
+ * or destroying queue_cond underneath it (UB). Without the shutdown flag +
+ * broadcast, the blocker never wakes and destroy frees the cond under it. */
+typedef struct {
+    nl_endpoint_t *ep;
+    bool returned;
+    bool got_event;
+} blocker_ctx_t;
+
+static void *blocker_main(void *arg) {
+    blocker_ctx_t *c = (blocker_ctx_t *)arg;
+    nl_event_t ev;
+    bool r = nl_poll_event(c->ep, &ev, -1); /* infinite wait */
+    c->got_event = r;
+    c->returned = true;
+    return NULL;
+}
+
+TEST(test_threading_destroy_wakes_blocked_poll) {
+    nl_config_t cfg;
+    nl_config_default(&cfg);
+    nl_address_t bind_addr = addr(34950);
+    nl_endpoint_t *server = NULL;
+    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+
+    blocker_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.ep = server;
+    pthread_t blocker;
+    ASSERT_EQ(pthread_create(&blocker, NULL, blocker_main, &ctx), 0);
+
+    usleep(200 * 1000); /* let the blocker enter its infinite poll */
+    /* Must return (waking the blocker with shutdown) rather than hang,
+     * and must not destroy queue_cond under the waiter (TSan). */
+    nl_endpoint_destroy(server);
+    pthread_join(blocker, NULL);
+    ASSERT_TRUE(ctx.returned);
+    ASSERT_FALSE(ctx.got_event); /* no event was ever queued: shutdown wake */
+}
+
+/* Regression: nl_poll_event's exit path used to decrement active_pollers
+ * and unlock queue_lock BEFORE its final ep touches (the deferred
+ * consume_window_for_borrows call and the borrow booking, which re-locks
+ * queue_lock). nl_endpoint_destroy drains on active_pollers == 0 and then
+ * endpoint_free, so a poller preempted in that window could lock a
+ * destroyed mutex or read freed memory. The decrement is now the poller's
+ * last ep-touching operation, so destroy cannot free underneath it; this
+ * test exercises the shape (spinning pollers mid-exit while destroy runs)
+ * and is mainly meant to be run under ThreadSanitizer (`make test-tsan`),
+ * where the freed-mutex touch should surface as a race/use-after-free. */
+#define DESTROY_RACERS 3
+
+typedef struct {
+    nl_endpoint_t *ep;
+    nl_peer_id_t peer; /* used by the flood thread only */
+    atomic_bool run;
+} poll_destroy_ctx_t;
+
+/* Tight non-blocking polling loop: the poller lives almost entirely in
+ * nl_poll_event (entry scan + exit path), so destroy's drain constantly
+ * races its final ep touches. Consumes DATA events without validating
+ * them: this test is about the exit-path race, not delivery. */
+static void *poll_destroy_racer_main(void *arg) {
+    poll_destroy_ctx_t *c = (poll_destroy_ctx_t *)arg;
+    while (atomic_load(&c->run)) {
+        nl_event_t ev;
+        if (nl_poll_event(c->ep, &ev, 0)) {
+            /* only NL_EVENT_DATA carries a borrowed payload; nothing to
+             * assert here, polling again releases the borrow */
+        }
+    }
+    return NULL;
+}
+
+/* Keeps the server's event queue non-empty so the racers spend their time
+ * in the event-returning exit path (with a window charge to release and a
+ * borrow to re-book), the widest part of the racy window. */
+static void *event_flood_main(void *arg) {
+    poll_destroy_ctx_t *c = (poll_destroy_ctx_t *)arg;
+    uint8_t payload[POLL_PAYLOAD_LEN];
+    memset(payload, POLL_PAYLOAD_BYTE, sizeof(payload));
+    while (atomic_load(&c->run)) {
+        if (nl_send(c->ep, c->peer, 0, NL_RELIABLE_ORDERED, payload, sizeof(payload)) == NL_OK) continue;
+        usleep(2000); /* window/queue gated once the server stops draining */
+    }
+    return NULL;
+}
+
+TEST(test_threading_destroy_wakes_poll_exit_racers) {
+    for (int iter = 0; iter < 10; iter++) {
+        nl_endpoint_t *server, *client;
+        nl_peer_id_t client_peer;
+        make_pair_ex(&server, &client, &client_peer, (uint16_t)(34960 + iter), 0,
+                     /*client_timeout_ms*/ 600);
+
+        poll_destroy_ctx_t racers[DESTROY_RACERS];
+        pthread_t racer_threads[DESTROY_RACERS];
+        for (int t = 0; t < DESTROY_RACERS; t++) {
+            memset(&racers[t], 0, sizeof(racers[t]));
+            racers[t].ep = server;
+            atomic_init(&racers[t].run, true);
+            ASSERT_EQ(pthread_create(&racer_threads[t], NULL, poll_destroy_racer_main, &racers[t]), 0);
+        }
+
+        /* The flood thread sends on the CLIENT endpoint, which is never
+         * destroyed concurrently, like the existing destroy-race test. It
+         * keeps a backlog queued on the server so racers stay in the busy
+         * exit path. */
+        poll_destroy_ctx_t flood;
+        memset(&flood, 0, sizeof(flood));
+        flood.ep = client;
+        flood.peer = client_peer;
+        atomic_init(&flood.run, true);
+        pthread_t flood_thread;
+        ASSERT_EQ(pthread_create(&flood_thread, NULL, event_flood_main, &flood), 0);
+
+        /* Let the racers settle into their loop (and land a few events so
+         * each holds a borrow in the exit path), then stop them by gate
+         * and destroy while they wind down. run=false is set BEFORE
+         * destroy: each racer may still be inside (or exiting) one final
+         * nl_poll_event call, which destroy must tolerate. After that
+         * call returns the racer re-checks the gate and exits without
+         * touching ep again, so the harness itself never polls a freed
+         * endpoint. */
+        usleep(50 * 1000);
+        for (int t = 0; t < DESTROY_RACERS; t++) atomic_store(&racers[t].run, false);
+        atomic_store(&flood.run, false);
+
+        nl_endpoint_destroy(server);
+
+        for (int t = 0; t < DESTROY_RACERS; t++) pthread_join(racer_threads[t], NULL);
+        pthread_join(flood_thread, NULL);
+
+        nl_endpoint_destroy(client);
+    }
+}
+
 int main(void) {
     printf("=== threading tests ===\n");
     RUN_TEST(test_threading_concurrent_pollers);
@@ -552,5 +690,7 @@ int main(void) {
     RUN_TEST(test_threading_nonblocking_poll_against_producer);
     RUN_TEST(test_threading_destroy_races_in_flight_traffic);
     RUN_TEST(test_threading_concurrent_connects);
+    RUN_TEST(test_threading_destroy_wakes_blocked_poll);
+    RUN_TEST(test_threading_destroy_wakes_poll_exit_racers);
     TEST_SUMMARY();
 }

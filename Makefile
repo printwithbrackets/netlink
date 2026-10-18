@@ -17,12 +17,19 @@
 
 CC      ?= cc
 AR      ?= ar
-CFLAGS  ?= -std=c11 -Wall -Wextra -O2 -fPIC
-LDFLAGS ?=
+# `override ... +=` appends the required defaults to any user-supplied
+# CFLAGS/LDFLAGS (command line or environment): a plain `CFLAGS +=` would
+# be silently DISCARDED, because a command-line assignment takes
+# precedence over everything the makefile does without `override`. -MMD
+# -MP writes a .d file per object so library sources rebuild when a
+# header they include changes (include/netlink.h edits would otherwise
+# leave a stale lib quietly exporting an old ABI/version).
+override CFLAGS  += -std=c11 -Wall -Wextra -O2 -fPIC -MMD -MP
+override LDFLAGS +=
 
 # Keep in sync with NL_VERSION_* in include/netlink.h and version fields
 # in bindings/python, bindings/rust.
-VERSION := 1.1.1
+VERSION := 1.2.0
 
 # --- OpenSSL location ---
 # Default assumes libcrypto is discoverable via pkg-config. Override
@@ -47,6 +54,10 @@ LIBS := $(CRYPTO_LIBS) -lpthread
 
 all: $(STATIC_LIB) $(SHARED_LIB)
 
+ifneq (,$(wildcard $(BUILD_DIR)/*.d))
+include $(wildcard $(BUILD_DIR)/*.d)
+endif
+
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
@@ -57,7 +68,7 @@ $(STATIC_LIB): $(OBJ)
 	$(AR) rcs $@ $(OBJ)
 
 $(SHARED_LIB): $(OBJ)
-	$(CC) -shared $(OBJ) $(LIBS) -o $@
+	$(CC) -shared $(CFLAGS) $(LDFLAGS) $(OBJ) $(LIBS) -o $@
 
 # --- tests ---
 TEST_BIN_DIR := $(BUILD_DIR)/tests
@@ -67,14 +78,19 @@ TEST_CFLAGS := $(CFLAGS) -g -fsanitize=address,undefined $(INCLUDES)
 test: all test-unit test-integration
 
 # Language-binding tests (require `make` first, plus go/cargo/python3).
+# Python uses pytest, matching .github/workflows/ci.yml (which pip-installs
+# pytest first); falls back to the plain-script runner when pytest is not
+# installed. The availability probe is quiet, but pytest itself runs with
+# stderr visible so failures are readable instead of silenced.
 test-bindings: all
 	@echo "--- Python binding tests ---"
 	cd bindings/python && NETLINK_LIBRARY_PATH=../../build/libnetlink.so \
-		python3 tests/test_python_bindings.py
+		sh -c 'if python3 -m pytest --version >/dev/null 2>&1; then python3 -m pytest tests/ -v; else python3 tests/test_python_bindings.py; fi'
 	@echo "--- Go binding tests ---"
+	cd bindings/go && test -z "$$(gofmt -l .)"
 	cd bindings/go && go vet ./... && go test -count=1 -timeout 120s ./...
 	@echo "--- Rust binding tests ---"
-	cd bindings/rust && cargo test
+	cd bindings/rust && cargo fmt --check && cargo test
 
 test-unit: | $(BUILD_DIR)
 	mkdir -p $(TEST_BIN_DIR)

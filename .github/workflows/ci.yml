@@ -91,6 +91,10 @@ jobs:
           cd bindings/go
           go build ./...
           go vet ./...
+      - name: Check Go formatting
+        run: |
+          cd bindings/go
+          test -z "$(gofmt -l .)"
       - name: Run Go binding tests
         run: |
           cd bindings/go
@@ -106,10 +110,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
       - name: Install OpenSSL
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
       - name: Build native library
         run: make
+      - name: Check Rust formatting
+        run: |
+          cd bindings/rust
+          cargo fmt --check
       - name: Build and test Rust bindings
         run: |
           cd bindings/rust

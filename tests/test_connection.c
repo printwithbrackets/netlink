@@ -64,7 +64,7 @@ typedef struct harness {
     nl_conn_callbacks_t cb;
 } harness_t;
 
-static void h_on_data(void *ctx, nl_peer_id_t peer, uint8_t channel, nl_delivery_t delivery,
+static bool h_on_data(void *ctx, nl_peer_id_t peer, uint8_t channel, nl_delivery_t delivery,
                        const uint8_t *data, uint32_t len) {
     (void)peer;
     harness_t *h = (harness_t *)ctx;
@@ -82,6 +82,7 @@ static void h_on_data(void *ctx, nl_peer_id_t peer, uint8_t channel, nl_delivery
         h->order_len[h->order_count] = (int)len;
         h->order_count++;
     }
+    return true; /* harness always accepts the event */
 }
 
 static void h_on_disconnected(void *ctx, nl_peer_id_t peer, nl_result_t reason) {
@@ -852,6 +853,60 @@ TEST(test_large_reliable_message_100000) {
     nl_connection_destroy(sc);
 }
 
+TEST(test_send_rejects_over_max_size) {
+    /* One byte past the documented maximum must be refused with an
+     * explicit error before anything goes on the wire -- not truncated,
+     * not silently fragmented past the cap. */
+    harness_t ch, sh;
+    nl_connection_t *cc, *sc;
+    make_pair(&ch, &sh, &cc, &sc, 100000, 100000);
+
+    size_t total = NL_MAX_MESSAGE_SIZE + 1;
+    uint8_t *big = (uint8_t *)malloc(total);
+    ASSERT_TRUE(big != NULL);
+    memset(big, 0x11, total);
+
+    ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED, big, total, 0),
+              NL_ERR_MESSAGE_TOO_LARGE);
+    ASSERT_EQ(ch.packets_sent, 0);
+    ASSERT_EQ(sh.data_count, 0);
+
+    free(big);
+    nl_connection_destroy(cc);
+    nl_connection_destroy(sc);
+}
+
+TEST(test_large_reliable_message_exact_max_size) {
+    /* The boundary itself: exactly NL_MAX_MESSAGE_SIZE (256 KB, exactly
+     * NL_MAX_FRAGMENTS fragments) must round-trip intact. Everything
+     * larger is rejected; everything up to here must work. */
+    harness_t ch, sh;
+    nl_connection_t *cc, *sc;
+    make_pair(&ch, &sh, &cc, &sc, 1000000, 1000000);
+
+    size_t total = NL_MAX_MESSAGE_SIZE;
+    uint8_t *big = (uint8_t *)malloc(total);
+    ASSERT_TRUE(big != NULL);
+    for (size_t i = 0; i < total; i++) big[i] = (uint8_t)((i * 13 + 11) & 0xFF);
+
+    ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED, big, total, 0), NL_OK);
+    ASSERT_EQ(sh.data_count, 0); /* nothing complete until the window opens */
+    ASSERT_TRUE(ch.packets_sent <= NL_CWND_INITIAL_PACKETS);
+
+    uint64_t t = 0;
+    pump_until(&ch, cc, &sh, sc, &t, 600);
+
+    ASSERT_EQ(sh.data_count, 1);
+    ASSERT_EQ(sh.last_data_len, (uint32_t)total);
+    CHECK_MEM_EQ(sh.last_data, big, total);
+    ASSERT_EQ(ch.disconnect_count, 0);
+    ASSERT_EQ(sh.disconnect_count, 0);
+
+    free(big);
+    nl_connection_destroy(cc);
+    nl_connection_destroy(sc);
+}
+
 TEST(test_partial_ring_parks_continuation_without_overwriting) {
     /* Fill the reliable send ring almost to capacity (9 unacked small
      * messages leave only 1 cwnd slot), then start a 20-fragment message:
@@ -1278,6 +1333,74 @@ TEST(test_deferred_queue_continuation_head_never_displaced) {
     nl_connection_destroy(conn);
 }
 
+/* Regression (P0-2): a DATA packet with a malformed delivery value must
+ * return PROTOCOL_MISMATCH without touching peer_rwnd. The old code did
+ * `break` without setting a result (returning OK) and left the
+ * zero-initialized out-param to overwrite the window. */
+TEST(test_malformed_delivery_does_not_clobber_peer_window) {
+    harness_t ch, sh;
+    nl_connection_t *cc, *sc;
+    make_pair(&ch, &sh, &cc, &sc, 10000, 1000);
+
+    /* Establish a real window advertisement first. */
+    ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED,
+                           (const uint8_t *)"hi", 2, 0), NL_OK);
+    ASSERT_EQ(sh.data_count, 1);
+    uint16_t before_rwnd = sc->peer_rwnd;
+    uint16_t before_cap = sc->peer_rwnd_capacity;
+    ASSERT_TRUE(before_rwnd != 0);
+
+    /* Craft a DATA packet with delivery=99 (invalid) but otherwise valid
+     * encryption, using the client's send keys. */
+    uint8_t plaintext[NL_DATA_HEADER_SIZE + 1];
+    size_t po = 0;
+    plaintext[po++] = 0; /* channel */
+    plaintext[po++] = 99; /* malformed delivery */
+    nl_put_u16(plaintext + po, 0); po += 2; /* seq */
+    nl_put_u16(plaintext + po, 0); po += 2; /* ack */
+    nl_put_u64(plaintext + po, 0); po += 8; /* ack_bits */
+    plaintext[po++] = 0; /* ack_valid */
+    nl_put_u16(plaintext + po, 1234); po += 2; /* rwnd (must be ignored) */
+    plaintext[po++] = 0; /* is_fragment */
+    plaintext[po++] = 'x';
+    ASSERT_EQ(po, sizeof(plaintext));
+
+    uint64_t counter = cc->send_counter;
+    uint8_t nonce[12];
+    nl_nonce_build(cc->send_salt, counter, nonce);
+    uint8_t aad[17];
+    aad[0] = NL_PKT_DATA;
+    nl_put_u64(aad + 1, cc->id);
+    nl_put_u64(aad + 9, counter);
+    uint8_t ct[sizeof(plaintext)];
+    uint8_t tag[16];
+    ASSERT_TRUE(nl_crypto_aead_encrypt(cc->send_key, nonce, aad, sizeof(aad),
+                                       plaintext, sizeof(plaintext), ct, tag));
+    uint8_t enc_body[8 + 8 + sizeof(ct) + 16];
+    nl_put_u64(enc_body, cc->id);
+    nl_put_u64(enc_body + 8, counter);
+    memcpy(enc_body + 16, ct, sizeof(ct));
+    memcpy(enc_body + 16 + sizeof(ct), tag, 16);
+    cc->send_counter++; /* keep the counter monotonic for later sends */
+
+    if (!enter_in_flight(sc)) { nl_connection_destroy(cc); nl_connection_destroy(sc); return; }
+    nl_result_t r = nl_connection_on_packet(sc, NL_PKT_DATA, enc_body, sizeof(enc_body), 0, &sh.cb);
+    exit_in_flight();
+    drain_queue();
+
+    ASSERT_EQ(r, NL_ERR_PROTOCOL_MISMATCH);
+    ASSERT_EQ(sc->peer_rwnd, before_rwnd);
+    ASSERT_EQ(sc->peer_rwnd_capacity, before_cap);
+
+    /* Connection must still be alive: a normal send round-trips. */
+    ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED,
+                           (const uint8_t *)"after", 5, 10), NL_OK);
+    ASSERT_EQ(sh.data_count, 2);
+
+    nl_connection_destroy(cc);
+    nl_connection_destroy(sc);
+}
+
 int main(void) {
     printf("=== connection tests ===\n");
     RUN_TEST(test_connection_send_and_receive_roundtrip);
@@ -1300,6 +1423,8 @@ int main(void) {
     RUN_TEST(test_capabilities_stored_on_connection);
     RUN_TEST(test_large_reliable_message_40000);
     RUN_TEST(test_large_reliable_message_100000);
+    RUN_TEST(test_send_rejects_over_max_size);
+    RUN_TEST(test_large_reliable_message_exact_max_size);
     RUN_TEST(test_partial_ring_parks_continuation_without_overwriting);
     RUN_TEST(test_one_way_reliable_acked_without_reverse_data);
     RUN_TEST(test_burst_loss_at_cwnd_above_ack_window_no_teardown);
@@ -1308,5 +1433,6 @@ int main(void) {
     RUN_TEST(test_backwards_now_does_not_poison_rtt_estimator);
     RUN_TEST(test_deferred_queue_fifo_stable_within_equal_priority);
     RUN_TEST(test_deferred_queue_continuation_head_never_displaced);
+    RUN_TEST(test_malformed_delivery_does_not_clobber_peer_window);
     TEST_SUMMARY();
 }
