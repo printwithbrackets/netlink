@@ -32,7 +32,7 @@ import time
 from dataclasses import dataclass
 from typing import Iterator, Optional
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 __all__ = [
     "Delivery", "EventType", "AddressFamily", "Transport", "Priority",
@@ -260,7 +260,7 @@ def _check(code: int) -> None:
 
 
 def version() -> str:
-    """Return the loaded C library's version string (e.g. "1.2.0")."""
+    """Return the loaded C library's version string (e.g. "1.3.0")."""
     raw = _lib.nl_version_string()
     return raw.decode("utf-8") if raw else ""
 

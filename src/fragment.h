@@ -13,6 +13,11 @@
  *     growing unboundedly).
  *   - incomplete reassemblies older than NL_REASSEMBLY_TIMEOUT_MS are
  *     reclaimed even without eviction pressure.
+ *   - a tracker serving a RELIABLE lane (nl_reassembly_tracker_set_reliable)
+ *     never evicts or times out an in-flight message: its fragments have
+ *     already been acked, so the sender will not resend them and dropping
+ *     the partial message would lose it for good. The caller gates new
+ *     fragments with nl_reassembly_would_accept() before acking them.
  *   - the total in-flight reassembly size is budgeted per tracker
  *     (byte_budget): an incomplete message charges its full declared size
  *     at acquisition, and messages that would exceed the budget are
@@ -85,6 +90,8 @@ typedef struct {
      * buffers pinned by spreading fragments across message ids. */
     uint32_t in_flight_bytes;
     uint32_t byte_budget; /* 0 = unlimited (unit tests, plain tracker init) */
+    /* RELIABLE lanes: no eviction, no timeout (see header comment). */
+    bool reliable;
 } nl_reassembly_tracker_t;
 
 void nl_reassembly_tracker_init(nl_reassembly_tracker_t *t);
@@ -94,6 +101,20 @@ void nl_reassembly_tracker_init(nl_reassembly_tracker_t *t);
  * connection's reassembly buffers stay within its own budget. */
 void nl_reassembly_tracker_init_budget(nl_reassembly_tracker_t *t, uint32_t byte_budget);
 void nl_reassembly_tracker_free(nl_reassembly_tracker_t *t);
+
+/* Mark the tracker as serving a reliable lane: in-flight messages are
+ * never evicted and never expire. Call right after init, before feeding. */
+void nl_reassembly_tracker_set_reliable(nl_reassembly_tracker_t *t, bool reliable);
+
+/* Would nl_reassembly_feed take a fragment of `message_id` (declared
+ * `fragment_count`) without refusing it for lack of room? True for a
+ * message that is already in flight and for malformed input (feed drops
+ * those, there is nothing to retry). False when the message is new and
+ * either every slot is busy or its reserve would exceed the byte budget.
+ * Only meaningful for reliable trackers: an unreliable tracker may evict
+ * to make room, so this returns true for it when no slot is free. */
+bool nl_reassembly_would_accept(const nl_reassembly_tracker_t *t, uint16_t message_id,
+                                uint16_t fragment_count);
 
 typedef enum {
     NL_REASSEMBLE_INVALID,   /* malformed/out-of-bounds fields, drop the packet */

@@ -59,8 +59,10 @@ extern "C" {
   #else
     #define NL_API __declspec(dllimport)
   #endif
-#else
+#elif defined(__GNUC__) || defined(__clang__)
   #define NL_API __attribute__((visibility("default")))
+#else
+  #define NL_API /* e.g. MSVC building the static library: no attribute to apply */
 #endif
 
 /* ----------------------------------------------------------------------- */
@@ -68,7 +70,7 @@ extern "C" {
 /* ----------------------------------------------------------------------- */
 
 #define NL_VERSION_MAJOR 1
-#define NL_VERSION_MINOR 2
+#define NL_VERSION_MINOR 3
 #define NL_VERSION_PATCH 0
 
 /* Wire protocol version. Bumped whenever the on-the-wire packet format
@@ -80,7 +82,11 @@ extern "C" {
  * (negotiated as the bitwise AND of both peers' advertised sets).
  * v3: new encrypted NL_PKT_ACK packet (reliable receivers send standalone
  * acks when no reverse DATA exists to piggyback them on); discovery probe
- * nonces are random rather than a counter. */
+ * nonces are random rather than a counter.
+ * v4: the DATA header gains a u8 ack_valid, so "no ack yet" is no longer
+ * indistinguishable from "I have sequence 0" (header and ACK payload each
+ * grow by one byte).
+ * v5: ack_bits widens from u32 to u64 (NL_ACK_WINDOW_BITS = 64). */
 #define NL_PROTOCOL_VERSION 5
 
 /* ----------------------------------------------------------------------- */

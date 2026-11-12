@@ -65,6 +65,10 @@
  * CHALLENGE, or RESPONSE would otherwise stall connect until the pending
  * timeout. Matches NL_HANDSHAKE_RETRY_MS in connection.c for ACCEPTED. */
 #define NL_HANDSHAKE_RETRY_MS 250
+/* A retransmitted REQUEST for a handshake already in flight is answered at
+ * most this often per pending entry, so replaying one captured REQUEST (from
+ * a spoofed source) cannot turn the server into a CHALLENGE reflector. */
+#define NL_HANDSHAKE_MIN_RESEND_MS 100
 /* One WebSocket link per accepted/active TCP connection. HTTP and frame
  * bytes are buffered here until the upgrade completes / a full message
  * is reassembled. */
@@ -991,6 +995,42 @@ static void handle_connect_request(nl_endpoint_t *ep, const uint8_t *buf, size_t
     uint8_t client_nonce[16]; memcpy(client_nonce, buf + off, 16); off += 16;
     uint32_t client_caps = nl_get_u32(buf + off); off += 4;
 
+    /* The connection id doubles as the peer handle the application sees, and
+     * 0 is NL_INVALID_PEER. Drop silently: nothing to reflect or allocate. */
+    if (client_connid == 0) return;
+
+    /* A retransmitted REQUEST for a handshake that was already admitted needs
+     * no new state, so it must not draw on the shared handshake budget: an
+     * attacker spending that budget would otherwise also cancel the retries of
+     * every client mid-handshake. Each pending entry is rate limited on its
+     * own instead. */
+    pthread_mutex_lock(&ep->pending_lock);
+    pending_t *retrans = find_pending_by_addr_locked(ep, from, PENDING_SERVER_AWAIT_RESPONSE);
+    if (retrans && retrans->connection_id == client_connid &&
+        memcmp(client_pub, retrans->peer_pubkey, 32) == 0 &&
+        memcmp(client_nonce, retrans->peer_nonce, 16) == 0 &&
+        retrans->retry_packet_len > 0) {
+        /* A retry proves a live client even when we do not answer it: it is
+         * what protects this entry from flood eviction (see
+         * acquire_pending_slot_locked). */
+        retrans->req_refreshed = true;
+        if (now - retrans->last_retry_ms < NL_HANDSHAKE_MIN_RESEND_MS) {
+            pthread_mutex_unlock(&ep->pending_lock);
+            return;
+        }
+        uint8_t copy[NL_CONNECT_CHALLENGE_SIZE];
+        memcpy(copy, retrans->retry_packet, retrans->retry_packet_len);
+        uint16_t clen = retrans->retry_packet_len;
+        struct sockaddr_storage faddr = *from;
+        socklen_t flen = from_len;
+        retrans->last_retry_ms = now;
+        retrans->req_refreshed = true;
+        pthread_mutex_unlock(&ep->pending_lock);
+        ep_send_nl(ep, &faddr, flen, copy, clen);
+        return;
+    }
+    pthread_mutex_unlock(&ep->pending_lock);
+
     if (!rate_limit_check(ep, now)) return; /* silently drop under flood, don't amplify */
 
     pthread_mutex_lock(&ep->connections_lock);
@@ -1108,10 +1148,13 @@ static void handle_connect_response(nl_endpoint_t *ep, const uint8_t *buf, size_
                                      const struct sockaddr_storage *from, socklen_t from_len, uint64_t now) {
     (void)from_len; /* the pending entry's own stored addr_len is used instead, see below */
     if (len < NL_CONNECT_RESPONSE_SIZE) return;
-    /* Bounded processing cost per packet: RESPONSE does X25519+HKDF,
-     * so a flood of spoofed-but-plausible responses must not outrun the
-     * REQUEST limiter (shared budget: one handshake costs one of each). */
-    if (!rate_limit_check(ep, now)) return;
+    /* No draw on the shared handshake budget here. The expensive part
+     * (X25519 + HKDF) only runs for a RESPONSE that echoes a genuine cookie
+     * for a pending entry, and that entry is consumed by the first success, so
+     * the work is already bounded by the REQUESTs the limiter admitted. A bad
+     * RESPONSE costs one table scan and a constant-time compare. Charging the
+     * budget up front let anyone spending it also cancel every handshake that
+     * was already in progress. */
     size_t off = 1;
     uint8_t cookie[16]; memcpy(cookie, buf + off, 16); off += 16;
     uint8_t client_pub[32]; memcpy(client_pub, buf + off, 32); off += 32;
@@ -1128,7 +1171,7 @@ static void handle_connect_response(nl_endpoint_t *ep, const uint8_t *buf, size_
     bool ok = nl_crypto_x25519(p->my_keypair, p->peer_pubkey, shared);
     session_keys_t keys;
     if (ok) ok = derive_session_keys(shared, p->peer_nonce /*client nonce*/, p->my_nonce /*server nonce*/, &keys);
-    memset(shared, 0, sizeof(shared));
+    nl_crypto_wipe(shared, sizeof(shared));
     if (!ok) { release_pending_locked(p); pthread_mutex_unlock(&ep->pending_lock); return; }
 
     uint64_t connid = p->connection_id;
@@ -1142,14 +1185,14 @@ static void handle_connect_response(nl_endpoint_t *ep, const uint8_t *buf, size_
     pthread_mutex_lock(&ep->connections_lock);
     if (find_connection_locked(ep, connid)) {
         pthread_mutex_unlock(&ep->connections_lock); /* astronomically-unlikely id collision: reject */
-        memset(&keys, 0, sizeof(keys));
+        nl_crypto_wipe(&keys, sizeof(keys));
         return;
     }
     nl_connection_t *conn = nl_connection_create(connid, &paddr, paddr_len, false, channel_count,
                                                   keys.s2c_key, keys.c2s_key, keys.s2c_salt, keys.c2s_salt,
                                                   ep->config.connection_timeout_ms, ep->config.keepalive_interval_ms,
                                                   now);
-    memset(&keys, 0, sizeof(keys));
+    nl_crypto_wipe(&keys, sizeof(keys));
     if (!conn) { pthread_mutex_unlock(&ep->connections_lock); return; }
     conn->capabilities = negotiated_caps;
     conn->rate_bps = ep->config.max_send_bytes_per_sec;
@@ -1209,7 +1252,7 @@ static void handle_connect_challenge(nl_endpoint_t *ep, const uint8_t *buf, size
     bool ok = nl_crypto_x25519(p->my_keypair, server_pub, shared);
     session_keys_t keys;
     if (ok) ok = derive_session_keys(shared, p->my_nonce /*client nonce*/, server_nonce, &keys);
-    memset(shared, 0, sizeof(shared));
+    nl_crypto_wipe(shared, sizeof(shared));
     if (!ok) { release_pending_locked(p); pthread_mutex_unlock(&ep->pending_lock); return; }
 
     uint64_t connid = p->connection_id;
@@ -1255,7 +1298,7 @@ static void handle_connect_challenge(nl_endpoint_t *ep, const uint8_t *buf, size
         }
     }
     pthread_mutex_unlock(&ep->connections_lock);
-    memset(&keys, 0, sizeof(keys));
+    nl_crypto_wipe(&keys, sizeof(keys));
 
     ep_send_nl(ep, from, from_len, out, o);
 }
@@ -1905,7 +1948,7 @@ static void endpoint_free(nl_endpoint_t *ep) {
     pthread_mutex_destroy(&ep->ws_links_lock);
     pthread_cond_destroy(&ep->queue_cond);
 
-    memset(ep->server_secret, 0, sizeof(ep->server_secret));
+    nl_crypto_wipe(ep->server_secret, sizeof(ep->server_secret));
     free(ep);
 }
 

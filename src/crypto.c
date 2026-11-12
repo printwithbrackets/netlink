@@ -1,5 +1,6 @@
 #include "crypto.h"
 #include <openssl/evp.h>
+#include <openssl/crypto.h>
 #include <openssl/rand.h>
 #include <openssl/hmac.h>
 #include <openssl/kdf.h>
@@ -147,6 +148,7 @@ bool nl_crypto_aead_encrypt(const uint8_t key[NL_KEY_SIZE], const uint8_t nonce[
     int len = 0;
     if (aad && aad_len > 0) {
         if (EVP_EncryptUpdate(ctx, NULL, &len, aad, (int)aad_len) != 1) goto out;
+        len = 0; /* the AAD update reports the AAD length, which is not an output offset */
     }
 
     if (plaintext_len > 0) {
@@ -185,6 +187,7 @@ bool nl_crypto_aead_decrypt(const uint8_t key[NL_KEY_SIZE], const uint8_t nonce[
     int len = 0;
     if (aad && aad_len > 0) {
         if (EVP_DecryptUpdate(ctx, NULL, &len, aad, (int)aad_len) != 1) goto out;
+        len = 0; /* the AAD update reports the AAD length, which is not an output offset */
     }
 
     if (ciphertext_len > 0) {
@@ -271,4 +274,8 @@ bool nl_replay_window_check(nl_replay_window_t *w, uint64_t counter) {
     if (w->bitmask & bit) return false; /* already seen */
     w->bitmask |= bit;
     return true;
+}
+
+void nl_crypto_wipe(void *p, size_t len) {
+    if (p && len) OPENSSL_cleanse(p, len);
 }

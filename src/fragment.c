@@ -27,6 +27,10 @@ void nl_reassembly_tracker_init_budget(nl_reassembly_tracker_t *t, uint32_t byte
     t->byte_budget = byte_budget;
 }
 
+void nl_reassembly_tracker_set_reliable(nl_reassembly_tracker_t *t, bool reliable) {
+    t->reliable = reliable;
+}
+
 static void slot_release(nl_reassembly_slot_t *slot) {
     free(slot->fragment_received);
     free(slot->data);
@@ -52,6 +56,9 @@ static nl_reassembly_slot_t *acquire_slot(nl_reassembly_tracker_t *t) {
     for (int i = 0; i < NL_REASSEMBLY_SLOTS; i++) {
         if (!t->slots[i].active) return &t->slots[i];
     }
+    /* Reliable lanes never evict: the in-flight message's fragments were
+     * already acked, so evicting it would lose it permanently. */
+    if (t->reliable) return NULL;
     /* All slots busy with distinct in-flight messages: evict the oldest
      * rather than letting an attacker (or an unlucky burst of legitimate
      * traffic) grow memory without bound. */
@@ -104,6 +111,7 @@ nl_reassemble_result_t nl_reassembly_feed(nl_reassembly_tracker_t *t, uint64_t n
             return NL_REASSEMBLE_INVALID;
         }
         slot = acquire_slot(t);
+        if (!slot) return NL_REASSEMBLE_INVALID; /* reliable tracker with every slot busy */
         if (slot->active) {
             /* evicting an in-progress one: return its charged reserve */
             t->in_flight_bytes -= slot->reserved_bytes;
@@ -176,7 +184,26 @@ nl_reassemble_result_t nl_reassembly_feed(nl_reassembly_tracker_t *t, uint64_t n
     return NL_REASSEMBLE_PENDING;
 }
 
+bool nl_reassembly_would_accept(const nl_reassembly_tracker_t *t, uint16_t message_id,
+                                uint16_t fragment_count) {
+    if (fragment_count == 0 || fragment_count > NL_MAX_FRAGMENTS) return true;
+    if ((size_t)fragment_count * NL_FRAGMENT_CHUNK_SIZE > NL_MAX_MESSAGE_SIZE) return true;
+    bool free_slot = false;
+    for (int i = 0; i < NL_REASSEMBLY_SLOTS; i++) {
+        if (t->slots[i].active && t->slots[i].message_id == message_id) return true;
+        if (!t->slots[i].active) free_slot = true;
+    }
+    uint32_t reserve = (uint32_t)fragment_count * NL_FRAGMENT_CHUNK_SIZE;
+    if (t->byte_budget && t->in_flight_bytes + reserve > t->byte_budget) return false;
+    if (!free_slot && t->reliable) return false;
+    return true;
+}
+
 void nl_reassembly_expire(nl_reassembly_tracker_t *t, uint64_t now_ms) {
+    /* A reliable lane's fragments are already acked: the sender will not
+     * resend them, so reclaiming a slow message would lose it. A dead peer
+     * is handled by the connection timeout, which frees the whole tracker. */
+    if (t->reliable) return;
     for (int i = 0; i < NL_REASSEMBLY_SLOTS; i++) {
         nl_reassembly_slot_t *slot = &t->slots[i];
         if (slot->active && (now_ms - slot->first_seen_ms) > NL_REASSEMBLY_TIMEOUT_MS) {

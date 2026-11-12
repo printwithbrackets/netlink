@@ -318,6 +318,69 @@ TEST(test_reassembly_byte_budget_does_not_reject_max_size_message) {
     nl_reassembly_tracker_free(&t);
 }
 
+
+/* Feed fragment `idx` of a `count`-fragment message whose chunks are all full-size. */
+static nl_reassemble_result_t feed_full(nl_reassembly_tracker_t *t, uint64_t now, uint16_t mid,
+                                        uint16_t idx, uint16_t count) {
+    static uint8_t chunk[NL_FRAGMENT_CHUNK_SIZE];
+    memset(chunk, (int)(mid & 0xFF), sizeof(chunk));
+    const uint8_t *out; uint32_t out_len;
+    return nl_reassembly_feed(t, now, mid, idx, count, chunk, NL_FRAGMENT_CHUNK_SIZE, &out, &out_len);
+}
+
+TEST(test_reliable_tracker_never_evicts_in_flight_message) {
+    nl_reassembly_tracker_t t;
+    nl_reassembly_tracker_init(&t);
+    nl_reassembly_tracker_set_reliable(&t, true);
+    /* Fill every slot with a distinct 2-fragment message, one fragment each. */
+    for (uint16_t m = 0; m < NL_REASSEMBLY_SLOTS; m++) {
+        ASSERT_EQ(feed_full(&t, 100 + m, m, 0, 2), NL_REASSEMBLE_PENDING);
+    }
+    /* A new message must be refused, not allowed to displace message 0. */
+    ASSERT_FALSE(nl_reassembly_would_accept(&t, 99, 2));
+    ASSERT_EQ(feed_full(&t, 200, 99, 0, 2), NL_REASSEMBLE_INVALID);
+    /* The oldest message is still intact and completes when its other fragment arrives. */
+    ASSERT_EQ(feed_full(&t, 300, 0, 1, 2), NL_REASSEMBLE_COMPLETE);
+    /* ...which frees a slot, so the refused message is now accepted. */
+    ASSERT_TRUE(nl_reassembly_would_accept(&t, 99, 2));
+    ASSERT_EQ(feed_full(&t, 400, 99, 0, 2), NL_REASSEMBLE_PENDING);
+    nl_reassembly_tracker_free(&t);
+}
+
+TEST(test_reliable_tracker_never_expires_in_flight_message) {
+    nl_reassembly_tracker_t t;
+    nl_reassembly_tracker_init(&t);
+    nl_reassembly_tracker_set_reliable(&t, true);
+    ASSERT_EQ(feed_full(&t, 0, 7, 0, 2), NL_REASSEMBLE_PENDING);
+    /* An hour later (many retransmit backoffs) the partial message must still be there. */
+    nl_reassembly_expire(&t, 3600ull * 1000);
+    ASSERT_EQ(feed_full(&t, 3600ull * 1000, 7, 1, 2), NL_REASSEMBLE_COMPLETE);
+    nl_reassembly_tracker_free(&t);
+}
+
+TEST(test_unreliable_tracker_still_expires_and_evicts) {
+    nl_reassembly_tracker_t t;
+    nl_reassembly_tracker_init(&t);
+    ASSERT_EQ(feed_full(&t, 0, 7, 0, 2), NL_REASSEMBLE_PENDING);
+    nl_reassembly_expire(&t, NL_REASSEMBLY_TIMEOUT_MS + 1);
+    /* Slot was reclaimed, so fragment 1 alone starts a fresh, incomplete message. */
+    ASSERT_EQ(feed_full(&t, NL_REASSEMBLY_TIMEOUT_MS + 1, 7, 1, 2), NL_REASSEMBLE_PENDING);
+    nl_reassembly_tracker_free(&t);
+}
+
+TEST(test_would_accept_respects_budget_and_known_messages) {
+    nl_reassembly_tracker_t t;
+    nl_reassembly_tracker_init_budget(&t, 3 * NL_FRAGMENT_CHUNK_SIZE);
+    nl_reassembly_tracker_set_reliable(&t, true);
+    ASSERT_EQ(feed_full(&t, 0, 1, 0, 2), NL_REASSEMBLE_PENDING); /* reserves 2 of 3 chunks */
+    ASSERT_FALSE(nl_reassembly_would_accept(&t, 2, 2));          /* new message, 2 more chunks: over budget */
+    ASSERT_TRUE(nl_reassembly_would_accept(&t, 2, 1));           /* a 1-chunk message still fits */
+    ASSERT_TRUE(nl_reassembly_would_accept(&t, 1, 2));           /* already in flight: no new room needed */
+    ASSERT_TRUE(nl_reassembly_would_accept(&t, 3, 0));           /* malformed: feed drops it, nothing to retry */
+    ASSERT_TRUE(nl_reassembly_would_accept(&t, 3, NL_MAX_FRAGMENTS + 1));
+    nl_reassembly_tracker_free(&t);
+}
+
 int main(void) {
     printf("=== fragment tests ===\n");
     RUN_TEST(test_fragment_count_needed_basic);
@@ -340,5 +403,9 @@ int main(void) {
     RUN_TEST(test_reassembly_byte_budget_rejects_overcommitted_spread);
     RUN_TEST(test_reassembly_byte_budget_rejects_single_oversized_message);
     RUN_TEST(test_reassembly_byte_budget_does_not_reject_max_size_message);
+    RUN_TEST(test_reliable_tracker_never_evicts_in_flight_message);
+    RUN_TEST(test_reliable_tracker_never_expires_in_flight_message);
+    RUN_TEST(test_unreliable_tracker_still_expires_and_evicts);
+    RUN_TEST(test_would_accept_respects_budget_and_known_messages);
     TEST_SUMMARY();
 }

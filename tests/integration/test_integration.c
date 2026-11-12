@@ -1629,6 +1629,143 @@ TEST(test_pending_eviction_protects_live_handshake) {
     nl_endpoint_destroy(server);
 }
 
+
+/* ---- handshake admission: validation, retransmits and the shared budget ---- */
+
+static int raw_udp_socket(int timeout_ms) {
+    int raw = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    struct timeval tv = { .tv_sec = timeout_ms / 1000, .tv_usec = (timeout_ms % 1000) * 1000 };
+    setsockopt(raw, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    return raw;
+}
+
+static struct sockaddr_in loopback_addr(uint16_t port) {
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons(port);
+    a.sin_addr.s_addr = inet_addr("127.0.0.1");
+    return a;
+}
+
+/* Spend the server's whole handshake budget with throwaway REQUESTs from another socket. */
+static void flood_handshake_budget(uint16_t port, int settle_ms) {
+    int junk = raw_udp_socket(50);
+    struct sockaddr_in dst = loopback_addr(port);
+    uint8_t req[NL_CONNECT_REQUEST_SIZE];
+    for (int i = 0; i < 400; i++) {
+        build_connect_request(req, 0xF100000ull + (uint64_t)i, (uint8_t)(i + 3));
+        sendto(junk, req, sizeof(req), 0, (struct sockaddr *)&dst, sizeof(dst));
+    }
+    close(junk);
+    usleep((useconds_t)settle_ms * 1000); /* let the server's I/O thread chew through the burst */
+}
+
+/* A client-chosen connection id of 0 is NL_INVALID_PEER: it must never become a peer. */
+TEST(test_server_ignores_request_with_zero_connection_id) {
+    nl_config_t cfg; nl_config_default(&cfg);
+    nl_endpoint_t *server = NULL;
+    nl_address_t bind_addr = addr("127.0.0.1", 34830);
+    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+    int raw = raw_udp_socket(400);
+    struct sockaddr_in dst = loopback_addr(34830);
+    uint8_t req[NL_CONNECT_REQUEST_SIZE], resp[256];
+
+    build_connect_request(req, 0, 1);
+    ASSERT_TRUE(sendto(raw, req, sizeof(req), 0, (struct sockaddr *)&dst, sizeof(dst)) >= 0);
+    ASSERT_TRUE(recv(raw, resp, sizeof(resp), 0) < 0); /* silence: nothing to reflect or allocate */
+
+    build_connect_request(req, 0xAAAA0003, 2);
+    ASSERT_TRUE(sendto(raw, req, sizeof(req), 0, (struct sockaddr *)&dst, sizeof(dst)) >= 0);
+    ssize_t n = recv(raw, resp, sizeof(resp), 0);
+    ASSERT_TRUE(n >= (ssize_t)NL_CONNECT_CHALLENGE_SIZE);
+    ASSERT_EQ(resp[0], NL_PKT_CONNECT_CHALLENGE);
+
+    close(raw);
+    nl_endpoint_destroy(server);
+}
+
+/* A client whose REQUEST was already admitted must still get its CHALLENGE
+ * retransmitted while someone else is burning the shared handshake budget. */
+TEST(test_request_retransmit_is_answered_while_budget_is_exhausted) {
+    nl_config_t cfg; nl_config_default(&cfg);
+    nl_endpoint_t *server = NULL;
+    nl_address_t bind_addr = addr("127.0.0.1", 34831);
+    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+    int raw = raw_udp_socket(800);
+    struct sockaddr_in dst = loopback_addr(34831);
+    uint8_t req[NL_CONNECT_REQUEST_SIZE], resp[256];
+
+    build_connect_request(req, 0xBEEF0001, 9);
+    ASSERT_TRUE(sendto(raw, req, sizeof(req), 0, (struct sockaddr *)&dst, sizeof(dst)) >= 0);
+    ASSERT_TRUE(recv(raw, resp, sizeof(resp), 0) >= (ssize_t)NL_CONNECT_CHALLENGE_SIZE);
+    /* The client's first retry (what a live client does within 250 ms). It
+     * marks the entry as a live handshake, which is what keeps a later flood
+     * from evicting it. */
+    usleep(120 * 1000);
+    ASSERT_TRUE(sendto(raw, req, sizeof(req), 0, (struct sockaddr *)&dst, sizeof(dst)) >= 0);
+    ASSERT_TRUE(recv(raw, resp, sizeof(resp), 0) >= (ssize_t)NL_CONNECT_CHALLENGE_SIZE);
+
+    flood_handshake_budget(34831, 100);
+
+    /* The identical REQUEST again (the client's retry timer fired). Timing
+     * matters here: the server also resends CHALLENGE on its own 250 ms timer,
+     * so the answer has to arrive within a few ms (60 ms is generous) to count as a
+     * reply to this retry and not the timer. */
+    struct timeval quick = { .tv_sec = 0, .tv_usec = 60 * 1000 };
+    setsockopt(raw, SOL_SOCKET, SO_RCVTIMEO, &quick, sizeof(quick));
+    while (recv(raw, resp, sizeof(resp), MSG_DONTWAIT) > 0) { /* drop anything already queued */ }
+    ASSERT_TRUE(sendto(raw, req, sizeof(req), 0, (struct sockaddr *)&dst, sizeof(dst)) >= 0);
+    ssize_t n = recv(raw, resp, sizeof(resp), 0);
+    ASSERT_TRUE(n >= (ssize_t)NL_CONNECT_CHALLENGE_SIZE);
+    ASSERT_EQ(resp[0], NL_PKT_CONNECT_CHALLENGE);
+
+    close(raw);
+    nl_endpoint_destroy(server);
+}
+
+/* A RESPONSE that echoes a genuine cookie is bounded by the pending entry it
+ * consumes, so it must complete the handshake even when the budget is spent. */
+TEST(test_valid_response_completes_while_budget_is_exhausted) {
+    nl_config_t cfg; nl_config_default(&cfg);
+    nl_endpoint_t *server = NULL;
+    nl_address_t bind_addr = addr("127.0.0.1", 34832);
+    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+    int raw = raw_udp_socket(800);
+    struct sockaddr_in dst = loopback_addr(34832);
+    uint8_t req[NL_CONNECT_REQUEST_SIZE], resp[256];
+
+    build_connect_request(req, 0xBEEF0002, 5);
+    ASSERT_TRUE(sendto(raw, req, sizeof(req), 0, (struct sockaddr *)&dst, sizeof(dst)) >= 0);
+    ASSERT_TRUE(recv(raw, resp, sizeof(resp), 0) >= (ssize_t)NL_CONNECT_CHALLENGE_SIZE);
+    ASSERT_EQ(resp[0], NL_PKT_CONNECT_CHALLENGE);
+    uint8_t cookie[16];
+    memcpy(cookie, resp + 1 + 32 + 16, 16);
+    /* One retry first, as a live client would, so the flood cannot evict the entry. */
+    usleep(120 * 1000);
+    ASSERT_TRUE(sendto(raw, req, sizeof(req), 0, (struct sockaddr *)&dst, sizeof(dst)) >= 0);
+    ASSERT_TRUE(recv(raw, resp, sizeof(resp), 0) >= (ssize_t)NL_CONNECT_CHALLENGE_SIZE);
+
+    flood_handshake_budget(34832, 200);
+
+    uint8_t rsp[NL_CONNECT_RESPONSE_SIZE];
+    rsp[0] = NL_PKT_CONNECT_RESPONSE;
+    memcpy(rsp + 1, cookie, 16);
+    memcpy(rsp + 17, req + 16, 32);  /* the client pubkey from the REQUEST */
+    memcpy(rsp + 49, req + 48, 16);  /* the client nonce from the REQUEST */
+    ASSERT_TRUE(sendto(raw, rsp, sizeof(rsp), 0, (struct sockaddr *)&dst, sizeof(dst)) >= 0);
+
+    nl_event_t ev;
+    bool connected = false;
+    for (int i = 0; i < 20 && !connected; i++) {
+        if (nl_poll_event(server, &ev, 100) && ev.event_type == NL_EVENT_CONNECTED) connected = true;
+    }
+    ASSERT_TRUE(connected);
+
+    close(raw);
+    nl_endpoint_destroy(server);
+}
+
 int main(void) {
     printf("=== integration tests (real UDP sockets) ===\n");
     RUN_TEST(test_server_challenge_retransmit_roundtrips_at_full_length);
@@ -1659,6 +1796,9 @@ int main(void) {
     RUN_TEST(test_zero_length_send_roundtrips);
     RUN_TEST(test_connect_empty_host_rejected);
     RUN_TEST(test_server_denies_protocol_mismatch);
+    RUN_TEST(test_server_ignores_request_with_zero_connection_id);
+    RUN_TEST(test_request_retransmit_is_answered_while_budget_is_exhausted);
+    RUN_TEST(test_valid_response_completes_while_budget_is_exhausted);
     RUN_TEST(test_client_surfaces_protocol_mismatch_deny);
     RUN_TEST(test_spoofed_connect_response_rejected);
     RUN_TEST(test_connect_timeout_when_server_silent);

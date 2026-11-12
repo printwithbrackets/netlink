@@ -426,14 +426,15 @@ priority order:
 1. **Connection migration** -- `PATH_CHALLENGE`/`PATH_RESPONSE` so a
    client changing networks (mobile Wi-Fi <-> cellular, NAT rebind)
    doesn't need a full reconnect, QUIC-style.
-2. **Expanded/range-based ACKs** -- the current 32-bit ack bitmap works
-   well for the loss patterns tested above, but wider bitmaps or explicit
-   ranges would help on very high-latency/lossy links.
+2. **Expanded/range-based ACKs** -- the current 64-bit ack bitmap works
+   well for the loss patterns tested above, but it also caps a connection
+   at 64 reliable packets in flight, so explicit ranges would help on very
+   high-latency/lossy links.
 3. **An optional RPC layer** with request/response semantics, and
    **built-in (optional, separate-from-core) serialization**.
 4. **Compression** (compress-then-encrypt, never the reverse).
 5. Smaller infrastructure: a C++ RAII wrapper, CMake alongside the
-   Makefile, a pkg-config `.pc` file, fuzzing (libFuzzer/AFL++) on the
+   Makefile, fuzzing (libFuzzer/AFL++) on the
    packet-parsing paths, Windows/macOS/Go/Rust CI, and benchmarks.
 
 If you'd like to tackle any of these, see [CONTRIBUTING.md](CONTRIBUTING.md)
@@ -450,6 +451,27 @@ MIT -- see [LICENSE](LICENSE).
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Changelog
+
+### 1.3.0 (2026-11-11)
+
+**Fixed**
+
+- **A reliable message could be lost when two large messages were in flight on `NL_RELIABLE_UNORDERED`.** A fragment was recorded in the receive window, and therefore acked, before reassembly decided whether it had room. If reassembly then refused it (byte budget or no free slot) the sender saw an ack and never retransmitted, so the message was gone for good. A new fragment that reassembly cannot take is now left unrecorded and unacked, so the normal retransmit path delivers it once an in-flight message completes. Reliable lanes also no longer evict or time out a partly reassembled message, because its fragments were already acked and would not be resent. Unreliable lanes keep both behaviors. New helpers: `nl_recv_dedupe_seen`, `nl_reassembly_tracker_set_reliable`, `nl_reassembly_would_accept`.
+- **A one-way stream could stall after the receiving app drained its queue.** The receiver advertised a closed window in its last ack and never told the sender the window had reopened, because window updates only rode on acks and on DATA. The tick now sends a window-only ack (`ack_valid = 0`) once the window has grown by at least one fragment's worth since the last advertisement. `KEEPALIVE` now carries the local window as a 2-byte payload, so a lost update is repaired within one keepalive interval. Older peers ignore the keepalive payload and already accept window-only acks, so no protocol version bump is needed.
+- **A burst of losses cut the congestion window once per detection.** Five separate losses inside one window of data took cwnd from 32 to 2. Fast-retransmit losses detected within one smoothed RTT of the previous reduction are now treated as one congestion event and cut the window once. An RTO still always applies.
+- **The shared handshake budget could be spent to cancel handshakes already in progress.** One 200-per-second counter covered REQUEST and RESPONSE and was charged before anything was validated, so about 200 spoofed REQUESTs per second made the server drop every real retry and every RESPONSE. A retransmitted REQUEST for an entry that is already pending no longer draws on the budget (each pending entry is limited to one resend per 100 ms instead, and a throttled retry still marks the entry live so flood eviction spares it). A RESPONSE no longer draws on it either: the expensive work only runs for a genuine cookie and consumes the pending entry. New REQUESTs are still limited, so a spoofed flood can still keep new clients out. Closing that needs per-source limits and a stateless retry token.
+- **The server accepted a client-chosen connection id of 0**, which is `NL_INVALID_PEER`. Such a REQUEST is now dropped silently.
+- **Session keys were not wiped.** `memset` before `free` is a dead store and the optimizer removed it from `nl_connection_destroy`. Keys, the shared secret, and the server cookie secret now go through the new `nl_crypto_wipe` (`OPENSSL_cleanse`).
+- **Priority could reorder a `NL_RELIABLE_ORDERED` stream.** A later high-priority message on a channel jumped ahead of an earlier low-priority one on the same channel while sends were parked, so the receiver saw them swapped. Priority still applies across channels and across unordered traffic, but never within one ordered stream.
+- **AEAD finalize offset.** `nl_crypto_aead_encrypt` and `nl_crypto_aead_decrypt` reused the length reported by the AAD update as an output offset when the payload was empty. Harmless in practice, no behavior change.
+
+**Changed**
+
+- **Build hardening.** `-fvisibility=hidden` (the shared library now exports only the 18 `NL_API` functions, down from 99, so internal `nl_crypto_*`, `nl_channel_*` and `*_for_test` symbols are no longer ABI), `-D_FORTIFY_SOURCE=2`, and on Linux `-Wl,-z,relro,-z,now`.
+- `NL_API` expands to nothing on compilers without the GNU attribute (MSVC building the static library).
+- `examples/echo_client.c` measures its connect and echo deadlines from a fixed start instead of treating one quiet 500 ms poll as a timeout, and no longer waits forever for the unreliable-sequenced echo.
+- **`make test-tsan` passes again.** `test_threading_destroy_wakes_poll_exit_racers` had a harness race: a racer could pass its `run` check, be preempted, and call `nl_poll_event` after `nl_endpoint_destroy` had finished, which breaks the API contract (no call may begin once destroy has started) and TSan reported it as a use of a destroyed mutex. Each racer now makes exactly one last blocking call that is already inside the library before destroy runs, so destroy only races calls that started earlier. That is the property it has to tolerate, and the test still delivers fresh events while destroy drains. Four consecutive runs and the full `make test-tsan` target are clean.
+- Header and README: the protocol history now covers v4 and v5, the roadmap no longer lists the 32-bit ack bitmap or the pkg-config file, and the 1.2.0 entry notes that the ack window ended at 64 bits.
 
 ### 1.2.0 (2026-10-18)
 
@@ -583,7 +605,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   adjacent `running`, and both flags are published *before*
   `pthread_create` — storing after the create left a window in which the
   new thread could observe them unset.
-- **The 32-bit ack bitmap was narrower than the congestion window.** An
+- **The 32-bit ack bitmap was narrower than the congestion window.** (The
+  bitmap was widened to 64 bits later in this same release, see
+  "Ack bitmap widened" below, so the final window is 64.) An
   ack can only name 32 sequences back from the receiver's newest one,
   while the congestion window allowed 256 packets in flight
   (`NL_SSTHRESH_INITIAL_PACKETS` was 64). More than 32 reliable packets

@@ -91,6 +91,12 @@ void nl_nonce_build(const uint8_t salt[12], uint64_t counter, uint8_t out_nonce[
  * timing side-channel could leak information to an attacker. */
 bool nl_crypto_const_time_eq(const uint8_t *a, const uint8_t *b, size_t len);
 
+/* Zero `len` bytes at `p` in a way the optimizer may not remove. A plain
+ * memset on a buffer that is freed or goes out of scope right after is a dead
+ * store and compilers delete it, which leaves session keys and secrets in
+ * freed memory. Use this for anything secret. */
+void nl_crypto_wipe(void *p, size_t len);
+
 /* ---- Anti-replay ----
  *
  * The per-channel sequence/dedupe logic in seqbuf.h protects RELIABLE

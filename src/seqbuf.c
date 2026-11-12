@@ -208,6 +208,15 @@ bool nl_recv_dedupe_insert(nl_recv_dedupe_t *d, uint16_t sequence) {
     return true;
 }
 
+bool nl_recv_dedupe_seen(const nl_recv_dedupe_t *d, uint16_t sequence) {
+    if (!d->has_received_any) return false;
+    if (nl_seq_greater_than(sequence, d->most_recent)) return false;
+    uint16_t age = (uint16_t)(d->most_recent - sequence);
+    if (age >= NL_SEQ_RING_SIZE) return true; /* insert() treats these as duplicates */
+    const nl_recv_slot_t *slot = &d->slots[sequence & NL_SEQ_RING_MASK];
+    return slot->valid && slot->sequence == sequence;
+}
+
 void nl_recv_dedupe_build_ack(const nl_recv_dedupe_t *d, uint16_t *out_ack, nl_ack_bits_t *out_ack_bits) {
     *out_ack = d->most_recent;
     nl_ack_bits_t bits = 0;

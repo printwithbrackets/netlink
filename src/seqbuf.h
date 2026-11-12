@@ -167,6 +167,11 @@ void nl_recv_dedupe_free(nl_recv_dedupe_t *d);
  * to track), and records it. Returns false for duplicates or packets so
  * old they've fallen out of the tracked window (treat as duplicates). */
 bool nl_recv_dedupe_insert(nl_recv_dedupe_t *d, uint16_t sequence);
+/* Read-only counterpart of nl_recv_dedupe_insert: true if inserting
+ * `sequence` would report a duplicate (already recorded, or too old to be
+ * tracked). Never modifies the window, so a caller can decide whether to
+ * accept a packet before it becomes visible in the ack. */
+bool nl_recv_dedupe_seen(const nl_recv_dedupe_t *d, uint16_t sequence);
 /* Produce the (ack, ack_bits) pair to piggyback on an outgoing packet,
  * describing everything received up through `most_recent`. */
 void nl_recv_dedupe_build_ack(const nl_recv_dedupe_t *d, uint16_t *out_ack, nl_ack_bits_t *out_ack_bits);
