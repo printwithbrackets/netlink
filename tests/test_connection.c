@@ -1401,6 +1401,166 @@ TEST(test_malformed_delivery_does_not_clobber_peer_window) {
     nl_connection_destroy(sc);
 }
 
+
+/* What the real endpoint does right after draining the socket and before the
+ * app polls events: flush pending acks. Those acks advertise the window as it
+ * is at that moment, i.e. still full of undrained data. */
+static void harness_flush_acks(harness_t *h, nl_connection_t *conn, uint64_t now_ms) {
+    if (!enter_in_flight(conn)) return;
+    nl_connection_flush_acks(conn, now_ms, &h->cb);
+    exit_in_flight();
+    drain_queue();
+}
+
+/* Regression: after the receiving app drains its queue the sender was never
+ * told the window had reopened (window updates rode only on acks and DATA),
+ * so a one-way stream stalled for good with the rest of the data parked. */
+TEST(test_window_reopen_reaches_one_way_sender) {
+    harness_t ch, sh;
+    nl_connection_t *cc, *sc;
+    make_pair(&ch, &sh, &cc, &sc, 100000, 100000);
+    sc->recv_window_size = 4096;
+
+    uint8_t msg[1500];
+    memset(msg, 'w', sizeof(msg));
+    for (int i = 0; i < 6; i++) {
+        ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_UNORDERED, msg, sizeof(msg), 0), NL_OK);
+    }
+    /* The 4096-byte window cannot take all six: the rest is parked. */
+    ASSERT_TRUE(sh.data_count < 6);
+    int before = sh.data_count;
+    harness_flush_acks(&sh, sc, 0);
+    ASSERT_TRUE(cc->peer_rwnd < sizeof(msg)); /* the client now believes the window is shut */
+
+    /* The receiving app drains everything it was given. The server has no
+     * DATA of its own to send, so only a window update can unblock the client. */
+    nl_connection_consume_window(sc, sc->recv_window_used);
+    for (int step = 1; step <= 200 && sh.data_count < 6; step++) {
+        ch.now_ms = sh.now_ms = (uint64_t)step * 50;
+        harness_tick(&sh, sc, sh.now_ms);
+        harness_tick(&ch, cc, ch.now_ms);
+        /* Keep draining as data arrives, like a game loop polling events. */
+        nl_connection_consume_window(sc, sc->recv_window_used);
+    }
+    ASSERT_TRUE(sh.data_count > before);
+    ASSERT_EQ(sh.data_count, 6);
+
+    nl_connection_destroy(cc);
+    nl_connection_destroy(sc);
+}
+
+/* The window update itself is not retransmitted. If it is lost, the next
+ * keepalive (which now carries the window) must repair the stall. */
+TEST(test_lost_window_update_is_repaired_by_keepalive) {
+    harness_t ch, sh;
+    nl_connection_t *cc, *sc;
+    make_pair(&ch, &sh, &cc, &sc, 100000, 1000);
+    sc->recv_window_size = 4096;
+
+    uint8_t msg[1500];
+    memset(msg, 'k', sizeof(msg));
+    for (int i = 0; i < 6; i++) {
+        ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_UNORDERED, msg, sizeof(msg), 0), NL_OK);
+    }
+    ASSERT_TRUE(sh.data_count < 6);
+    harness_flush_acks(&sh, sc, 0);
+    ASSERT_TRUE(cc->peer_rwnd < sizeof(msg));
+
+    nl_connection_consume_window(sc, sc->recv_window_used);
+    /* Lose the first thing the server sends after the drain (the window update). */
+    sh.drop_next_send = true;
+    ch.now_ms = sh.now_ms = 60;
+    harness_tick(&sh, sc, 60);
+    harness_tick(&ch, cc, 60);
+    ASSERT_TRUE(sh.data_count < 6);
+
+    /* From here the only server-to-client traffic is its idle keepalive. */
+    for (int step = 1; step <= 120 && sh.data_count < 6; step++) {
+        uint64_t now = 60 + (uint64_t)step * 50;
+        ch.now_ms = sh.now_ms = now;
+        harness_tick(&sh, sc, now);
+        harness_tick(&ch, cc, now);
+        nl_connection_consume_window(sc, sc->recv_window_used);
+    }
+    ASSERT_EQ(sh.data_count, 6);
+
+    nl_connection_destroy(cc);
+    nl_connection_destroy(sc);
+}
+
+
+/* Regression: every incoming packet that triggered a fast retransmit cut the
+ * window again, so five separate losses inside ONE window of data took cwnd
+ * from 32 down to 2. Losses detected within one RTT of the last reduction are
+ * the same congestion event and must cut the window only once. */
+TEST(test_congestion_burst_of_losses_cuts_window_once) {
+    harness_t ch, sh;
+    nl_connection_t *cc, *sc;
+    make_pair(&ch, &sh, &cc, &sc, 100000, 100000);
+    cc->cwnd = 32;
+    cc->ssthresh = 64;
+
+    /* Drop every other packet from 4 to 12. Each later ack makes exactly one
+     * more hole eligible for fast retransmit, so the sender sees five
+     * separate loss detections spread over five incoming acks. */
+    uint8_t b = 'c';
+    for (int i = 0; i < 24; i++) {
+        /* One instant: the harness has no real latency, so every detection falls
+         * inside the same RTT, which is exactly the case under test. */
+        uint64_t now = 1000;
+        ch.now_ms = sh.now_ms = now;
+        bool drop = (i == 4 || i == 6 || i == 8 || i == 10 || i == 12);
+        ch.drop_next_send = drop;
+        ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_UNORDERED, &b, 1, now), NL_OK);
+        if (!drop) harness_flush_acks(&sh, sc, now); /* the endpoint acks each datagram it drains */
+    }
+    ASSERT_TRUE(cc->stats.retransmits >= 3); /* several separate loss detections happened */
+    /* One halving of 32 is 16. Cutting once per detection would reach 2. */
+    ASSERT_TRUE(cc->cwnd >= 16);
+
+    nl_connection_destroy(cc);
+    nl_connection_destroy(sc);
+}
+
+
+/* Regression: priority sorted the deferred queue across everything, so a later
+ * high-priority message on a RELIABLE_ORDERED channel overtook an earlier
+ * low-priority one on the same channel. Sequence numbers are assigned at emit
+ * time, so the receiver then saw the two swapped and "ordered" was a lie.
+ * Priority may reorder across channels and across unordered traffic, never
+ * within one ordered stream. */
+TEST(test_priority_never_reorders_one_reliable_ordered_stream) {
+    harness_t ch, sh;
+    nl_connection_t *cc, *sc;
+    make_pair(&ch, &sh, &cc, &sc, 10000, 100000);
+    cc->peer_rwnd = 0;
+
+    if (!enter_in_flight(cc)) { nl_connection_destroy(cc); nl_connection_destroy(sc); return; }
+    ASSERT_EQ(nl_connection_send(cc, 0, NL_RELIABLE_ORDERED, (const uint8_t *)"first", 5, NL_PRIORITY_LOW, 0, &ch.cb), NL_OK);
+    ASSERT_EQ(nl_connection_send(cc, 0, NL_RELIABLE_ORDERED, (const uint8_t *)"second", 6, NL_PRIORITY_HIGH, 0, &ch.cb), NL_OK);
+    /* An unrelated channel is free to jump the queue. */
+    ASSERT_EQ(nl_connection_send(cc, 1, NL_RELIABLE_ORDERED, (const uint8_t *)"other", 5, NL_PRIORITY_HIGH, 0, &ch.cb), NL_OK);
+    exit_in_flight();
+    drain_queue();
+    ASSERT_EQ(sh.data_count, 0);
+
+    cc->peer_rwnd = NL_RECV_WINDOW_DEFAULT;
+    harness_tick(&ch, cc, 100);
+    ASSERT_EQ(sh.data_count, 3);
+    int first_at = -1, second_at = -1, other_at = -1;
+    for (int i = 0; i < sh.order_count; i++) {
+        if (memcmp(sh.order[i], "first", 5) == 0) first_at = i;
+        if (memcmp(sh.order[i], "second", 6) == 0) second_at = i;
+        if (memcmp(sh.order[i], "other", 5) == 0) other_at = i;
+    }
+    ASSERT_TRUE(first_at >= 0 && second_at >= 0 && other_at >= 0);
+    ASSERT_TRUE(first_at < second_at);   /* one ordered stream keeps its order */
+    ASSERT_TRUE(other_at < first_at);    /* priority still works across channels */
+
+    nl_connection_destroy(cc);
+    nl_connection_destroy(sc);
+}
+
 int main(void) {
     printf("=== connection tests ===\n");
     RUN_TEST(test_connection_send_and_receive_roundtrip);
@@ -1434,5 +1594,9 @@ int main(void) {
     RUN_TEST(test_deferred_queue_fifo_stable_within_equal_priority);
     RUN_TEST(test_deferred_queue_continuation_head_never_displaced);
     RUN_TEST(test_malformed_delivery_does_not_clobber_peer_window);
+    RUN_TEST(test_window_reopen_reaches_one_way_sender);
+    RUN_TEST(test_lost_window_update_is_repaired_by_keepalive);
+    RUN_TEST(test_congestion_burst_of_losses_cuts_window_once);
+    RUN_TEST(test_priority_never_reorders_one_reliable_ordered_stream);
     TEST_SUMMARY();
 }

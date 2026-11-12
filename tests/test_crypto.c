@@ -297,6 +297,32 @@ TEST(test_replay_window_forged_packet_cannot_burn_counter) {
     ASSERT_TRUE(nl_replay_window_check(&w, forged_counter));
 }
 
+
+TEST(test_wipe_zeroes_the_buffer_and_tolerates_empty_input) {
+    uint8_t buf[64];
+    memset(buf, 0xAB, sizeof(buf));
+    nl_crypto_wipe(buf, sizeof(buf));
+    for (size_t i = 0; i < sizeof(buf); i++) ASSERT_EQ(buf[i], 0);
+    nl_crypto_wipe(NULL, 16); /* must not crash */
+    nl_crypto_wipe(buf, 0);
+}
+
+
+/* An empty payload (keepalive, bare ack) has no ciphertext bytes, so the
+ * caller may pass a NULL output. The finalize step must then not do pointer
+ * arithmetic with a leftover length from the AAD update (UBSan flags
+ * NULL + nonzero offset). Round trip it. */
+TEST(test_aead_round_trips_empty_payload_with_null_output) {
+    uint8_t key[NL_KEY_SIZE]; memset(key, 0x11, sizeof(key));
+    uint8_t nonce[12]; memset(nonce, 0x22, sizeof(nonce));
+    uint8_t aad[17]; memset(aad, 0x33, sizeof(aad));
+    uint8_t tag[16];
+    ASSERT_TRUE(nl_crypto_aead_encrypt(key, nonce, aad, sizeof(aad), NULL, 0, NULL, tag));
+    ASSERT_TRUE(nl_crypto_aead_decrypt(key, nonce, aad, sizeof(aad), NULL, 0, tag, NULL));
+    aad[0] ^= 1; /* tampering with the associated data must still be caught */
+    ASSERT_FALSE(nl_crypto_aead_decrypt(key, nonce, aad, sizeof(aad), NULL, 0, tag, NULL));
+}
+
 int main(void) {
     printf("=== crypto tests ===\n");
     RUN_TEST(test_random_produces_different_output);
@@ -325,5 +351,7 @@ int main(void) {
     RUN_TEST(test_replay_window_first_packet_always_accepted);
     RUN_TEST(test_replay_window_peek_does_not_mutate);
     RUN_TEST(test_replay_window_forged_packet_cannot_burn_counter);
+    RUN_TEST(test_wipe_zeroes_the_buffer_and_tolerates_empty_input);
+    RUN_TEST(test_aead_round_trips_empty_payload_with_null_output);
     TEST_SUMMARY();
 }

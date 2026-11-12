@@ -25,11 +25,21 @@ AR      ?= ar
 # header they include changes (include/netlink.h edits would otherwise
 # leave a stale lib quietly exporting an old ABI/version).
 override CFLAGS  += -std=c11 -Wall -Wextra -O2 -fPIC -MMD -MP
+# Hardening: export only the NL_API surface from the shared library (every
+# internal nl_crypto_* / nl_channel_* / *_for_test symbol used to be public ABI),
+# and turn on _FORTIFY_SOURCE so an overlong memcpy into a fixed buffer aborts
+# instead of corrupting the stack. -U first because some distro compilers
+# already define it and a plain -D would warn about the redefinition.
+override CFLAGS  += -fvisibility=hidden -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2
 override LDFLAGS +=
+# Full RELRO / immediate binding for the shared library (GNU ld only).
+ifeq ($(shell uname -s),Linux)
+override LDFLAGS += -Wl,-z,relro,-z,now
+endif
 
 # Keep in sync with NL_VERSION_* in include/netlink.h and version fields
 # in bindings/python, bindings/rust.
-VERSION := 1.2.0
+VERSION := 1.3.0
 
 # --- OpenSSL location ---
 # Default assumes libcrypto is discoverable via pkg-config. Override

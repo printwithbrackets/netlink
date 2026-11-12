@@ -145,6 +145,11 @@ typedef struct nl_connection {
     uint32_t cwnd;
     uint32_t ssthresh;
     uint32_t cwnd_ack_accum; /* congestion-avoidance: +1 cwnd per full window of acks */
+    /* Time of the last window reduction. Fast-retransmit losses detected within
+     * one smoothed RTT of it belong to the same congestion event and must not
+     * cut the window again (NewReno: one reduction per window of data). */
+    uint64_t last_loss_cut_ms;
+    bool     loss_cut_valid;
 
     /* Flow control: peer's last advertised receive window (bytes of DATA
      * they'll still buffer), and our own receive-window accounting so we
@@ -169,6 +174,11 @@ typedef struct nl_connection {
     uint32_t peer_window_in_flight;
     uint32_t recv_window_size;  /* configured local window capacity (bytes) */
     uint32_t recv_window_used;  /* payload bytes currently queued for the app */
+    /* Window most recently advertised to the peer in an ack, window update,
+     * keepalive, or DATA header. The tick sends a window-only ack when the
+     * live window has grown past this by a useful amount, so a sender that
+     * parked on a closed window hears it reopen without needing reverse DATA. */
+    uint16_t last_adv_sent;
 
     /* Sender-side rate limit (payload bytes/sec; 0 = off). Token bucket;
      * retransmits and keepalives bypass it so loss recovery is never starved. */

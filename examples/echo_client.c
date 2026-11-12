@@ -1,9 +1,17 @@
 /* echo_client.c - connects to the echo server, sends a few messages
  * across different channels and delivery modes, and prints the echoes. */
+#define _POSIX_C_SOURCE 200809L /* clock_gettime under -std=c11 */
 #include <netlink.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+static uint64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
 
 static uint16_t parse_port(const char *s, uint16_t dflt) {
     if (!s) return dflt;
@@ -53,12 +61,26 @@ int main(int argc, char **argv) {
     bool sent_batch = false;
     int echoes_received = 0;
     const int total_messages = 3;
+    int exit_code = 0;
+    /* Deadlines are measured from a fixed start, not per poll: one quiet
+     * 500 ms poll says nothing, the handshake retries every 250 ms and a
+     * lossy link can need several rounds. */
+    const uint64_t connect_deadline_ms = now_ms() + 5000;
+    uint64_t echo_deadline_ms = 0;
 
     while (1) {
         nl_event_t ev;
         if (!nl_poll_event(client, &ev, 500)) {
-            if (!connected) {
+            if (!connected && now_ms() > connect_deadline_ms) {
                 fprintf(stderr, "timed out waiting to connect\n");
+                exit_code = 1;
+                break;
+            }
+            if (sent_batch && now_ms() > echo_deadline_ms) {
+                /* The UNRELIABLE_SEQUENCED echo may legitimately be dropped, so
+                 * waiting for all three forever would hang on a lossy link. */
+                fprintf(stderr, "gave up after %d of %d echoes\n", echoes_received, total_messages);
+                exit_code = echoes_received >= total_messages - 1 ? 0 : 1;
                 break;
             }
             continue;
@@ -94,6 +116,7 @@ int main(int argc, char **argv) {
 
         if (connected && !sent_batch) {
             sent_batch = true;
+            echo_deadline_ms = now_ms() + 5000;
             nl_send(client, server, 0, NL_RELIABLE_ORDERED, (const uint8_t *)"hello reliable", 14);
             nl_send(client, server, 1, NL_UNRELIABLE_SEQUENCED, (const uint8_t *)"hello sequenced", 15);
             nl_send(client, server, 2, NL_RELIABLE_UNORDERED, (const uint8_t *)"hello unordered", 15);
@@ -101,5 +124,5 @@ int main(int argc, char **argv) {
     }
 
     nl_endpoint_destroy(client);
-    return 0;
+    return exit_code;
 }

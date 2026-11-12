@@ -163,6 +163,13 @@ nl_result_t nl_channel_send_range(nl_channel_t *chan, uint64_t now_ms, uint8_t c
     return NL_OK;
 }
 
+static void lane_reassembly_ensure(nl_lane_t *lane, nl_delivery_t delivery) {
+    if (lane->reassembly_init) return;
+    nl_reassembly_tracker_init_budget(&lane->reassembly, lane->reassembly_byte_budget);
+    nl_reassembly_tracker_set_reliable(&lane->reassembly, is_reliable(delivery));
+    lane->reassembly_init = true;
+}
+
 static void deliver_or_reassemble(nl_lane_t *lane, uint64_t now_ms, uint8_t channel_id, nl_delivery_t delivery,
                                    bool is_fragment, uint16_t message_id, uint16_t frag_index, uint16_t frag_count,
                                    const uint8_t *chunk, uint16_t chunk_len,
@@ -171,10 +178,7 @@ static void deliver_or_reassemble(nl_lane_t *lane, uint64_t now_ms, uint8_t chan
         deliver(ctx, channel_id, delivery, chunk, chunk_len);
         return;
     }
-    if (!lane->reassembly_init) {
-        nl_reassembly_tracker_init_budget(&lane->reassembly, lane->reassembly_byte_budget);
-        lane->reassembly_init = true;
-    }
+    lane_reassembly_ensure(lane, delivery);
     const uint8_t *out_data;
     uint32_t out_len;
     nl_reassemble_result_t r = nl_reassembly_feed(&lane->reassembly, now_ms, message_id, frag_index,
@@ -389,6 +393,15 @@ void nl_channel_on_receive(nl_channel_t *chan, uint64_t now_ms,
     /* Even a duplicate needs an ack: the sender hasn't heard this
      * sequence was received (that's why it retransmitted). Mark dirty
      * before the dup check so the flush isn't skipped. */
+    if (delivery == NL_RELIABLE_UNORDERED && is_fragment && !nl_recv_dedupe_seen(&lane->recv_dedupe, seq)) {
+        /* Reassembly may be unable to take a new message right now (slots or
+         * byte budget). Acking the fragment would make the sender stop
+         * retransmitting it and the message would be lost, so leave it
+         * unrecorded and unacked and let the retransmit path bring it back
+         * once an in-flight message has completed. */
+        lane_reassembly_ensure(lane, delivery);
+        if (!nl_reassembly_would_accept(&lane->reassembly, message_id, frag_count)) return;
+    }
     bool is_new_seq = nl_recv_dedupe_insert(&lane->recv_dedupe, seq);
     lane->ack_dirty = true;
     if (!is_new_seq) return; /* duplicate payload: ack state updated, delivery skipped */

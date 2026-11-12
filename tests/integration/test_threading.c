@@ -592,7 +592,7 @@ TEST(test_threading_destroy_wakes_blocked_poll) {
  * endpoint_free, so a poller preempted in that window could lock a
  * destroyed mutex or read freed memory. The decrement is now the poller's
  * last ep-touching operation, so destroy cannot free underneath it; this
- * test exercises the shape (spinning pollers mid-exit while destroy runs)
+ * test exercises the shape (pollers woken mid-exit while destroy drains)
  * and is mainly meant to be run under ThreadSanitizer (`make test-tsan`),
  * where the freed-mutex touch should surface as a race/use-after-free. */
 #define DESTROY_RACERS 3
@@ -601,27 +601,42 @@ typedef struct {
     nl_endpoint_t *ep;
     nl_peer_id_t peer; /* used by the flood thread only */
     atomic_bool run;
+    atomic_bool at_final; /* racer: about to make the one call that races destroy */
 } poll_destroy_ctx_t;
 
-/* Tight non-blocking polling loop: the poller lives almost entirely in
- * nl_poll_event (entry scan + exit path), so destroy's drain constantly
- * races its final ep touches. Consumes DATA events without validating
- * them: this test is about the exit-path race, not delivery. */
+/* A racer polls in a tight non-blocking loop while the queue is being
+ * flooded, then makes exactly ONE more call, a blocking one, and returns.
+ *
+ * That last call is the one that races nl_endpoint_destroy. The previous
+ * version kept looping on a `run` flag until destroy had started, which let
+ * a racer pass the flag check, get preempted, and enter nl_poll_event after
+ * destroy had freed the endpoint. That is a use after destroy by the harness,
+ * not a library bug: no caller may begin an API call once destroy has
+ * started. Here every racer has stopped looping and is (or is about to be)
+ * blocked inside its final call before destroy runs, so destroy only ever
+ * races calls that began earlier, which is exactly what it must tolerate. */
 static void *poll_destroy_racer_main(void *arg) {
     poll_destroy_ctx_t *c = (poll_destroy_ctx_t *)arg;
-    while (atomic_load(&c->run)) {
-        nl_event_t ev;
-        if (nl_poll_event(c->ep, &ev, 0)) {
-            /* only NL_EVENT_DATA carries a borrowed payload; nothing to
-             * assert here, polling again releases the borrow */
-        }
+    nl_event_t ev;
+    /* Phase 1: poll until told to stop AND the backlog is drained, so the
+     * final call below blocks instead of returning an old event at once. The
+     * endpoint is alive throughout: the main thread waits for at_final. */
+    for (;;) {
+        bool got = nl_poll_event(c->ep, &ev, 0);
+        if (!got && !atomic_load(&c->run)) break;
     }
+    atomic_store(&c->at_final, true);
+    /* Phase 2: the single call that races destroy. It is woken either by
+     * shutdown or by an event the second flood delivers mid-destroy (the
+     * event-returning exit path with a window charge to release and a borrow
+     * to book, the widest part of the original race). */
+    (void)nl_poll_event(c->ep, &ev, 5000);
     return NULL;
 }
 
 /* Keeps the server's event queue non-empty so the racers spend their time
- * in the event-returning exit path (with a window charge to release and a
- * borrow to re-book), the widest part of the racy window. */
+ * in the event-returning exit path. Sends on the CLIENT endpoint, which is
+ * never destroyed concurrently. */
 static void *event_flood_main(void *arg) {
     poll_destroy_ctx_t *c = (poll_destroy_ctx_t *)arg;
     uint8_t payload[POLL_PAYLOAD_LEN];
@@ -631,6 +646,16 @@ static void *event_flood_main(void *arg) {
         usleep(2000); /* window/queue gated once the server stops draining */
     }
     return NULL;
+}
+
+static pthread_t start_flood(poll_destroy_ctx_t *flood, nl_endpoint_t *client, nl_peer_id_t peer) {
+    memset(flood, 0, sizeof(*flood));
+    flood->ep = client;
+    flood->peer = peer;
+    atomic_init(&flood->run, true);
+    pthread_t th;
+    pthread_create(&th, NULL, event_flood_main, flood);
+    return th;
 }
 
 TEST(test_threading_destroy_wakes_poll_exit_racers) {
@@ -646,37 +671,39 @@ TEST(test_threading_destroy_wakes_poll_exit_racers) {
             memset(&racers[t], 0, sizeof(racers[t]));
             racers[t].ep = server;
             atomic_init(&racers[t].run, true);
+            atomic_init(&racers[t].at_final, false);
             ASSERT_EQ(pthread_create(&racer_threads[t], NULL, poll_destroy_racer_main, &racers[t]), 0);
         }
 
-        /* The flood thread sends on the CLIENT endpoint, which is never
-         * destroyed concurrently, like the existing destroy-race test. It
-         * keeps a backlog queued on the server so racers stay in the busy
-         * exit path. */
-        poll_destroy_ctx_t flood;
-        memset(&flood, 0, sizeof(flood));
-        flood.ep = client;
-        flood.peer = client_peer;
-        atomic_init(&flood.run, true);
-        pthread_t flood_thread;
-        ASSERT_EQ(pthread_create(&flood_thread, NULL, event_flood_main, &flood), 0);
-
-        /* Let the racers settle into their loop (and land a few events so
-         * each holds a borrow in the exit path), then stop them by gate
-         * and destroy while they wind down. run=false is set BEFORE
-         * destroy: each racer may still be inside (or exiting) one final
-         * nl_poll_event call, which destroy must tolerate. After that
-         * call returns the racer re-checks the gate and exits without
-         * touching ep again, so the harness itself never polls a freed
-         * endpoint. */
+        /* Phase 1: a backlog keeps the racers in the busy exit path while
+         * they land events and hold borrows. */
+        poll_destroy_ctx_t flood1;
+        pthread_t flood1_thread = start_flood(&flood1, client, client_peer);
         usleep(50 * 1000);
-        for (int t = 0; t < DESTROY_RACERS; t++) atomic_store(&racers[t].run, false);
-        atomic_store(&flood.run, false);
+        atomic_store(&flood1.run, false);
+        pthread_join(flood1_thread, NULL);
 
+        /* Stop the racers' loops and wait until every one of them is on its
+         * final call. Only then may destroy begin. */
+        for (int t = 0; t < DESTROY_RACERS; t++) atomic_store(&racers[t].run, false);
+        for (int t = 0; t < DESTROY_RACERS; t++) {
+            for (int spins = 0; !atomic_load(&racers[t].at_final); spins++) {
+                ASSERT_TRUE(spins < 5000); /* 5 s */
+                usleep(1000);
+            }
+        }
+        usleep(50 * 1000); /* at_final is set just before the call: give each racer time to be inside it */
+
+        /* Phase 2: fresh events arrive while destroy runs, so blocked racers
+         * wake with an event (exit path with a borrow) as destroy drains. */
+        poll_destroy_ctx_t flood2;
+        pthread_t flood2_thread = start_flood(&flood2, client, client_peer);
+        usleep(1000);
         nl_endpoint_destroy(server);
 
+        atomic_store(&flood2.run, false);
         for (int t = 0; t < DESTROY_RACERS; t++) pthread_join(racer_threads[t], NULL);
-        pthread_join(flood_thread, NULL);
+        pthread_join(flood2_thread, NULL);
 
         nl_endpoint_destroy(client);
     }

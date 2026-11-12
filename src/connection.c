@@ -87,8 +87,18 @@ static void cc_on_acks(nl_connection_t *conn, uint32_t newly_acked) {
 }
 
 /* Loss signal: RTO resets cwnd to 1 (slow start); fast retransmit enters
- * recovery at half window (ssthresh). `fast` selects which. */
-static void cc_on_loss(nl_connection_t *conn, bool fast) {
+ * recovery at half window (ssthresh). `fast` selects which. A fast loss
+ * detected within one smoothed RTT of the previous reduction is the same
+ * congestion event (one window of data, several holes) and is ignored, so a
+ * burst of losses halves the window once instead of once per detection. An
+ * RTO always applies: it means the ack clock stopped, which is worse. */
+static void cc_on_loss(nl_connection_t *conn, bool fast, uint64_t now_ms) {
+    if (fast && conn->loss_cut_valid && now_ms >= conn->last_loss_cut_ms &&
+        now_ms - conn->last_loss_cut_ms < (conn->rtt_ms ? conn->rtt_ms : 1)) {
+        return;
+    }
+    conn->last_loss_cut_ms = now_ms;
+    conn->loss_cut_valid = true;
     uint32_t half = conn->cwnd / 2;
     if (half < 2) half = 2;
     conn->ssthresh = half;
@@ -152,21 +162,28 @@ static bool deferred_push(nl_connection_t *conn, uint8_t channel, nl_delivery_t 
     m->len = (uint32_t)len;
     m->next = NULL;
 
-    nl_deferred_msg_t *head = conn->deferred_head;
-    if (head && head->continuation) {
-        nl_deferred_msg_t *cur = head;
-        while (cur->next && cur->next->priority >= priority) cur = cur->next;
-        m->next = cur->next;
-        cur->next = m;
-    } else if (!head || head->priority < priority) {
-        m->next = conn->deferred_head;
-        conn->deferred_head = m;
-    } else {
-        nl_deferred_msg_t *cur = conn->deferred_head;
-        while (cur->next && cur->next->priority >= priority) cur = cur->next;
-        m->next = cur->next;
-        cur->next = m;
+    /* Descending priority, stable within equal priority. A message already
+     * being streamed (continuation) stays at the head. */
+    nl_deferred_msg_t **link = &conn->deferred_head;
+    if (*link && (*link)->continuation) link = &(*link)->next;
+    while (*link && (*link)->priority >= priority) link = &(*link)->next;
+    /* ...but priority must never reorder one RELIABLE_ORDERED stream: sequence
+     * numbers are assigned at emit time, so jumping an earlier message of the
+     * same channel would swap what the receiver delivers. Priority still
+     * applies across channels and across unordered traffic. */
+    if (delivery == NL_RELIABLE_ORDERED) {
+        nl_deferred_msg_t **last_same = NULL;
+        for (nl_deferred_msg_t **l = &conn->deferred_head; *l; l = &(*l)->next) {
+            if ((*l)->channel == channel && (*l)->delivery == (uint8_t)NL_RELIABLE_ORDERED) last_same = l;
+        }
+        if (last_same) {
+            for (nl_deferred_msg_t **l = link; *l; l = &(*l)->next) {
+                if (l == last_same) { link = &(*l)->next; break; }
+            }
+        }
     }
+    m->next = *link;
+    *link = m;
     conn->deferred_count++;
     conn->deferred_bytes += (uint32_t)len;
     return true;
@@ -264,6 +281,7 @@ nl_connection_t *nl_connection_create(nl_peer_id_t id, const struct sockaddr_sto
     conn->peer_window_in_flight = 0;
     conn->recv_window_size = NL_RECV_WINDOW_DEFAULT;
     conn->recv_window_used = 0;
+    conn->last_adv_sent = nl_connection_adv_window(conn);
     conn->rate_bps = 0;
     conn->rate_tokens = 0.0;
     conn->rate_last_refill_ms = now_ms;
@@ -288,8 +306,8 @@ void nl_connection_destroy(nl_connection_t *conn) {
     deferred_free_all(conn);
     pthread_mutex_destroy(&conn->lock);
     /* Best-effort zeroing of key material before freeing. */
-    memset(conn->send_key, 0, sizeof(conn->send_key));
-    memset(conn->recv_key, 0, sizeof(conn->recv_key));
+    nl_crypto_wipe(conn->send_key, sizeof(conn->send_key));
+    nl_crypto_wipe(conn->recv_key, sizeof(conn->recv_key));
     free(conn);
 }
 
@@ -478,6 +496,7 @@ static send_outcome_t do_channel_send(nl_connection_t *conn, const send_attempt_
     send_outcome_t out = { NL_ERR_INTERNAL, 0, a->message_id, 0 };
     emit_ctx_t ectx = { conn, a->cb };
     uint16_t rwnd = nl_connection_adv_window(conn);
+    conn->last_adv_sent = rwnd;
     uint16_t frag_count = 0;
     out.result = nl_channel_send_range(&conn->channels[a->channel], a->now_ms, a->channel,
                                        a->delivery, a->data, a->len, rwnd,
@@ -780,9 +799,15 @@ nl_result_t nl_connection_on_packet(nl_connection_t *conn, uint8_t type,
             break;
         }
         case NL_PKT_KEEPALIVE:
-            /* Nothing to do beyond the last_recv_time_ms update above --
-             * keepalives exist purely to keep the connection from idling
-             * out and to let both sides estimate RTT. */
+            /* Keeps the connection from idling out. A payload of two bytes
+             * carries the peer's current window, which repairs a lost
+             * window update (older peers send none). */
+            if (ct_len >= 2) {
+                uint16_t peer_rwnd = nl_get_u16(plaintext);
+                if (peer_rwnd > conn->peer_rwnd_capacity) conn->peer_rwnd_capacity = peer_rwnd;
+                conn->peer_rwnd = peer_rwnd;
+                conn->peer_window_in_flight = 0;
+            }
             break;
         case NL_PKT_CONNECT_ACCEPTED:
             /* Client-side handshake confirmation. Harmless no-op if this
@@ -804,7 +829,7 @@ nl_result_t nl_connection_on_packet(nl_connection_t *conn, uint8_t type,
     }
 
     if (total_newly_acked > 0) cc_on_acks(conn, total_newly_acked);
-    if (fast_loss) cc_on_loss(conn, /*fast*/ true);
+    if (fast_loss) cc_on_loss(conn, /*fast*/ true, now_ms);
 
     /* Acks (and the peer's new rwnd) open budget for deferred sends. */
     if (conn->deferred_head) flush_deferred(conn, now_ms, cb);
@@ -840,9 +865,33 @@ static void flush_acks_locked(nl_connection_t *conn, const nl_conn_callbacks_t *
             payload[12] = 1; /* ack_valid: this packet carries a real ack */
             nl_put_u16(payload + 13, adv);
             encrypt_and_emit(conn, NL_PKT_ACK, payload, NL_ACK_PAYLOAD_SIZE, /*is_retransmit*/ false, cb);
+            conn->last_adv_sent = adv;
             lane->ack_dirty = false;
         }
     }
+}
+
+/* Smallest window growth worth a packet: one fragment's worth of room. */
+#define NL_WINDOW_UPDATE_MIN_GROWTH NL_FRAGMENT_CHUNK_SIZE
+
+/* Caller must hold conn->lock. When the app has drained enough since we last
+ * advertised our window, tell the peer with an ack that carries no
+ * acknowledgement (ack_valid = 0), only the new window. Without this a sender
+ * parked on a closed window hears nothing until the receiver happens to have
+ * DATA of its own to send. The update is best effort: the idle keepalive
+ * repeats the current window, so a lost update delays the sender by at most
+ * one keepalive interval. */
+static void maybe_send_window_update_locked(nl_connection_t *conn, const nl_conn_callbacks_t *cb) {
+    uint16_t adv = nl_connection_adv_window(conn);
+    if (adv <= conn->last_adv_sent) return;
+    if ((uint32_t)(adv - conn->last_adv_sent) < NL_WINDOW_UPDATE_MIN_GROWTH) return;
+    uint8_t payload[NL_ACK_PAYLOAD_SIZE] = {0};
+    payload[0] = 0;                       /* channel 0 always exists */
+    payload[1] = (uint8_t)NL_RELIABLE_UNORDERED;
+    payload[12] = 0;                      /* ack_valid: window only */
+    nl_put_u16(payload + 13, adv);
+    encrypt_and_emit(conn, NL_PKT_ACK, payload, NL_ACK_PAYLOAD_SIZE, /*is_retransmit*/ false, cb);
+    conn->last_adv_sent = adv;
 }
 
 void nl_connection_flush_acks(nl_connection_t *conn, uint64_t now_ms, const nl_conn_callbacks_t *cb) {
@@ -896,7 +945,7 @@ void nl_connection_tick(nl_connection_t *conn, uint64_t now_ms, const nl_conn_ca
                          on_channel_retransmit, &rctx, &give_up);
         any_gave_up = any_gave_up || give_up;
     }
-    if (conn->stats.retransmits > retx_before) cc_on_loss(conn, /*fast*/ false);
+    if (conn->stats.retransmits > retx_before) cc_on_loss(conn, /*fast*/ false, now_ms);
 
     /* Rate tokens refill with wall time; re-check deferred queue. */
     if (conn->deferred_head) {
@@ -909,12 +958,18 @@ void nl_connection_tick(nl_connection_t *conn, uint64_t now_ms, const nl_conn_ca
      * happen without new inbound traffic (and the unit-test harness,
      * which has no endpoint). */
     flush_acks_locked(conn, cb);
+    maybe_send_window_update_locked(conn, cb);
 
     /* Idle keepalive so a channel with no application traffic still gets
      * timely acks and RTT samples, and the peer's idle timer keeps resetting. */
     if (now_ms - conn->last_send_time_ms >= conn->keepalive_interval_ms) {
-        uint8_t empty[1] = {0};
-        encrypt_and_emit(conn, NL_PKT_KEEPALIVE, empty, 0, /*is_retransmit*/ false, cb);
+        /* The payload is the local window (u16). Old peers ignore keepalive
+         * payloads, and a keepalive without one is still accepted below. */
+        uint8_t ka[2];
+        uint16_t ka_adv = nl_connection_adv_window(conn);
+        nl_put_u16(ka, ka_adv);
+        encrypt_and_emit(conn, NL_PKT_KEEPALIVE, ka, sizeof(ka), /*is_retransmit*/ false, cb);
+        conn->last_adv_sent = ka_adv;
         conn->last_send_time_ms = now_ms;
     }
 

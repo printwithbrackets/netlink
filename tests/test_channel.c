@@ -762,6 +762,69 @@ TEST(test_partial_send_reports_fragments_actually_sent) {
     nl_channel_free(&chan);
 }
 
+
+/* Regression: a RELIABLE_UNORDERED fragment that reassembly cannot take yet
+ * (byte budget full) used to be recorded in the dedupe window and therefore
+ * acked, so the sender stopped retransmitting it and the message was lost
+ * for good. It must be left unacked so the retransmit path delivers it. */
+TEST(test_reliable_unordered_fragment_not_acked_when_reassembly_full) {
+    nl_channel_t sender, receiver;
+    nl_channel_init(&sender);
+    nl_channel_init(&receiver);
+    /* Room for message A (4 fragments) plus 2 more fragments, but not for B (3). */
+    nl_channel_set_reassembly_budget(&receiver, 6 * NL_FRAGMENT_CHUNK_SIZE);
+
+    size_t a_len = 4 * NL_FRAGMENT_CHUNK_SIZE;
+    size_t b_len = 2 * NL_FRAGMENT_CHUNK_SIZE + 1;
+    uint8_t *a = (uint8_t *)malloc(a_len);
+    uint8_t *b = (uint8_t *)malloc(b_len);
+    memset(a, 0xA1, a_len);
+    memset(b, 0xB2, b_len);
+
+    capture_t *cap_a = (capture_t *)calloc(1, sizeof(capture_t));
+    capture_t *cap_b = (capture_t *)calloc(1, sizeof(capture_t));
+    ASSERT_EQ(nl_channel_send(&sender, 0, 0, NL_RELIABLE_UNORDERED, a, a_len, NL_RECV_WINDOW_DEFAULT, capture_emit, cap_a), NL_OK);
+    ASSERT_EQ(nl_channel_send(&sender, 0, 0, NL_RELIABLE_UNORDERED, b, b_len, NL_RECV_WINDOW_DEFAULT, capture_emit, cap_b), NL_OK);
+    ASSERT_EQ(cap_a->count, 4);
+    ASSERT_EQ(cap_b->count, 3);
+
+    delivered_t *del = (delivered_t *)calloc(1, sizeof(delivered_t));
+    /* A arrives minus fragment 1 (lost in transit). */
+    for (int i = 0; i < cap_a->count; i++) {
+        if (i == 1) continue;
+        nl_channel_on_receive(&receiver, 0, cap_a->packets[i].data, cap_a->packets[i].len, NL_RECV_WINDOW_DEFAULT, capture_deliver, del, NULL, NULL, NULL, NULL, NULL, NULL);
+    }
+    /* B arrives whole, but A still holds 4 of the 6 budgeted fragments. */
+    for (int i = 0; i < cap_b->count; i++) {
+        nl_channel_on_receive(&receiver, 0, cap_b->packets[i].data, cap_b->packets[i].len, NL_RECV_WINDOW_DEFAULT, capture_deliver, del, NULL, NULL, NULL, NULL, NULL, NULL);
+    }
+    ASSERT_EQ(del->count, 0);
+
+    /* B's sequences (4..6) must not be covered by the ack the receiver would send:
+     * the newest acked sequence is A's last fragment (3). */
+    uint16_t ack = 0;
+    nl_ack_bits_t bits = 0;
+    nl_recv_dedupe_build_ack(&receiver.lanes[NL_RELIABLE_UNORDERED].recv_dedupe, &ack, &bits);
+    ASSERT_EQ(ack, 3);
+
+    /* A's missing fragment is retransmitted: A completes and frees its budget. */
+    nl_channel_on_receive(&receiver, 0, cap_a->packets[1].data, cap_a->packets[1].len, NL_RECV_WINDOW_DEFAULT, capture_deliver, del, NULL, NULL, NULL, NULL, NULL, NULL);
+    ASSERT_EQ(del->count, 1);
+    ASSERT_EQ(del->len[0], (uint32_t)a_len);
+
+    /* B's fragments are retransmitted and now go through. */
+    for (int i = 0; i < cap_b->count; i++) {
+        nl_channel_on_receive(&receiver, 0, cap_b->packets[i].data, cap_b->packets[i].len, NL_RECV_WINDOW_DEFAULT, capture_deliver, del, NULL, NULL, NULL, NULL, NULL, NULL);
+    }
+    ASSERT_EQ(del->count, 2);
+    ASSERT_EQ(del->len[1], (uint32_t)b_len);
+    ASSERT_MEM_EQ(del->data[1], b, b_len);
+
+    free(a); free(b); free(cap_a); free(cap_b); free(del);
+    nl_channel_free(&sender);
+    nl_channel_free(&receiver);
+}
+
 int main(void) {
     printf("=== channel tests ===\n");
     RUN_TEST(test_unreliable_basic_roundtrip);
@@ -786,5 +849,6 @@ int main(void) {
     RUN_TEST(test_packet_beyond_reorder_window_is_dropped_not_acked);
     RUN_TEST(test_partial_send_reports_fragments_actually_sent);
     RUN_TEST(test_rwnd_carried_on_data_header);
+    RUN_TEST(test_reliable_unordered_fragment_not_acked_when_reassembly_full);
     TEST_SUMMARY();
 }

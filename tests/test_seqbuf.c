@@ -677,6 +677,27 @@ TEST(test_reorder_ring_baseline_is_always_zero_not_first_arrival) {
     nl_reorder_ring_free(&ring);
 }
 
+
+TEST(test_recv_dedupe_seen_is_read_only_and_matches_insert) {
+    nl_recv_dedupe_t d;
+    ASSERT_EQ(nl_recv_dedupe_init(&d), 0);
+    ASSERT_FALSE(nl_recv_dedupe_seen(&d, 5)); /* nothing received yet */
+    ASSERT_TRUE(nl_recv_dedupe_insert(&d, 5));
+    ASSERT_TRUE(nl_recv_dedupe_seen(&d, 5));
+    ASSERT_FALSE(nl_recv_dedupe_seen(&d, 6)); /* newer than anything received */
+    ASSERT_FALSE(nl_recv_dedupe_seen(&d, 4)); /* older but never received */
+    /* seen() must not have recorded anything: 4 and 6 are still new to insert(). */
+    ASSERT_TRUE(nl_recv_dedupe_insert(&d, 6));
+    ASSERT_TRUE(nl_recv_dedupe_insert(&d, 4));
+    uint16_t ack; nl_ack_bits_t bits;
+    nl_recv_dedupe_build_ack(&d, &ack, &bits);
+    ASSERT_EQ(ack, 6);
+    /* A sequence that has fallen out of the window counts as seen, like insert() says. */
+    ASSERT_TRUE(nl_recv_dedupe_insert(&d, (uint16_t)(6 + NL_SEQ_RING_SIZE + 10)));
+    ASSERT_TRUE(nl_recv_dedupe_seen(&d, 5));
+    nl_recv_dedupe_free(&d);
+}
+
 int main(void) {
     printf("=== seqbuf tests ===\n");
     RUN_TEST(test_seq_greater_than_basic);
@@ -704,6 +725,7 @@ int main(void) {
     RUN_TEST(test_recv_dedupe_too_old_rejected);
     RUN_TEST(test_recv_dedupe_build_ack_bitfield);
     RUN_TEST(test_recv_dedupe_wraparound);
+    RUN_TEST(test_recv_dedupe_seen_is_read_only_and_matches_insert);
     RUN_TEST(test_reorder_ring_in_order_passthrough);
     RUN_TEST(test_reorder_ring_buffers_out_of_order);
     RUN_TEST(test_reorder_ring_rejects_stale_duplicate);
