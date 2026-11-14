@@ -4,253 +4,253 @@
 #include <stdlib.h>
 
 TEST(test_fragment_count_needed_basic) {
-    ASSERT_EQ(nl_fragment_count_needed(0), 0);
-    ASSERT_EQ(nl_fragment_count_needed(1), 1);
-    ASSERT_EQ(nl_fragment_count_needed(NL_FRAGMENT_CHUNK_SIZE), 1);
-    ASSERT_EQ(nl_fragment_count_needed(NL_FRAGMENT_CHUNK_SIZE + 1), 2);
-    ASSERT_EQ(nl_fragment_count_needed(NL_FRAGMENT_CHUNK_SIZE * 3), 3);
+    ASSERT_EQ(wn_fragment_count_needed(0), 0);
+    ASSERT_EQ(wn_fragment_count_needed(1), 1);
+    ASSERT_EQ(wn_fragment_count_needed(WN_FRAGMENT_CHUNK_SIZE), 1);
+    ASSERT_EQ(wn_fragment_count_needed(WN_FRAGMENT_CHUNK_SIZE + 1), 2);
+    ASSERT_EQ(wn_fragment_count_needed(WN_FRAGMENT_CHUNK_SIZE * 3), 3);
 }
 
 TEST(test_fragment_count_needed_rejects_oversized) {
-    ASSERT_EQ(nl_fragment_count_needed(NL_MAX_MESSAGE_SIZE + 1), 0);
+    ASSERT_EQ(wn_fragment_count_needed(WN_MAX_MESSAGE_SIZE + 1), 0);
 }
 
 TEST(test_fragment_count_needed_exact_max_size_boundary) {
     /* The documented maximum (256 KB) must still be sendable and must
      * land exactly on the fragment cap: 262144 / 1024 = 256. One byte
      * more is rejected (covered above); the boundary itself must not be. */
-    ASSERT_EQ(NL_MAX_MESSAGE_SIZE, (size_t)NL_MAX_FRAGMENTS * NL_FRAGMENT_CHUNK_SIZE);
-    ASSERT_EQ(nl_fragment_count_needed(NL_MAX_MESSAGE_SIZE), NL_MAX_FRAGMENTS);
+    ASSERT_EQ(WN_MAX_MESSAGE_SIZE, (size_t)WN_MAX_FRAGMENTS * WN_FRAGMENT_CHUNK_SIZE);
+    ASSERT_EQ(wn_fragment_count_needed(WN_MAX_MESSAGE_SIZE), WN_MAX_FRAGMENTS);
 }
 
 TEST(test_fragment_get_chunk_splits_correctly) {
-    size_t total = NL_FRAGMENT_CHUNK_SIZE + 100;
+    size_t total = WN_FRAGMENT_CHUNK_SIZE + 100;
     uint8_t *data = (uint8_t *)malloc(total);
     for (size_t i = 0; i < total; i++) data[i] = (uint8_t)(i & 0xFF);
 
     const uint8_t *ptr; uint16_t len;
-    nl_fragment_get_chunk(data, total, 0, &ptr, &len);
-    ASSERT_EQ(len, NL_FRAGMENT_CHUNK_SIZE);
+    wn_fragment_get_chunk(data, total, 0, &ptr, &len);
+    ASSERT_EQ(len, WN_FRAGMENT_CHUNK_SIZE);
     ASSERT_TRUE(ptr == data);
 
-    nl_fragment_get_chunk(data, total, 1, &ptr, &len);
+    wn_fragment_get_chunk(data, total, 1, &ptr, &len);
     ASSERT_EQ(len, 100);
-    ASSERT_TRUE(ptr == data + NL_FRAGMENT_CHUNK_SIZE);
+    ASSERT_TRUE(ptr == data + WN_FRAGMENT_CHUNK_SIZE);
 
     free(data);
 }
 
 TEST(test_reassembly_single_fragment_message) {
-    nl_reassembly_tracker_t t;
-    nl_reassembly_tracker_init(&t);
+    wn_reassembly_tracker_t t;
+    wn_reassembly_tracker_init(&t);
 
     uint8_t chunk[] = "hello world";
     const uint8_t *out; uint32_t out_len;
-    nl_reassemble_result_t r = nl_reassembly_feed(&t, 0, /*msg_id*/1, /*idx*/0, /*count*/1,
+    wn_reassemble_result_t r = wn_reassembly_feed(&t, 0, /*msg_id*/1, /*idx*/0, /*count*/1,
                                                    chunk, sizeof(chunk), &out, &out_len);
-    ASSERT_EQ(r, NL_REASSEMBLE_COMPLETE);
+    ASSERT_EQ(r, WN_REASSEMBLE_COMPLETE);
     ASSERT_EQ(out_len, sizeof(chunk));
     ASSERT_MEM_EQ(out, chunk, sizeof(chunk));
 
-    nl_reassembly_tracker_free(&t);
+    wn_reassembly_tracker_free(&t);
 }
 
 TEST(test_reassembly_multi_fragment_in_order) {
-    nl_reassembly_tracker_t t;
-    nl_reassembly_tracker_init(&t);
+    wn_reassembly_tracker_t t;
+    wn_reassembly_tracker_init(&t);
 
-    size_t total = NL_FRAGMENT_CHUNK_SIZE * 2 + 50;
+    size_t total = WN_FRAGMENT_CHUNK_SIZE * 2 + 50;
     uint8_t *data = (uint8_t *)malloc(total);
     for (size_t i = 0; i < total; i++) data[i] = (uint8_t)((i * 7) & 0xFF);
 
-    uint16_t count = nl_fragment_count_needed(total);
+    uint16_t count = wn_fragment_count_needed(total);
     ASSERT_EQ(count, 3);
 
     const uint8_t *out = NULL; uint32_t out_len = 0;
-    nl_reassemble_result_t r = NL_REASSEMBLE_PENDING;
+    wn_reassemble_result_t r = WN_REASSEMBLE_PENDING;
     for (uint16_t i = 0; i < count; i++) {
         const uint8_t *chunk_ptr; uint16_t chunk_len;
-        nl_fragment_get_chunk(data, total, i, &chunk_ptr, &chunk_len);
-        r = nl_reassembly_feed(&t, 0, 42, i, count, chunk_ptr, chunk_len, &out, &out_len);
-        if (i < count - 1) ASSERT_EQ(r, NL_REASSEMBLE_PENDING);
+        wn_fragment_get_chunk(data, total, i, &chunk_ptr, &chunk_len);
+        r = wn_reassembly_feed(&t, 0, 42, i, count, chunk_ptr, chunk_len, &out, &out_len);
+        if (i < count - 1) ASSERT_EQ(r, WN_REASSEMBLE_PENDING);
     }
-    ASSERT_EQ(r, NL_REASSEMBLE_COMPLETE);
+    ASSERT_EQ(r, WN_REASSEMBLE_COMPLETE);
     ASSERT_EQ(out_len, total);
     ASSERT_MEM_EQ(out, data, total);
 
     free(data);
-    nl_reassembly_tracker_free(&t);
+    wn_reassembly_tracker_free(&t);
 }
 
 TEST(test_reassembly_out_of_order_fragments) {
-    nl_reassembly_tracker_t t;
-    nl_reassembly_tracker_init(&t);
+    wn_reassembly_tracker_t t;
+    wn_reassembly_tracker_init(&t);
 
-    size_t total = NL_FRAGMENT_CHUNK_SIZE * 3;
+    size_t total = WN_FRAGMENT_CHUNK_SIZE * 3;
     uint8_t *data = (uint8_t *)malloc(total);
     for (size_t i = 0; i < total; i++) data[i] = (uint8_t)(i & 0xFF);
-    uint16_t count = nl_fragment_count_needed(total);
+    uint16_t count = wn_fragment_count_needed(total);
 
     const uint8_t *out; uint32_t out_len;
     const uint8_t *c0, *c1, *c2; uint16_t l0, l1, l2;
-    nl_fragment_get_chunk(data, total, 0, &c0, &l0);
-    nl_fragment_get_chunk(data, total, 1, &c1, &l1);
-    nl_fragment_get_chunk(data, total, 2, &c2, &l2);
+    wn_fragment_get_chunk(data, total, 0, &c0, &l0);
+    wn_fragment_get_chunk(data, total, 1, &c1, &l1);
+    wn_fragment_get_chunk(data, total, 2, &c2, &l2);
 
     /* Arrive in order 2, 0, 1 */
-    ASSERT_EQ(nl_reassembly_feed(&t, 0, 7, 2, count, c2, l2, &out, &out_len), NL_REASSEMBLE_PENDING);
-    ASSERT_EQ(nl_reassembly_feed(&t, 0, 7, 0, count, c0, l0, &out, &out_len), NL_REASSEMBLE_PENDING);
-    nl_reassemble_result_t r = nl_reassembly_feed(&t, 0, 7, 1, count, c1, l1, &out, &out_len);
-    ASSERT_EQ(r, NL_REASSEMBLE_COMPLETE);
+    ASSERT_EQ(wn_reassembly_feed(&t, 0, 7, 2, count, c2, l2, &out, &out_len), WN_REASSEMBLE_PENDING);
+    ASSERT_EQ(wn_reassembly_feed(&t, 0, 7, 0, count, c0, l0, &out, &out_len), WN_REASSEMBLE_PENDING);
+    wn_reassemble_result_t r = wn_reassembly_feed(&t, 0, 7, 1, count, c1, l1, &out, &out_len);
+    ASSERT_EQ(r, WN_REASSEMBLE_COMPLETE);
     ASSERT_EQ(out_len, total);
     ASSERT_MEM_EQ(out, data, total);
 
     free(data);
-    nl_reassembly_tracker_free(&t);
+    wn_reassembly_tracker_free(&t);
 }
 
 TEST(test_reassembly_duplicate_fragment_is_idempotent) {
-    nl_reassembly_tracker_t t;
-    nl_reassembly_tracker_init(&t);
-    /* Non-final fragments must be exactly NL_FRAGMENT_CHUNK_SIZE (that's
+    wn_reassembly_tracker_t t;
+    wn_reassembly_tracker_init(&t);
+    /* Non-final fragments must be exactly WN_FRAGMENT_CHUNK_SIZE (that's
      * what real senders produce); only the final one may be short. */
-    uint8_t full[NL_FRAGMENT_CHUNK_SIZE]; memset(full, 0xAB, sizeof(full));
+    uint8_t full[WN_FRAGMENT_CHUNK_SIZE]; memset(full, 0xAB, sizeof(full));
     uint8_t last[] = "abc";
     const uint8_t *out; uint32_t out_len;
 
-    ASSERT_EQ(nl_reassembly_feed(&t, 0, 1, 0, 2, full, sizeof(full), &out, &out_len), NL_REASSEMBLE_PENDING);
+    ASSERT_EQ(wn_reassembly_feed(&t, 0, 1, 0, 2, full, sizeof(full), &out, &out_len), WN_REASSEMBLE_PENDING);
     /* Resend fragment 0 again (e.g. a duplicate delivery) -- must not
      * double-count toward completion or corrupt state. */
-    ASSERT_EQ(nl_reassembly_feed(&t, 0, 1, 0, 2, full, sizeof(full), &out, &out_len), NL_REASSEMBLE_PENDING);
-    ASSERT_EQ(nl_reassembly_feed(&t, 0, 1, 1, 2, last, 3, &out, &out_len), NL_REASSEMBLE_COMPLETE);
-    ASSERT_EQ(out_len, NL_FRAGMENT_CHUNK_SIZE + 3);
+    ASSERT_EQ(wn_reassembly_feed(&t, 0, 1, 0, 2, full, sizeof(full), &out, &out_len), WN_REASSEMBLE_PENDING);
+    ASSERT_EQ(wn_reassembly_feed(&t, 0, 1, 1, 2, last, 3, &out, &out_len), WN_REASSEMBLE_COMPLETE);
+    ASSERT_EQ(out_len, WN_FRAGMENT_CHUNK_SIZE + 3);
 
-    nl_reassembly_tracker_free(&t);
+    wn_reassembly_tracker_free(&t);
 }
 
 TEST(test_reassembly_rejects_zero_fragment_count) {
-    nl_reassembly_tracker_t t;
-    nl_reassembly_tracker_init(&t);
+    wn_reassembly_tracker_t t;
+    wn_reassembly_tracker_init(&t);
     uint8_t chunk[] = "x";
     const uint8_t *out; uint32_t out_len;
-    ASSERT_EQ(nl_reassembly_feed(&t, 0, 1, 0, 0, chunk, 1, &out, &out_len), NL_REASSEMBLE_INVALID);
-    nl_reassembly_tracker_free(&t);
+    ASSERT_EQ(wn_reassembly_feed(&t, 0, 1, 0, 0, chunk, 1, &out, &out_len), WN_REASSEMBLE_INVALID);
+    wn_reassembly_tracker_free(&t);
 }
 
 TEST(test_reassembly_rejects_fragment_count_over_max) {
-    nl_reassembly_tracker_t t;
-    nl_reassembly_tracker_init(&t);
+    wn_reassembly_tracker_t t;
+    wn_reassembly_tracker_init(&t);
     uint8_t chunk[] = "x";
     const uint8_t *out; uint32_t out_len;
-    ASSERT_EQ(nl_reassembly_feed(&t, 0, 1, 0, NL_MAX_FRAGMENTS + 1, chunk, 1, &out, &out_len),
-              NL_REASSEMBLE_INVALID);
-    nl_reassembly_tracker_free(&t);
+    ASSERT_EQ(wn_reassembly_feed(&t, 0, 1, 0, WN_MAX_FRAGMENTS + 1, chunk, 1, &out, &out_len),
+              WN_REASSEMBLE_INVALID);
+    wn_reassembly_tracker_free(&t);
 }
 
 TEST(test_reassembly_rejects_index_out_of_range) {
-    nl_reassembly_tracker_t t;
-    nl_reassembly_tracker_init(&t);
+    wn_reassembly_tracker_t t;
+    wn_reassembly_tracker_init(&t);
     uint8_t chunk[] = "x";
     const uint8_t *out; uint32_t out_len;
     /* index must be < count */
-    ASSERT_EQ(nl_reassembly_feed(&t, 0, 1, 5, 5, chunk, 1, &out, &out_len), NL_REASSEMBLE_INVALID);
-    nl_reassembly_tracker_free(&t);
+    ASSERT_EQ(wn_reassembly_feed(&t, 0, 1, 5, 5, chunk, 1, &out, &out_len), WN_REASSEMBLE_INVALID);
+    wn_reassembly_tracker_free(&t);
 }
 
 TEST(test_reassembly_rejects_oversized_chunk) {
-    nl_reassembly_tracker_t t;
-    nl_reassembly_tracker_init(&t);
-    uint8_t big[NL_FRAGMENT_CHUNK_SIZE + 1] = {0};
+    wn_reassembly_tracker_t t;
+    wn_reassembly_tracker_init(&t);
+    uint8_t big[WN_FRAGMENT_CHUNK_SIZE + 1] = {0};
     const uint8_t *out; uint32_t out_len;
-    ASSERT_EQ(nl_reassembly_feed(&t, 0, 1, 0, 2, big, sizeof(big), &out, &out_len), NL_REASSEMBLE_INVALID);
-    nl_reassembly_tracker_free(&t);
+    ASSERT_EQ(wn_reassembly_feed(&t, 0, 1, 0, 2, big, sizeof(big), &out, &out_len), WN_REASSEMBLE_INVALID);
+    wn_reassembly_tracker_free(&t);
 }
 
 TEST(test_reassembly_rejects_short_non_final_fragment) {
     /* Only the LAST fragment may be shorter than the chunk size; a short
      * non-final fragment is a malformed/malicious claim. */
-    nl_reassembly_tracker_t t;
-    nl_reassembly_tracker_init(&t);
+    wn_reassembly_tracker_t t;
+    wn_reassembly_tracker_init(&t);
     uint8_t chunk[10] = {0};
     const uint8_t *out; uint32_t out_len;
-    ASSERT_EQ(nl_reassembly_feed(&t, 0, 1, 0, 3, chunk, 10, &out, &out_len), NL_REASSEMBLE_INVALID);
-    nl_reassembly_tracker_free(&t);
+    ASSERT_EQ(wn_reassembly_feed(&t, 0, 1, 0, 3, chunk, 10, &out, &out_len), WN_REASSEMBLE_INVALID);
+    wn_reassembly_tracker_free(&t);
 }
 
 TEST(test_reassembly_rejects_inconsistent_fragment_count) {
-    nl_reassembly_tracker_t t;
-    nl_reassembly_tracker_init(&t);
-    uint8_t chunk[NL_FRAGMENT_CHUNK_SIZE] = {0};
+    wn_reassembly_tracker_t t;
+    wn_reassembly_tracker_init(&t);
+    uint8_t chunk[WN_FRAGMENT_CHUNK_SIZE] = {0};
     const uint8_t *out; uint32_t out_len;
-    ASSERT_EQ(nl_reassembly_feed(&t, 0, 1, 0, 5, chunk, NL_FRAGMENT_CHUNK_SIZE, &out, &out_len),
-              NL_REASSEMBLE_PENDING);
+    ASSERT_EQ(wn_reassembly_feed(&t, 0, 1, 0, 5, chunk, WN_FRAGMENT_CHUNK_SIZE, &out, &out_len),
+              WN_REASSEMBLE_PENDING);
     /* Same message_id, but now claiming a different fragment_count. */
-    ASSERT_EQ(nl_reassembly_feed(&t, 0, 1, 1, 7, chunk, NL_FRAGMENT_CHUNK_SIZE, &out, &out_len),
-              NL_REASSEMBLE_INVALID);
-    nl_reassembly_tracker_free(&t);
+    ASSERT_EQ(wn_reassembly_feed(&t, 0, 1, 1, 7, chunk, WN_FRAGMENT_CHUNK_SIZE, &out, &out_len),
+              WN_REASSEMBLE_INVALID);
+    wn_reassembly_tracker_free(&t);
 }
 
 TEST(test_reassembly_bounded_concurrent_slots_evicts_oldest) {
-    /* Fill all NL_REASSEMBLY_SLOTS with distinct incomplete messages, then
+    /* Fill all WN_REASSEMBLY_SLOTS with distinct incomplete messages, then
      * start one more -- the oldest incomplete one must be evicted rather
      * than growing memory unboundedly. */
-    nl_reassembly_tracker_t t;
-    nl_reassembly_tracker_init(&t);
-    uint8_t full[NL_FRAGMENT_CHUNK_SIZE]; memset(full, 0, sizeof(full));
+    wn_reassembly_tracker_t t;
+    wn_reassembly_tracker_init(&t);
+    uint8_t full[WN_FRAGMENT_CHUNK_SIZE]; memset(full, 0, sizeof(full));
     const uint8_t *out; uint32_t out_len;
 
-    for (int i = 0; i < NL_REASSEMBLY_SLOTS; i++) {
-        nl_reassemble_result_t r = nl_reassembly_feed(&t, (uint64_t)i, (uint16_t)i, 0, 2, full, sizeof(full), &out, &out_len);
-        ASSERT_EQ(r, NL_REASSEMBLE_PENDING);
+    for (int i = 0; i < WN_REASSEMBLY_SLOTS; i++) {
+        wn_reassemble_result_t r = wn_reassembly_feed(&t, (uint64_t)i, (uint16_t)i, 0, 2, full, sizeof(full), &out, &out_len);
+        ASSERT_EQ(r, WN_REASSEMBLE_PENDING);
     }
     /* One more, distinct message_id -- must evict message_id 0 (oldest). */
-    nl_reassemble_result_t r = nl_reassembly_feed(&t, (uint64_t)NL_REASSEMBLY_SLOTS,
-                                                   (uint16_t)NL_REASSEMBLY_SLOTS, 0, 2, full, sizeof(full), &out, &out_len);
-    ASSERT_EQ(r, NL_REASSEMBLE_PENDING);
+    wn_reassemble_result_t r = wn_reassembly_feed(&t, (uint64_t)WN_REASSEMBLY_SLOTS,
+                                                   (uint16_t)WN_REASSEMBLY_SLOTS, 0, 2, full, sizeof(full), &out, &out_len);
+    ASSERT_EQ(r, WN_REASSEMBLE_PENDING);
 
     /* message_id 0's remaining fragment should now start a FRESH reassembly
      * (its old progress was evicted), not complete it -- prove this by
      * feeding fragment 1 and checking it's still not complete (fragment 0
      * of the fresh attempt is still missing). */
-    r = nl_reassembly_feed(&t, (uint64_t)100, 0, 1, 2, full, sizeof(full), &out, &out_len);
-    ASSERT_EQ(r, NL_REASSEMBLE_PENDING);
+    r = wn_reassembly_feed(&t, (uint64_t)100, 0, 1, 2, full, sizeof(full), &out, &out_len);
+    ASSERT_EQ(r, WN_REASSEMBLE_PENDING);
 
-    nl_reassembly_tracker_free(&t);
+    wn_reassembly_tracker_free(&t);
 }
 
 TEST(test_reassembly_expiry_reclaims_stale_slot) {
-    nl_reassembly_tracker_t t;
-    nl_reassembly_tracker_init(&t);
-    uint8_t full[NL_FRAGMENT_CHUNK_SIZE]; memset(full, 0, sizeof(full));
+    wn_reassembly_tracker_t t;
+    wn_reassembly_tracker_init(&t);
+    uint8_t full[WN_FRAGMENT_CHUNK_SIZE]; memset(full, 0, sizeof(full));
     const uint8_t *out; uint32_t out_len;
 
-    nl_reassembly_feed(&t, 0, 1, 0, 2, full, sizeof(full), &out, &out_len);
-    nl_reassembly_expire(&t, NL_REASSEMBLY_TIMEOUT_MS + 1);
+    wn_reassembly_feed(&t, 0, 1, 0, 2, full, sizeof(full), &out, &out_len);
+    wn_reassembly_expire(&t, WN_REASSEMBLY_TIMEOUT_MS + 1);
 
     /* After expiry, message_id 1 restarting from fragment 0 should be a
      * fresh reassembly (PENDING again, not silently reusing stale data). */
-    nl_reassemble_result_t r = nl_reassembly_feed(&t, NL_REASSEMBLY_TIMEOUT_MS + 2, 1, 0, 2, full, sizeof(full), &out, &out_len);
-    ASSERT_EQ(r, NL_REASSEMBLE_PENDING);
+    wn_reassemble_result_t r = wn_reassembly_feed(&t, WN_REASSEMBLY_TIMEOUT_MS + 2, 1, 0, 2, full, sizeof(full), &out, &out_len);
+    ASSERT_EQ(r, WN_REASSEMBLE_PENDING);
 
-    nl_reassembly_tracker_free(&t);
+    wn_reassembly_tracker_free(&t);
 }
 
 TEST(test_reassembly_message_id_reuse_after_completion) {
     /* After a message_id completes, it's legitimate for a later message to
      * reuse the same 16-bit id (wraparound) -- must behave as a fresh
      * reassembly, not accidentally merge with the old, already-delivered one. */
-    nl_reassembly_tracker_t t;
-    nl_reassembly_tracker_init(&t);
+    wn_reassembly_tracker_t t;
+    wn_reassembly_tracker_init(&t);
     uint8_t chunk[] = "first";
     const uint8_t *out; uint32_t out_len;
-    ASSERT_EQ(nl_reassembly_feed(&t, 0, 9, 0, 1, chunk, 5, &out, &out_len), NL_REASSEMBLE_COMPLETE);
+    ASSERT_EQ(wn_reassembly_feed(&t, 0, 9, 0, 1, chunk, 5, &out, &out_len), WN_REASSEMBLE_COMPLETE);
 
     uint8_t chunk2[] = "second-msg";
-    ASSERT_EQ(nl_reassembly_feed(&t, 1, 9, 0, 1, chunk2, 10, &out, &out_len), NL_REASSEMBLE_COMPLETE);
+    ASSERT_EQ(wn_reassembly_feed(&t, 1, 9, 0, 1, chunk2, 10, &out, &out_len), WN_REASSEMBLE_COMPLETE);
     ASSERT_EQ(out_len, 10);
     ASSERT_MEM_EQ(out, chunk2, 10);
 
-    nl_reassembly_tracker_free(&t);
+    wn_reassembly_tracker_free(&t);
 }
 
 TEST(test_reassembly_byte_budget_rejects_overcommitted_spread) {
@@ -258,22 +258,22 @@ TEST(test_reassembly_byte_budget_rejects_overcommitted_spread) {
      * beyond the remaining budget, even though slots exist -- the budget
      * is about PINNED BYTES, not slot count, and the reserve is charged
      * per message at acquisition (count x chunk, the full buffer size). */
-    nl_reassembly_tracker_t t;
-    nl_reassembly_tracker_init_budget(&t, 2048); /* exactly one 2-fragment message */
-    uint8_t full[NL_FRAGMENT_CHUNK_SIZE]; memset(full, 0, sizeof(full));
+    wn_reassembly_tracker_t t;
+    wn_reassembly_tracker_init_budget(&t, 2048); /* exactly one 2-fragment message */
+    uint8_t full[WN_FRAGMENT_CHUNK_SIZE]; memset(full, 0, sizeof(full));
     const uint8_t *out; uint32_t out_len;
 
     /* The first in-flight message reserves the whole 2KB budget. */
-    ASSERT_EQ(nl_reassembly_feed(&t, 0, 1, 0, 2, full, sizeof(full), &out, &out_len), NL_REASSEMBLE_PENDING);
+    ASSERT_EQ(wn_reassembly_feed(&t, 0, 1, 0, 2, full, sizeof(full), &out, &out_len), WN_REASSEMBLE_PENDING);
     /* Second message: over budget, must not evict the in-flight one. */
-    ASSERT_EQ(nl_reassembly_feed(&t, 0, 2, 0, 2, full, sizeof(full), &out, &out_len), NL_REASSEMBLE_INVALID);
+    ASSERT_EQ(wn_reassembly_feed(&t, 0, 2, 0, 2, full, sizeof(full), &out, &out_len), WN_REASSEMBLE_INVALID);
 
     /* Completing a message releases its reserve back to the budget... */
-    ASSERT_EQ(nl_reassembly_feed(&t, 0, 1, 1, 2, full, 3, &out, &out_len), NL_REASSEMBLE_COMPLETE);
+    ASSERT_EQ(wn_reassembly_feed(&t, 0, 1, 1, 2, full, 3, &out, &out_len), WN_REASSEMBLE_COMPLETE);
     /* ...so a new message fits again. */
-    ASSERT_EQ(nl_reassembly_feed(&t, 0, 2, 0, 2, full, sizeof(full), &out, &out_len), NL_REASSEMBLE_PENDING);
+    ASSERT_EQ(wn_reassembly_feed(&t, 0, 2, 0, 2, full, sizeof(full), &out, &out_len), WN_REASSEMBLE_PENDING);
 
-    nl_reassembly_tracker_free(&t);
+    wn_reassembly_tracker_free(&t);
 }
 
 TEST(test_reassembly_byte_budget_rejects_single_oversized_message) {
@@ -281,104 +281,104 @@ TEST(test_reassembly_byte_budget_rejects_single_oversized_message) {
      * claiming more bytes than the budget allows cannot even start: the
      * peer cannot drip its fragments in one at a time to exceed the
      * budget mid-message. */
-    nl_reassembly_tracker_t t;
-    nl_reassembly_tracker_init_budget(&t, 1500);
-    uint8_t full[NL_FRAGMENT_CHUNK_SIZE]; memset(full, 0, sizeof(full));
+    wn_reassembly_tracker_t t;
+    wn_reassembly_tracker_init_budget(&t, 1500);
+    uint8_t full[WN_FRAGMENT_CHUNK_SIZE]; memset(full, 0, sizeof(full));
     const uint8_t *out; uint32_t out_len;
 
     /* 3 fragments x 1024 = 3072 > 1500: rejected at acquisition. */
-    ASSERT_EQ(nl_reassembly_feed(&t, 0, 7, 0, 3, full, sizeof(full), &out, &out_len), NL_REASSEMBLE_INVALID);
+    ASSERT_EQ(wn_reassembly_feed(&t, 0, 7, 0, 3, full, sizeof(full), &out, &out_len), WN_REASSEMBLE_INVALID);
 
-    nl_reassembly_tracker_free(&t);
+    wn_reassembly_tracker_free(&t);
 }
 
 TEST(test_reassembly_byte_budget_does_not_reject_max_size_message) {
     /* The default budget must accommodate a full maximum-size message. */
-    ASSERT_TRUE(NL_REASSEMBLY_BYTE_BUDGET_DEFAULT > NL_MAX_MESSAGE_SIZE);
+    ASSERT_TRUE(WN_REASSEMBLY_BYTE_BUDGET_DEFAULT > WN_MAX_MESSAGE_SIZE);
 
-    nl_reassembly_tracker_t t;
-    nl_reassembly_tracker_init_budget(&t, NL_REASSEMBLY_BYTE_BUDGET_DEFAULT);
-    uint8_t chunk[NL_FRAGMENT_CHUNK_SIZE]; memset(chunk, 0, sizeof(chunk));
+    wn_reassembly_tracker_t t;
+    wn_reassembly_tracker_init_budget(&t, WN_REASSEMBLY_BYTE_BUDGET_DEFAULT);
+    uint8_t chunk[WN_FRAGMENT_CHUNK_SIZE]; memset(chunk, 0, sizeof(chunk));
     const uint8_t *out; uint32_t out_len;
-    uint16_t count = nl_fragment_count_needed(NL_MAX_MESSAGE_SIZE);
+    uint16_t count = wn_fragment_count_needed(WN_MAX_MESSAGE_SIZE);
     ASSERT_TRUE(count > 0);
     /* Feed the last fragment first (worst case for byte-reservation order),
      * then enough full chunks to complete -- total in flight must stay
      * within the budget for the message to ever complete. */
     uint16_t last_index = (uint16_t)(count - 1);
-    ASSERT_EQ(nl_reassembly_feed(&t, 0, 42, last_index, count, chunk, NL_FRAGMENT_CHUNK_SIZE, &out, &out_len),
-              NL_REASSEMBLE_PENDING);
+    ASSERT_EQ(wn_reassembly_feed(&t, 0, 42, last_index, count, chunk, WN_FRAGMENT_CHUNK_SIZE, &out, &out_len),
+              WN_REASSEMBLE_PENDING);
     for (uint16_t i = 0; i < last_index; i++) {
-        uint16_t chunk_len = NL_FRAGMENT_CHUNK_SIZE;
-        nl_reassemble_result_t r = nl_reassembly_feed(&t, 0, 42, i, count, chunk, chunk_len, &out, &out_len);
-        ASSERT_EQ(r, (i == last_index - 1) ? NL_REASSEMBLE_COMPLETE : NL_REASSEMBLE_PENDING);
+        uint16_t chunk_len = WN_FRAGMENT_CHUNK_SIZE;
+        wn_reassemble_result_t r = wn_reassembly_feed(&t, 0, 42, i, count, chunk, chunk_len, &out, &out_len);
+        ASSERT_EQ(r, (i == last_index - 1) ? WN_REASSEMBLE_COMPLETE : WN_REASSEMBLE_PENDING);
     }
-    ASSERT_EQ(out_len, NL_MAX_MESSAGE_SIZE);
+    ASSERT_EQ(out_len, WN_MAX_MESSAGE_SIZE);
 
-    nl_reassembly_tracker_free(&t);
+    wn_reassembly_tracker_free(&t);
 }
 
 
 /* Feed fragment `idx` of a `count`-fragment message whose chunks are all full-size. */
-static nl_reassemble_result_t feed_full(nl_reassembly_tracker_t *t, uint64_t now, uint16_t mid,
+static wn_reassemble_result_t feed_full(wn_reassembly_tracker_t *t, uint64_t now, uint16_t mid,
                                         uint16_t idx, uint16_t count) {
-    static uint8_t chunk[NL_FRAGMENT_CHUNK_SIZE];
+    static uint8_t chunk[WN_FRAGMENT_CHUNK_SIZE];
     memset(chunk, (int)(mid & 0xFF), sizeof(chunk));
     const uint8_t *out; uint32_t out_len;
-    return nl_reassembly_feed(t, now, mid, idx, count, chunk, NL_FRAGMENT_CHUNK_SIZE, &out, &out_len);
+    return wn_reassembly_feed(t, now, mid, idx, count, chunk, WN_FRAGMENT_CHUNK_SIZE, &out, &out_len);
 }
 
 TEST(test_reliable_tracker_never_evicts_in_flight_message) {
-    nl_reassembly_tracker_t t;
-    nl_reassembly_tracker_init(&t);
-    nl_reassembly_tracker_set_reliable(&t, true);
+    wn_reassembly_tracker_t t;
+    wn_reassembly_tracker_init(&t);
+    wn_reassembly_tracker_set_reliable(&t, true);
     /* Fill every slot with a distinct 2-fragment message, one fragment each. */
-    for (uint16_t m = 0; m < NL_REASSEMBLY_SLOTS; m++) {
-        ASSERT_EQ(feed_full(&t, 100 + m, m, 0, 2), NL_REASSEMBLE_PENDING);
+    for (uint16_t m = 0; m < WN_REASSEMBLY_SLOTS; m++) {
+        ASSERT_EQ(feed_full(&t, 100 + m, m, 0, 2), WN_REASSEMBLE_PENDING);
     }
     /* A new message must be refused, not allowed to displace message 0. */
-    ASSERT_FALSE(nl_reassembly_would_accept(&t, 99, 2));
-    ASSERT_EQ(feed_full(&t, 200, 99, 0, 2), NL_REASSEMBLE_INVALID);
+    ASSERT_FALSE(wn_reassembly_would_accept(&t, 99, 2));
+    ASSERT_EQ(feed_full(&t, 200, 99, 0, 2), WN_REASSEMBLE_INVALID);
     /* The oldest message is still intact and completes when its other fragment arrives. */
-    ASSERT_EQ(feed_full(&t, 300, 0, 1, 2), NL_REASSEMBLE_COMPLETE);
+    ASSERT_EQ(feed_full(&t, 300, 0, 1, 2), WN_REASSEMBLE_COMPLETE);
     /* ...which frees a slot, so the refused message is now accepted. */
-    ASSERT_TRUE(nl_reassembly_would_accept(&t, 99, 2));
-    ASSERT_EQ(feed_full(&t, 400, 99, 0, 2), NL_REASSEMBLE_PENDING);
-    nl_reassembly_tracker_free(&t);
+    ASSERT_TRUE(wn_reassembly_would_accept(&t, 99, 2));
+    ASSERT_EQ(feed_full(&t, 400, 99, 0, 2), WN_REASSEMBLE_PENDING);
+    wn_reassembly_tracker_free(&t);
 }
 
 TEST(test_reliable_tracker_never_expires_in_flight_message) {
-    nl_reassembly_tracker_t t;
-    nl_reassembly_tracker_init(&t);
-    nl_reassembly_tracker_set_reliable(&t, true);
-    ASSERT_EQ(feed_full(&t, 0, 7, 0, 2), NL_REASSEMBLE_PENDING);
+    wn_reassembly_tracker_t t;
+    wn_reassembly_tracker_init(&t);
+    wn_reassembly_tracker_set_reliable(&t, true);
+    ASSERT_EQ(feed_full(&t, 0, 7, 0, 2), WN_REASSEMBLE_PENDING);
     /* An hour later (many retransmit backoffs) the partial message must still be there. */
-    nl_reassembly_expire(&t, 3600ull * 1000);
-    ASSERT_EQ(feed_full(&t, 3600ull * 1000, 7, 1, 2), NL_REASSEMBLE_COMPLETE);
-    nl_reassembly_tracker_free(&t);
+    wn_reassembly_expire(&t, 3600ull * 1000);
+    ASSERT_EQ(feed_full(&t, 3600ull * 1000, 7, 1, 2), WN_REASSEMBLE_COMPLETE);
+    wn_reassembly_tracker_free(&t);
 }
 
 TEST(test_unreliable_tracker_still_expires_and_evicts) {
-    nl_reassembly_tracker_t t;
-    nl_reassembly_tracker_init(&t);
-    ASSERT_EQ(feed_full(&t, 0, 7, 0, 2), NL_REASSEMBLE_PENDING);
-    nl_reassembly_expire(&t, NL_REASSEMBLY_TIMEOUT_MS + 1);
+    wn_reassembly_tracker_t t;
+    wn_reassembly_tracker_init(&t);
+    ASSERT_EQ(feed_full(&t, 0, 7, 0, 2), WN_REASSEMBLE_PENDING);
+    wn_reassembly_expire(&t, WN_REASSEMBLY_TIMEOUT_MS + 1);
     /* Slot was reclaimed, so fragment 1 alone starts a fresh, incomplete message. */
-    ASSERT_EQ(feed_full(&t, NL_REASSEMBLY_TIMEOUT_MS + 1, 7, 1, 2), NL_REASSEMBLE_PENDING);
-    nl_reassembly_tracker_free(&t);
+    ASSERT_EQ(feed_full(&t, WN_REASSEMBLY_TIMEOUT_MS + 1, 7, 1, 2), WN_REASSEMBLE_PENDING);
+    wn_reassembly_tracker_free(&t);
 }
 
 TEST(test_would_accept_respects_budget_and_known_messages) {
-    nl_reassembly_tracker_t t;
-    nl_reassembly_tracker_init_budget(&t, 3 * NL_FRAGMENT_CHUNK_SIZE);
-    nl_reassembly_tracker_set_reliable(&t, true);
-    ASSERT_EQ(feed_full(&t, 0, 1, 0, 2), NL_REASSEMBLE_PENDING); /* reserves 2 of 3 chunks */
-    ASSERT_FALSE(nl_reassembly_would_accept(&t, 2, 2));          /* new message, 2 more chunks: over budget */
-    ASSERT_TRUE(nl_reassembly_would_accept(&t, 2, 1));           /* a 1-chunk message still fits */
-    ASSERT_TRUE(nl_reassembly_would_accept(&t, 1, 2));           /* already in flight: no new room needed */
-    ASSERT_TRUE(nl_reassembly_would_accept(&t, 3, 0));           /* malformed: feed drops it, nothing to retry */
-    ASSERT_TRUE(nl_reassembly_would_accept(&t, 3, NL_MAX_FRAGMENTS + 1));
-    nl_reassembly_tracker_free(&t);
+    wn_reassembly_tracker_t t;
+    wn_reassembly_tracker_init_budget(&t, 3 * WN_FRAGMENT_CHUNK_SIZE);
+    wn_reassembly_tracker_set_reliable(&t, true);
+    ASSERT_EQ(feed_full(&t, 0, 1, 0, 2), WN_REASSEMBLE_PENDING); /* reserves 2 of 3 chunks */
+    ASSERT_FALSE(wn_reassembly_would_accept(&t, 2, 2));          /* new message, 2 more chunks: over budget */
+    ASSERT_TRUE(wn_reassembly_would_accept(&t, 2, 1));           /* a 1-chunk message still fits */
+    ASSERT_TRUE(wn_reassembly_would_accept(&t, 1, 2));           /* already in flight: no new room needed */
+    ASSERT_TRUE(wn_reassembly_would_accept(&t, 3, 0));           /* malformed: feed drops it, nothing to retry */
+    ASSERT_TRUE(wn_reassembly_would_accept(&t, 3, WN_MAX_FRAGMENTS + 1));
+    wn_reassembly_tracker_free(&t);
 }
 
 int main(void) {

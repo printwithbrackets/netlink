@@ -2,58 +2,58 @@
 #include <stdlib.h>
 #include <string.h>
 
-uint16_t nl_fragment_count_needed(size_t message_len) {
-    if (message_len == 0 || message_len > NL_MAX_MESSAGE_SIZE) return 0;
-    size_t count = (message_len + NL_FRAGMENT_CHUNK_SIZE - 1) / NL_FRAGMENT_CHUNK_SIZE;
-    if (count > NL_MAX_FRAGMENTS) return 0;
+uint16_t wn_fragment_count_needed(size_t message_len) {
+    if (message_len == 0 || message_len > WN_MAX_MESSAGE_SIZE) return 0;
+    size_t count = (message_len + WN_FRAGMENT_CHUNK_SIZE - 1) / WN_FRAGMENT_CHUNK_SIZE;
+    if (count > WN_MAX_FRAGMENTS) return 0;
     return (uint16_t)count;
 }
 
-void nl_fragment_get_chunk(const uint8_t *data, size_t total_len, uint16_t index,
+void wn_fragment_get_chunk(const uint8_t *data, size_t total_len, uint16_t index,
                             const uint8_t **out_ptr, uint16_t *out_len) {
-    size_t offset = (size_t)index * NL_FRAGMENT_CHUNK_SIZE;
+    size_t offset = (size_t)index * WN_FRAGMENT_CHUNK_SIZE;
     size_t remaining = total_len - offset;
-    size_t len = remaining < NL_FRAGMENT_CHUNK_SIZE ? remaining : NL_FRAGMENT_CHUNK_SIZE;
+    size_t len = remaining < WN_FRAGMENT_CHUNK_SIZE ? remaining : WN_FRAGMENT_CHUNK_SIZE;
     *out_ptr = data + offset;
     *out_len = (uint16_t)len;
 }
 
-void nl_reassembly_tracker_init(nl_reassembly_tracker_t *t) {
+void wn_reassembly_tracker_init(wn_reassembly_tracker_t *t) {
     memset(t, 0, sizeof(*t));
 }
 
-void nl_reassembly_tracker_init_budget(nl_reassembly_tracker_t *t, uint32_t byte_budget) {
+void wn_reassembly_tracker_init_budget(wn_reassembly_tracker_t *t, uint32_t byte_budget) {
     memset(t, 0, sizeof(*t));
     t->byte_budget = byte_budget;
 }
 
-void nl_reassembly_tracker_set_reliable(nl_reassembly_tracker_t *t, bool reliable) {
+void wn_reassembly_tracker_set_reliable(wn_reassembly_tracker_t *t, bool reliable) {
     t->reliable = reliable;
 }
 
-static void slot_release(nl_reassembly_slot_t *slot) {
+static void slot_release(wn_reassembly_slot_t *slot) {
     free(slot->fragment_received);
     free(slot->data);
     memset(slot, 0, sizeof(*slot));
 }
 
-void nl_reassembly_tracker_free(nl_reassembly_tracker_t *t) {
-    for (int i = 0; i < NL_REASSEMBLY_SLOTS; i++) {
+void wn_reassembly_tracker_free(wn_reassembly_tracker_t *t) {
+    for (int i = 0; i < WN_REASSEMBLY_SLOTS; i++) {
         slot_release(&t->slots[i]);
     }
     t->in_flight_bytes = 0;
 }
 
-static nl_reassembly_slot_t *find_active(nl_reassembly_tracker_t *t, uint16_t message_id) {
-    for (int i = 0; i < NL_REASSEMBLY_SLOTS; i++) {
+static wn_reassembly_slot_t *find_active(wn_reassembly_tracker_t *t, uint16_t message_id) {
+    for (int i = 0; i < WN_REASSEMBLY_SLOTS; i++) {
         if (t->slots[i].active && t->slots[i].message_id == message_id) return &t->slots[i];
     }
     return NULL;
 }
 
-static nl_reassembly_slot_t *acquire_slot(nl_reassembly_tracker_t *t) {
+static wn_reassembly_slot_t *acquire_slot(wn_reassembly_tracker_t *t) {
     /* Prefer a never-used or already-inactive slot. */
-    for (int i = 0; i < NL_REASSEMBLY_SLOTS; i++) {
+    for (int i = 0; i < WN_REASSEMBLY_SLOTS; i++) {
         if (!t->slots[i].active) return &t->slots[i];
     }
     /* Reliable lanes never evict: the in-flight message's fragments were
@@ -63,38 +63,38 @@ static nl_reassembly_slot_t *acquire_slot(nl_reassembly_tracker_t *t) {
      * rather than letting an attacker (or an unlucky burst of legitimate
      * traffic) grow memory without bound. */
     int oldest = 0;
-    for (int i = 1; i < NL_REASSEMBLY_SLOTS; i++) {
+    for (int i = 1; i < WN_REASSEMBLY_SLOTS; i++) {
         if (t->slots[i].first_seen_ms < t->slots[oldest].first_seen_ms) oldest = i;
     }
     return &t->slots[oldest];
 }
 
-nl_reassemble_result_t nl_reassembly_feed(nl_reassembly_tracker_t *t, uint64_t now_ms,
+wn_reassemble_result_t wn_reassembly_feed(wn_reassembly_tracker_t *t, uint64_t now_ms,
                                            uint16_t message_id, uint16_t fragment_index,
                                            uint16_t fragment_count,
                                            const uint8_t *chunk, uint16_t chunk_len,
                                            const uint8_t **out_data, uint32_t *out_len) {
     /* ---- validate attacker-controlled fields before touching memory ---- */
-    if (fragment_count == 0 || fragment_count > NL_MAX_FRAGMENTS) return NL_REASSEMBLE_INVALID;
-    if (fragment_index >= fragment_count) return NL_REASSEMBLE_INVALID;
-    if (chunk_len > NL_FRAGMENT_CHUNK_SIZE) return NL_REASSEMBLE_INVALID;
-    if ((size_t)fragment_count * NL_FRAGMENT_CHUNK_SIZE > NL_MAX_MESSAGE_SIZE) return NL_REASSEMBLE_INVALID;
+    if (fragment_count == 0 || fragment_count > WN_MAX_FRAGMENTS) return WN_REASSEMBLE_INVALID;
+    if (fragment_index >= fragment_count) return WN_REASSEMBLE_INVALID;
+    if (chunk_len > WN_FRAGMENT_CHUNK_SIZE) return WN_REASSEMBLE_INVALID;
+    if ((size_t)fragment_count * WN_FRAGMENT_CHUNK_SIZE > WN_MAX_MESSAGE_SIZE) return WN_REASSEMBLE_INVALID;
     bool is_last = (fragment_index == (uint16_t)(fragment_count - 1));
-    if (!is_last && chunk_len != NL_FRAGMENT_CHUNK_SIZE) return NL_REASSEMBLE_INVALID;
+    if (!is_last && chunk_len != WN_FRAGMENT_CHUNK_SIZE) return WN_REASSEMBLE_INVALID;
     if (chunk_len == 0 && fragment_count > 1 && is_last) {
         /* A zero-length final fragment is only sensible when the message
          * length is an exact multiple of the chunk size AND fragment_count
-         * already accounts for it -- nl_fragment_count_needed() never
+         * already accounts for it -- wn_fragment_count_needed() never
          * produces a trailing empty fragment, so this shape is invalid. */
-        return NL_REASSEMBLE_INVALID;
+        return WN_REASSEMBLE_INVALID;
     }
 
-    nl_reassembly_slot_t *slot = find_active(t, message_id);
+    wn_reassembly_slot_t *slot = find_active(t, message_id);
     if (slot) {
         if (slot->fragment_count != fragment_count) {
             /* Inconsistent claim about an in-flight message_id -- reject
              * the new packet, leave the existing reassembly untouched. */
-            return NL_REASSEMBLE_INVALID;
+            return WN_REASSEMBLE_INVALID;
         }
     } else {
         /* Reserve the message's FULL declared size at acquisition time
@@ -103,15 +103,15 @@ nl_reassemble_result_t nl_reassembly_feed(nl_reassembly_tracker_t *t, uint64_t n
          * buffer (proportional to fragment_count, see below), and means
          * late fragments never need a budget re-check: whatever lands is
          * already inside a reserve accounted at acquisition. */
-        uint32_t reserve = (uint32_t)fragment_count * NL_FRAGMENT_CHUNK_SIZE;
+        uint32_t reserve = (uint32_t)fragment_count * WN_FRAGMENT_CHUNK_SIZE;
         if (t->byte_budget && t->in_flight_bytes + reserve > t->byte_budget) {
             /* Over the budget: reject WITHOUT evicting -- a new message
              * that does not fit must not displace existing in-flight
              * ones. */
-            return NL_REASSEMBLE_INVALID;
+            return WN_REASSEMBLE_INVALID;
         }
         slot = acquire_slot(t);
-        if (!slot) return NL_REASSEMBLE_INVALID; /* reliable tracker with every slot busy */
+        if (!slot) return WN_REASSEMBLE_INVALID; /* reliable tracker with every slot busy */
         if (slot->active) {
             /* evicting an in-progress one: return its charged reserve */
             t->in_flight_bytes -= slot->reserved_bytes;
@@ -120,20 +120,20 @@ nl_reassemble_result_t nl_reassembly_feed(nl_reassembly_tracker_t *t, uint64_t n
 
         free(slot->fragment_received);
         slot->fragment_received = (bool *)calloc(fragment_count, sizeof(bool));
-        if (!slot->fragment_received) return NL_REASSEMBLE_INVALID;
+        if (!slot->fragment_received) return WN_REASSEMBLE_INVALID;
 
         /* Allocate (or grow) the reassembly buffer to exactly what this
          * message's declared fragment count needs, NOT a fixed
-         * NL_MAX_MESSAGE_SIZE block: memory stays proportional to the
+         * WN_MAX_MESSAGE_SIZE block: memory stays proportional to the
          * peer's declared message size (attacker-bounded to
-         * fragment_count x NL_FRAGMENT_CHUNK_SIZE), and the common
+         * fragment_count x WN_FRAGMENT_CHUNK_SIZE), and the common
          * small-message case no longer costs 256KB per tracker. The
          * buffer is kept across messages in this slot and only grown
          * (realloc) if a later message needs more room. */
-        size_t needed = (size_t)fragment_count * NL_FRAGMENT_CHUNK_SIZE;
+        size_t needed = (size_t)fragment_count * WN_FRAGMENT_CHUNK_SIZE;
         if (needed > slot->data_capacity) {
             uint8_t *grown = (uint8_t *)realloc(slot->data, needed);
-            if (!grown) { free(slot->fragment_received); slot->fragment_received = NULL; return NL_REASSEMBLE_INVALID; }
+            if (!grown) { free(slot->fragment_received); slot->fragment_received = NULL; return WN_REASSEMBLE_INVALID; }
             slot->data = grown;
             slot->data_capacity = needed;
         }
@@ -150,10 +150,10 @@ nl_reassemble_result_t nl_reassembly_feed(nl_reassembly_tracker_t *t, uint64_t n
     }
 
     if (slot->fragment_received[fragment_index]) {
-        return NL_REASSEMBLE_PENDING; /* duplicate fragment, already have it */
+        return WN_REASSEMBLE_PENDING; /* duplicate fragment, already have it */
     }
 
-    size_t offset = (size_t)fragment_index * NL_FRAGMENT_CHUNK_SIZE;
+    size_t offset = (size_t)fragment_index * WN_FRAGMENT_CHUNK_SIZE;
     if (chunk_len > 0) {
         memcpy(slot->data + offset, chunk, chunk_len);
     }
@@ -172,41 +172,41 @@ nl_reassemble_result_t nl_reassembly_feed(nl_reassembly_tracker_t *t, uint64_t n
              * rather than deliver a partially-garbage buffer. */
             slot->active = false;
             t->in_flight_bytes -= slot->reserved_bytes;
-            return NL_REASSEMBLE_INVALID;
+            return WN_REASSEMBLE_INVALID;
         }
         *out_data = slot->data;
         *out_len = slot->total_len;
         slot->active = false; /* buffers kept allocated for reuse */
         t->in_flight_bytes -= slot->reserved_bytes; /* delivered, no longer in flight */
-        return NL_REASSEMBLE_COMPLETE;
+        return WN_REASSEMBLE_COMPLETE;
     }
 
-    return NL_REASSEMBLE_PENDING;
+    return WN_REASSEMBLE_PENDING;
 }
 
-bool nl_reassembly_would_accept(const nl_reassembly_tracker_t *t, uint16_t message_id,
+bool wn_reassembly_would_accept(const wn_reassembly_tracker_t *t, uint16_t message_id,
                                 uint16_t fragment_count) {
-    if (fragment_count == 0 || fragment_count > NL_MAX_FRAGMENTS) return true;
-    if ((size_t)fragment_count * NL_FRAGMENT_CHUNK_SIZE > NL_MAX_MESSAGE_SIZE) return true;
+    if (fragment_count == 0 || fragment_count > WN_MAX_FRAGMENTS) return true;
+    if ((size_t)fragment_count * WN_FRAGMENT_CHUNK_SIZE > WN_MAX_MESSAGE_SIZE) return true;
     bool free_slot = false;
-    for (int i = 0; i < NL_REASSEMBLY_SLOTS; i++) {
+    for (int i = 0; i < WN_REASSEMBLY_SLOTS; i++) {
         if (t->slots[i].active && t->slots[i].message_id == message_id) return true;
         if (!t->slots[i].active) free_slot = true;
     }
-    uint32_t reserve = (uint32_t)fragment_count * NL_FRAGMENT_CHUNK_SIZE;
+    uint32_t reserve = (uint32_t)fragment_count * WN_FRAGMENT_CHUNK_SIZE;
     if (t->byte_budget && t->in_flight_bytes + reserve > t->byte_budget) return false;
     if (!free_slot && t->reliable) return false;
     return true;
 }
 
-void nl_reassembly_expire(nl_reassembly_tracker_t *t, uint64_t now_ms) {
+void wn_reassembly_expire(wn_reassembly_tracker_t *t, uint64_t now_ms) {
     /* A reliable lane's fragments are already acked: the sender will not
      * resend them, so reclaiming a slow message would lose it. A dead peer
      * is handled by the connection timeout, which frees the whole tracker. */
     if (t->reliable) return;
-    for (int i = 0; i < NL_REASSEMBLY_SLOTS; i++) {
-        nl_reassembly_slot_t *slot = &t->slots[i];
-        if (slot->active && (now_ms - slot->first_seen_ms) > NL_REASSEMBLY_TIMEOUT_MS) {
+    for (int i = 0; i < WN_REASSEMBLY_SLOTS; i++) {
+        wn_reassembly_slot_t *slot = &t->slots[i];
+        if (slot->active && (now_ms - slot->first_seen_ms) > WN_REASSEMBLY_TIMEOUT_MS) {
             slot->active = false;
             t->in_flight_bytes -= slot->reserved_bytes;
             /* Buffers intentionally kept allocated for the next reuse. */

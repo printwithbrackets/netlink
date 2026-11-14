@@ -10,7 +10,7 @@
  * Locking discipline (read this before touching connection/pending
  * tables):
  *   - `connections_lock` guards the connections[] array AND is held for
- *     the full duration of any nl_connection_* call made through it. This
+ *     the full duration of any wn_connection_* call made through it. This
  *     is coarser than strictly necessary (two unrelated connections can't
  *     send concurrently) but it is what makes connection lifetime safe
  *     without reference counting: a connection is only ever freed while
@@ -28,7 +28,7 @@
  *     from inside a call chain that started under it) must NOT attempt to
  *     take connections_lock again -- see ep_on_disconnected/ep_on_connected.
  */
-#include "../include/netlink.h"
+#include "../include/weft_net.h"
 #include "connection.h"
 #include "protocol.h"
 #include "crypto.h"
@@ -47,52 +47,52 @@
 #define MSG_NOSIGNAL 0
 #endif
 
-#define NL_MAX_CONNECTIONS_INTERNAL 512
-#define NL_MAX_PENDING 128
-#define NL_PENDING_TIMEOUT_MS 5000
-#define NL_RECV_BUFFER_SIZE 2048
-#define NL_RATE_LIMIT_WINDOW_MS 1000
-#define NL_RATE_LIMIT_MAX_PER_WINDOW 200
-#define NL_IO_POLL_INTERVAL_MS 50
-/* WebSocket link lifetimes: a connecting link gets NL_WS_CONNECT_TIMEOUT_
- * MS to finish TCP + HTTP upgrade + the NL handshake; after that any
- * link that has not moved a byte for NL_WS_IDLE_TIMEOUT_MS is closed.
+#define WN_MAX_CONNECTIONS_INTERNAL 512
+#define WN_MAX_PENDING 128
+#define WN_PENDING_TIMEOUT_MS 5000
+#define WN_RECV_BUFFER_SIZE 2048
+#define WN_RATE_LIMIT_WINDOW_MS 1000
+#define WN_RATE_LIMIT_MAX_PER_WINDOW 200
+#define WN_IO_POLL_INTERVAL_MS 50
+/* WebSocket link lifetimes: a connecting link gets WN_WS_CONNECT_TIMEOUT_
+ * MS to finish TCP + HTTP upgrade + the WN handshake; after that any
+ * link that has not moved a byte for WN_WS_IDLE_TIMEOUT_MS is closed.
  * Lives are enforced by the IO thread's reap sweep (ws_reap_links); see
  * also the last_activity_ms notes on ws_link_t. */
-#define NL_WS_CONNECT_TIMEOUT_MS 10000
-#define NL_WS_IDLE_TIMEOUT_MS 60000
+#define WN_WS_CONNECT_TIMEOUT_MS 10000
+#define WN_WS_IDLE_TIMEOUT_MS 60000
 /* Handshake retransmit cadence. UDP is lossy; a single lost REQUEST,
  * CHALLENGE, or RESPONSE would otherwise stall connect until the pending
- * timeout. Matches NL_HANDSHAKE_RETRY_MS in connection.c for ACCEPTED. */
-#define NL_HANDSHAKE_RETRY_MS 250
+ * timeout. Matches WN_HANDSHAKE_RETRY_MS in connection.c for ACCEPTED. */
+#define WN_HANDSHAKE_RETRY_MS 250
 /* A retransmitted REQUEST for a handshake already in flight is answered at
  * most this often per pending entry, so replaying one captured REQUEST (from
  * a spoofed source) cannot turn the server into a CHALLENGE reflector. */
-#define NL_HANDSHAKE_MIN_RESEND_MS 100
+#define WN_HANDSHAKE_MIN_RESEND_MS 100
 /* One WebSocket link per accepted/active TCP connection. HTTP and frame
  * bytes are buffered here until the upgrade completes / a full message
  * is reassembled. */
-#define NL_WS_LINK_MAX (NL_MAX_CONNECTIONS_INTERNAL + NL_MAX_PENDING)
-#define NL_WS_RECV_CHUNK 2048
+#define WN_WS_LINK_MAX (WN_MAX_CONNECTIONS_INTERNAL + WN_MAX_PENDING)
+#define WN_WS_RECV_CHUNK 2048
 
 typedef struct ws_link {
     struct ws_link *next;
-    nl_socket_t sock;
+    wn_socket_t sock;
     struct sockaddr_storage addr;
     socklen_t addr_len;
     bool is_server_side;      /* accepted on the server vs. client dial-out */
     bool upgraded;            /* HTTP 101 completed; frames only after this */
     bool client_connecting;   /* nonblocking TCP connect still in progress */
     bool client_sent_request; /* HTTP upgrade request written */
-    char http_buf[NL_WS_HTTP_MAX];
+    char http_buf[WN_WS_HTTP_MAX];
     size_t http_len;
     char client_key[25];      /* Sec-WebSocket-Key we sent (client only) */
-    nl_ws_decoder_t decoder;
+    wn_ws_decoder_t decoder;
     uint64_t created_ms;
     /* Read-side activity marker for the IO thread's reap sweep: bumped
      * whenever this link moved bytes (TCP data in, upgrade request out).
-     * Without it, a peer that stalls at any pre-NL stage (TCP connected
-     * but no HTTP request, HTTP sent but no 101, no NL handshake after
+     * Without it, a peer that stalls at any pre-WN stage (TCP connected
+     * but no HTTP request, HTTP sent but no 101, no WN handshake after
      * the 101) holds its socket/file descriptor and decoder memory for
      * as long as the TCP connection itself lives. Written only by the IO
      * thread, read by the IO thread's reap sweep: no locks involved. */
@@ -111,13 +111,13 @@ static size_t normalize_addr_bytes(const struct sockaddr_storage *addr, uint8_t 
     if (addr->ss_family == AF_INET) {
         const struct sockaddr_in *a = (const struct sockaddr_in *)addr;
         out[0] = 4;
-        nl_put_u16(out + 1, ntohs(a->sin_port));
+        wn_put_u16(out + 1, ntohs(a->sin_port));
         memcpy(out + 3, &a->sin_addr, 4);
         return 7;
     } else if (addr->ss_family == AF_INET6) {
         const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)addr;
         out[0] = 6;
-        nl_put_u16(out + 1, ntohs(a->sin6_port));
+        wn_put_u16(out + 1, ntohs(a->sin6_port));
         memcpy(out + 3, &a->sin6_addr, 16);
         return 19;
     }
@@ -132,29 +132,29 @@ static bool addr_equal(const struct sockaddr_storage *a, const struct sockaddr_s
     return la == lb && memcmp(na, nb, la) == 0;
 }
 
-static void sockaddr_to_nl_address(const struct sockaddr_storage *addr, socklen_t addr_len, nl_address_t *out) {
+static void sockaddr_to_wn_address(const struct sockaddr_storage *addr, socklen_t addr_len, wn_address_t *out) {
     (void)addr_len;
     memset(out, 0, sizeof(*out));
     if (addr->ss_family == AF_INET) {
         const struct sockaddr_in *a = (const struct sockaddr_in *)addr;
         inet_ntop(AF_INET, &a->sin_addr, out->host, sizeof(out->host));
         out->port = ntohs(a->sin_port);
-        out->family = NL_AF_INET;
+        out->family = WN_AF_INET;
     } else if (addr->ss_family == AF_INET6) {
         const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)addr;
         inet_ntop(AF_INET6, &a->sin6_addr, out->host, sizeof(out->host));
         out->port = ntohs(a->sin6_port);
-        out->family = NL_AF_INET6;
+        out->family = WN_AF_INET6;
     }
 }
 
-static bool resolve_address(const nl_address_t *addr, bool passive, int socktype,
+static bool resolve_address(const wn_address_t *addr, bool passive, int socktype,
                              struct sockaddr_storage *out, socklen_t *out_len, int *out_family) {
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
     hints.ai_socktype = socktype;
-    hints.ai_family = (addr->family == NL_AF_INET) ? AF_INET
-                     : (addr->family == NL_AF_INET6) ? AF_INET6
+    hints.ai_family = (addr->family == WN_AF_INET) ? AF_INET
+                     : (addr->family == WN_AF_INET6) ? AF_INET6
                      : AF_UNSPEC;
     if (passive) hints.ai_flags = AI_PASSIVE;
 
@@ -191,14 +191,14 @@ typedef struct {
     pending_role_t role;
     struct sockaddr_storage addr;
     socklen_t addr_len;
-    nl_keypair_t *my_keypair;
+    wn_keypair_t *my_keypair;
     uint8_t my_nonce[16];
     uint8_t peer_pubkey[32];
     uint8_t peer_nonce[16];
     uint8_t cookie[16];
     uint64_t connection_id;
     uint8_t channel_count;
-    uint32_t peer_caps;      /* client's advertised NL_CAP_* from REQUEST */
+    uint32_t peer_caps;      /* client's advertised WN_CAP_* from REQUEST */
     uint64_t created_ms;
     /* Last cleartext handshake datagram we put on the wire for this entry
      * (REQUEST / CHALLENGE / RESPONSE), retained so the IO thread can
@@ -207,7 +207,7 @@ typedef struct {
     /* Sized for the largest handshake packet, not for any one of them: a
      * server entry retains a CONNECT_CHALLENGE (69 bytes), which is bigger
      * than a CONNECT_RESPONSE (65). */
-    uint8_t retry_packet[NL_CONNECT_MAX_PACKET_SIZE];
+    uint8_t retry_packet[WN_CONNECT_MAX_PACKET_SIZE];
     uint16_t retry_packet_len;
     uint64_t last_retry_ms;
     /* True once the entry's peer RE-SENT its REQUEST and the server
@@ -227,24 +227,24 @@ static uint64_t now_ms(void) {
 
 /* Forward decls for helpers defined later but used by the WebSocket link
  * teardown path (see ws_link_drop_peer_state). */
-static pending_t *find_pending_by_addr_locked(nl_endpoint_t *ep, const struct sockaddr_storage *addr,
+static pending_t *find_pending_by_addr_locked(wn_endpoint_t *ep, const struct sockaddr_storage *addr,
                                                pending_role_t role);
 static void release_pending_locked(pending_t *p);
 
 /* ---- event queue ---- */
 
 typedef struct event_node {
-    nl_event_t pub;
+    wn_event_t pub;
     uint8_t *payload;
     uint32_t payload_len;
     struct event_node *next;
 } event_node_t;
 
-/* A payload handed to the application by nl_poll_event, still owned by the
+/* A payload handed to the application by wn_poll_event, still owned by the
  * library until that same thread polls again (or the endpoint is destroyed).
  *
  * One borrow per (endpoint, thread) rather than one per endpoint: the
- * payload borrow is a per-thread loan of a shared buffer, and nl_poll_event
+ * payload borrow is a per-thread loan of a shared buffer, and wn_poll_event
  * is documented as callable from any thread. With a single endpoint-wide
  * slot, one thread's poll freed a payload another thread was still reading
  * -- a use-after-free that also made the Rust binding's `unsafe impl Sync`
@@ -252,51 +252,51 @@ typedef struct event_node {
 typedef struct borrow_node {
     uint8_t *data;
     uint32_t len;
-    nl_peer_id_t peer;
+    wn_peer_id_t peer;
     bool is_data;
     pthread_t owner;
     struct borrow_node *next;
 } borrow_node_t;
 
-struct nl_endpoint {
+struct wn_endpoint {
     bool is_server;
-    nl_config_t config;
-    char server_name_buf[NL_SERVER_NAME_MAX]; /* owned copy of config.server_name */
-    nl_socket_t sock;
+    wn_config_t config;
+    char server_name_buf[WN_SERVER_NAME_MAX]; /* owned copy of config.server_name */
+    wn_socket_t sock;
 
     uint8_t server_secret[32]; /* server role only: HMAC key for connect cookies */
 
-    pending_t pending[NL_MAX_PENDING];
+    pending_t pending[WN_MAX_PENDING];
     pthread_mutex_t pending_lock;
 
-    nl_connection_t *connections[NL_MAX_CONNECTIONS_INTERNAL];
+    wn_connection_t *connections[WN_MAX_CONNECTIONS_INTERNAL];
     pthread_mutex_t connections_lock;
 
     event_node_t *queue_head, *queue_tail;
     pthread_mutex_t queue_lock;
     pthread_cond_t queue_cond;
-    /* Set by nl_endpoint_destroy (under queue_lock) to wake threads blocked
-     * in nl_poll_event: wait loops check it alongside queue_head so a
+    /* Set by wn_endpoint_destroy (under queue_lock) to wake threads blocked
+     * in wn_poll_event: wait loops check it alongside queue_head so a
      * destroy never leaves a waiter blocked forever, and never destroys
      * queue_cond underneath a waiter (destroy waits for active_pollers to
      * drain before freeing). */
     bool shutdown;
-    int active_pollers; /* threads currently inside nl_poll_event, guarded by queue_lock */
-    /* Payloads currently borrowed by the application via nl_poll_event,
+    int active_pollers; /* threads currently inside wn_poll_event, guarded by queue_lock */
+    /* Payloads currently borrowed by the application via wn_poll_event,
      * one per polling thread (see borrow_node_t). Each entry also carries
      * the metadata needed to release that payload's receive-window charge
      * when the borrow ends -- flow control's "app consumed" signal. */
     borrow_node_t *borrows;
     /* Total payload bytes of queued, undispatched events, and the cap on
-     * them (nl_config_t.event_queue_max_bytes resolved: 0 -> the library
+     * them (wn_config_t.event_queue_max_bytes resolved: 0 -> the library
      * default). Both guarded by queue_lock; released events account in
-     * push_event/nl_poll_event. */
+     * push_event/wn_poll_event. */
     uint64_t event_queue_bytes;
     uint32_t event_queue_cap;
 
-    /* TCP listen socket for NL_TRANSPORT_WEBSOCKET servers (NL_INVALID_
+    /* TCP listen socket for WN_TRANSPORT_WEBSOCKET servers (WN_INVALID_
      * SOCKET when using UDP or on clients). */
-    nl_socket_t listen_sock;
+    wn_socket_t listen_sock;
     /* WebSocket links: one per TCP connection (server-accepted or the
      * client's dial-out). Guarded by ws_links_lock. Lock order: never
      * hold ws_links_lock while acquiring connections_lock/pending_lock
@@ -317,11 +317,11 @@ struct nl_endpoint {
     atomic_bool running;
 
     /* Guards discovery_sock/discovery_port/discovery_expected_nonce and
-     * the discovery rate window: nl_discovery_enable/probe run on user
+     * the discovery rate window: wn_discovery_enable/probe run on user
      * threads while the IO thread reads the same fields. (The main sock
      * is set once before the IO thread starts and never changes.) */
     pthread_mutex_t discovery_lock;
-    nl_socket_t discovery_sock;
+    wn_socket_t discovery_sock;
     uint16_t discovery_port;
     uint32_t discovery_expected_nonce; /* last probe's nonce; replies must echo it */
     uint64_t discovery_rate_window_start_ms;
@@ -332,31 +332,31 @@ struct nl_endpoint {
 };
 
 typedef struct {
-    nl_endpoint_t *ep;
-    nl_connection_t *conn;
+    wn_endpoint_t *ep;
+    wn_connection_t *conn;
 } conn_ctx_t;
 
-static void release_pending_by_connid(nl_endpoint_t *ep, nl_peer_id_t connid, pending_role_t role);
+static void release_pending_by_connid(wn_endpoint_t *ep, wn_peer_id_t connid, pending_role_t role);
 
 /* ---- event queue push/pop ---- */
 
 /* Queue one event. Returns TRUE if the event was queued and may be
  * charged for by the connection's receive-window accounting; FALSE if it
  * was not handed to the application (payload allocation failed, or the
- * endpoint-wide event_queue_max_bytes cap was hit -- see NL_EVENT_QUEUE_
- * UNLIMITED in netlink.h).
+ * endpoint-wide event_queue_max_bytes cap was hit -- see WN_EVENT_QUEUE_
+ * UNLIMITED in weft_net.h).
  *
  * The event_queue_bytes total and the cap live in the endpoint, both
  * guarded by queue_lock. Nothing is charged/byte-counted for an event that
  * is refused, so the endpoint rejects the NEW event rather than dropping
  * already-queued ones: queued events must never silently vanish (a
  * CONNECTED/DISCONNECTED that did), and refusing the new event instead
- * lets nl_connection_on_packet keep its receive-window charge un-added
+ * lets wn_connection_on_packet keep its receive-window charge un-added
  * (via on_channel_deliver) so the sender's window self-limits.
  *
  * Callers may hold connections_lock (the DATA path runs under it), so
  * this never takes connections_lock itself. */
-static bool push_event(nl_endpoint_t *ep, nl_event_t ev, const uint8_t *data, uint32_t len) {
+static bool push_event(wn_endpoint_t *ep, wn_event_t ev, const uint8_t *data, uint32_t len) {
     event_node_t *node = (event_node_t *)calloc(1, sizeof(event_node_t));
     if (!node) return false; /* OOM: drop the event rather than crash */
     node->pub = ev;
@@ -369,7 +369,7 @@ static bool push_event(nl_endpoint_t *ep, nl_event_t ev, const uint8_t *data, ui
         node->payload_len = len;
     }
     pthread_mutex_lock(&ep->queue_lock);
-    if (ep->event_queue_cap != NL_EVENT_QUEUE_UNLIMITED &&
+    if (ep->event_queue_cap != WN_EVENT_QUEUE_UNLIMITED &&
         ep->event_queue_bytes + (uint64_t)len > (uint64_t)ep->event_queue_cap) {
         /* Refuse the new event instead of dropping queued ones. */
         pthread_mutex_unlock(&ep->queue_lock);
@@ -388,30 +388,30 @@ static bool push_event(nl_endpoint_t *ep, nl_event_t ev, const uint8_t *data, ui
 
 /* ---- connection table helpers (caller must hold connections_lock) ---- */
 
-static nl_connection_t *find_connection_locked(nl_endpoint_t *ep, nl_peer_id_t id) {
-    for (int i = 0; i < NL_MAX_CONNECTIONS_INTERNAL; i++) {
+static wn_connection_t *find_connection_locked(wn_endpoint_t *ep, wn_peer_id_t id) {
+    for (int i = 0; i < WN_MAX_CONNECTIONS_INTERNAL; i++) {
         if (ep->connections[i] && ep->connections[i]->id == id) return ep->connections[i];
     }
     return NULL;
 }
 
-static int find_free_connection_slot_locked(nl_endpoint_t *ep) {
-    for (int i = 0; i < NL_MAX_CONNECTIONS_INTERNAL; i++) {
+static int find_free_connection_slot_locked(wn_endpoint_t *ep) {
+    for (int i = 0; i < WN_MAX_CONNECTIONS_INTERNAL; i++) {
         if (!ep->connections[i]) return i;
     }
     return -1;
 }
 
-static int find_connection_slot_by_ptr_locked(nl_endpoint_t *ep, nl_connection_t *conn) {
-    for (int i = 0; i < NL_MAX_CONNECTIONS_INTERNAL; i++) {
+static int find_connection_slot_by_ptr_locked(wn_endpoint_t *ep, wn_connection_t *conn) {
+    for (int i = 0; i < WN_MAX_CONNECTIONS_INTERNAL; i++) {
         if (ep->connections[i] == conn) return i;
     }
     return -1;
 }
 
-static uint32_t count_active_connections_locked(nl_endpoint_t *ep) {
+static uint32_t count_active_connections_locked(wn_endpoint_t *ep) {
     uint32_t n = 0;
-    for (int i = 0; i < NL_MAX_CONNECTIONS_INTERNAL; i++) if (ep->connections[i]) n++;
+    for (int i = 0; i < WN_MAX_CONNECTIONS_INTERNAL; i++) if (ep->connections[i]) n++;
     return n;
 }
 
@@ -420,12 +420,12 @@ static uint32_t count_active_connections_locked(nl_endpoint_t *ep) {
 /* Blocking-ish write of a full buffer on a (possibly nonblocking) TCP
  * socket. Returns false on hard error or if the peer stays unwritable
  * for >1s (keeps the IO thread from wedging on a dead connection). */
-static bool sock_write_all(nl_socket_t s, const uint8_t *buf, size_t len) {
+static bool sock_write_all(wn_socket_t s, const uint8_t *buf, size_t len) {
     size_t off = 0;
     while (off < len) {
         ssize_t w = send(s, buf + off, len - off, MSG_NOSIGNAL);
         if (w > 0) { off += (size_t)w; continue; }
-        if (w < 0 && (nl_sock_errno() == EAGAIN || nl_sock_errno() == EWOULDBLOCK)) {
+        if (w < 0 && (wn_sock_errno() == EAGAIN || wn_sock_errno() == EWOULDBLOCK)) {
             struct pollfd p;
             p.fd = s; p.events = POLLOUT; p.revents = 0;
             if (poll(&p, 1, 1000) <= 0) return false;
@@ -438,12 +438,12 @@ static bool sock_write_all(nl_socket_t s, const uint8_t *buf, size_t len) {
 
 static void ws_link_free(ws_link_t *l) {
     if (!l) return;
-    if (l->sock != NL_INVALID_SOCKET) nl_close_socket(l->sock);
-    nl_ws_decoder_free(&l->decoder);
+    if (l->sock != WN_INVALID_SOCKET) wn_close_socket(l->sock);
+    wn_ws_decoder_free(&l->decoder);
     free(l);
 }
 
-static void ws_add_link_locked(nl_endpoint_t *ep, ws_link_t *l) {
+static void ws_add_link_locked(wn_endpoint_t *ep, ws_link_t *l) {
     l->next = ep->ws_links;
     ep->ws_links = l;
 }
@@ -452,7 +452,7 @@ static void ws_add_link_locked(nl_endpoint_t *ep, ws_link_t *l) {
  * only the IO thread (after its current poll iteration) and endpoint_free
  * (after join) call ws_drain_dead. Safe to call with connections_lock or
  * pending_lock held (takes only ws_links_lock). */
-static void ws_close_link(nl_endpoint_t *ep, ws_link_t *target) {
+static void ws_close_link(wn_endpoint_t *ep, ws_link_t *target) {
     if (!target) return;
     pthread_mutex_lock(&ep->ws_links_lock);
     ws_link_t **pp = &ep->ws_links;
@@ -468,39 +468,39 @@ static void ws_close_link(nl_endpoint_t *ep, ws_link_t *target) {
     if (found) {
         target->next = ep->ws_dead;
         ep->ws_dead = target;
-        if (target->sock != NL_INVALID_SOCKET) {
+        if (target->sock != WN_INVALID_SOCKET) {
             shutdown(target->sock, SHUT_RDWR);
         }
     }
     pthread_mutex_unlock(&ep->ws_links_lock);
 }
 
-static void ws_link_drop_peer_state(nl_endpoint_t *ep, const struct sockaddr_storage *addr);
+static void ws_link_drop_peer_state(wn_endpoint_t *ep, const struct sockaddr_storage *addr);
 
-/* Close WebSocket links past their timeouts (NL_WS_CONNECT_TIMEOUT_MS
- * while connecting, NL_WS_IDLE_TIMEOUT_MS otherwise). IO thread only:
+/* Close WebSocket links past their timeouts (WN_WS_CONNECT_TIMEOUT_MS
+ * while connecting, WN_WS_IDLE_TIMEOUT_MS otherwise). IO thread only:
  * pointers are validated as live-list members under the lock and are
  * never freed by anyone else (ws_drain_dead is our job), so closing them
  * after unlock is safe -- a concurrent ws_close_link by a user thread
  * just becomes a no-op found=false. */
-static void ws_reap_links(nl_endpoint_t *ep, uint64_t now) {
-    ws_link_t *victims[NL_WS_LINK_MAX];
+static void ws_reap_links(wn_endpoint_t *ep, uint64_t now) {
+    ws_link_t *victims[WN_WS_LINK_MAX];
     int n_victims = 0;
 
     pthread_mutex_lock(&ep->ws_links_lock);
     for (ws_link_t *l = ep->ws_links; l; l = l->next) {
         uint64_t idle = now - l->last_activity_ms;
-        bool overdue = (now - l->created_ms > NL_WS_CONNECT_TIMEOUT_MS &&
+        bool overdue = (now - l->created_ms > WN_WS_CONNECT_TIMEOUT_MS &&
                         !l->upgraded) ||
-                       idle > NL_WS_IDLE_TIMEOUT_MS;
-        if (overdue && n_victims < NL_WS_LINK_MAX) victims[n_victims++] = l;
+                       idle > WN_WS_IDLE_TIMEOUT_MS;
+        if (overdue && n_victims < WN_WS_LINK_MAX) victims[n_victims++] = l;
     }
     pthread_mutex_unlock(&ep->ws_links_lock);
 
     for (int i = 0; i < n_victims; i++) {
         struct sockaddr_storage a = victims[i]->addr;
         ws_close_link(ep, victims[i]);
-        /* Tear down NL state for this peer (if any). Safe: we hold no
+        /* Tear down WN state for this peer (if any). Safe: we hold no
          * connections or pending locks. */
         ws_link_drop_peer_state(ep, &a);
     }
@@ -509,7 +509,7 @@ static void ws_reap_links(nl_endpoint_t *ep, uint64_t now) {
 /* Free every dead link. IO thread calls this at the end of each cycle;
  * endpoint_free calls it after the IO thread has joined (at which point
  * any still-live links are also reclaimed). */
-static void ws_drain_dead(nl_endpoint_t *ep) {
+static void ws_drain_dead(wn_endpoint_t *ep) {
     pthread_mutex_lock(&ep->ws_links_lock);
     ws_link_t *list = ep->ws_dead;
     ep->ws_dead = NULL;
@@ -537,7 +537,7 @@ static void ws_drain_dead(nl_endpoint_t *ep) {
 /* Find-and-close under one lock hold (avoids the find/unlock/relock race
  * where another thread could move the link to the dead list and the IO
  * thread could free it in between). */
-static void ws_close_link_by_addr(nl_endpoint_t *ep, const struct sockaddr_storage *addr) {
+static void ws_close_link_by_addr(wn_endpoint_t *ep, const struct sockaddr_storage *addr) {
     pthread_mutex_lock(&ep->ws_links_lock);
     ws_link_t **pp = &ep->ws_links;
     while (*pp) {
@@ -546,7 +546,7 @@ static void ws_close_link_by_addr(nl_endpoint_t *ep, const struct sockaddr_stora
             *pp = t->next;
             t->next = ep->ws_dead;
             ep->ws_dead = t;
-            if (t->sock != NL_INVALID_SOCKET) shutdown(t->sock, SHUT_RDWR);
+            if (t->sock != WN_INVALID_SOCKET) shutdown(t->sock, SHUT_RDWR);
             break;
         }
         pp = &t->next;
@@ -554,31 +554,31 @@ static void ws_close_link_by_addr(nl_endpoint_t *ep, const struct sockaddr_stora
     pthread_mutex_unlock(&ep->ws_links_lock);
 }
 
-/* After a TCP link dies, tear down any half-open/established NetLink
+/* After a TCP link dies, tear down any half-open/established weft-net
  * state keyed by that address. Must NOT be called with connections_lock
  * or pending_lock held (takes both). */
-static void ws_link_drop_peer_state(nl_endpoint_t *ep, const struct sockaddr_storage *addr) {
-    nl_peer_id_t connid = NL_INVALID_PEER;
+static void ws_link_drop_peer_state(wn_endpoint_t *ep, const struct sockaddr_storage *addr) {
+    wn_peer_id_t connid = WN_INVALID_PEER;
     bool have_conn = false;
 
     pthread_mutex_lock(&ep->connections_lock);
-    for (int i = 0; i < NL_MAX_CONNECTIONS_INTERNAL; i++) {
-        nl_connection_t *c = ep->connections[i];
+    for (int i = 0; i < WN_MAX_CONNECTIONS_INTERNAL; i++) {
+        wn_connection_t *c = ep->connections[i];
         if (c && addr_equal(&c->addr, addr)) {
             connid = c->id;
             have_conn = true;
             ep->connections[i] = NULL;
-            nl_connection_destroy(c);
+            wn_connection_destroy(c);
             break;
         }
     }
     pthread_mutex_unlock(&ep->connections_lock);
 
     if (have_conn) {
-        nl_event_t ev; memset(&ev, 0, sizeof(ev));
-        ev.event_type = NL_EVENT_DISCONNECTED;
+        wn_event_t ev; memset(&ev, 0, sizeof(ev));
+        ev.event_type = WN_EVENT_DISCONNECTED;
         ev.peer = connid;
-        ev.disconnect_reason = NL_ERR_SOCKET;
+        ev.disconnect_reason = WN_ERR_SOCKET;
         push_event(ep, ev, NULL, 0);
         return;
     }
@@ -602,10 +602,10 @@ static void ws_link_drop_peer_state(nl_endpoint_t *ep, const struct sockaddr_sto
         release_pending_locked(p);
         pthread_mutex_unlock(&ep->pending_lock);
         if (client_role) {
-            nl_event_t ev; memset(&ev, 0, sizeof(ev));
-            ev.event_type = NL_EVENT_CONNECT_FAILED;
+            wn_event_t ev; memset(&ev, 0, sizeof(ev));
+            ev.event_type = WN_EVENT_CONNECT_FAILED;
             ev.peer = connid;
-            ev.disconnect_reason = NL_ERR_SOCKET;
+            ev.disconnect_reason = WN_ERR_SOCKET;
             push_event(ep, ev, NULL, 0);
         }
     } else {
@@ -613,7 +613,7 @@ static void ws_link_drop_peer_state(nl_endpoint_t *ep, const struct sockaddr_sto
     }
 }
 
-/* Send one NetLink packet to `addr`. UDP: datagram on the main socket.
+/* Send one weft-net packet to `addr`. UDP: datagram on the main socket.
  * WebSocket: binary frame on the upgraded TCP link for that address
  * (no-op if the link is missing or still mid-HTTP-handshake).
  *
@@ -621,42 +621,42 @@ static void ws_link_drop_peer_state(nl_endpoint_t *ep, const struct sockaddr_sto
  * ws_close_link/ws_drain_dead cannot free the link under us. Callers
  * already hold connections_lock (or pending_lock) when they got here
  * from a connection callback -- matching the documented lock order. */
-static bool ep_send_nl(nl_endpoint_t *ep, const struct sockaddr_storage *addr, socklen_t addr_len,
+static bool ep_send_wn(wn_endpoint_t *ep, const struct sockaddr_storage *addr, socklen_t addr_len,
                        const uint8_t *pkt, size_t len) {
-    if (ep->config.transport == NL_TRANSPORT_WEBSOCKET) {
+    if (ep->config.transport == WN_TRANSPORT_WEBSOCKET) {
         bool ok = false;
         pthread_mutex_lock(&ep->ws_links_lock);
         ws_link_t *l = NULL;
         for (ws_link_t *it = ep->ws_links; it; it = it->next) {
             if (addr_equal(&it->addr, addr)) { l = it; break; }
         }
-        if (l && l->upgraded && l->sock != NL_INVALID_SOCKET) {
+        if (l && l->upgraded && l->sock != WN_INVALID_SOCKET) {
             /* Client endpoints mask (RFC 6455 §5.3); servers do not. */
-            uint8_t frame[16 + NL_WS_MAX_MESSAGE];
-            size_t n = nl_ws_encode_binary(pkt, len, !ep->is_server, frame, sizeof(frame));
+            uint8_t frame[16 + WN_WS_MAX_MESSAGE];
+            size_t n = wn_ws_encode_binary(pkt, len, !ep->is_server, frame, sizeof(frame));
             if (n > 0) ok = sock_write_all(l->sock, frame, n);
         }
         pthread_mutex_unlock(&ep->ws_links_lock);
         return ok;
     }
-    if (ep->sock == NL_INVALID_SOCKET) return false;
+    if (ep->sock == WN_INVALID_SOCKET) return false;
     return sendto(ep->sock, pkt, len, 0, (const struct sockaddr *)addr, addr_len) >= 0;
 }
 
 /* ---- connection.c callback glue ---- */
 
-static void ep_send_wire(void *ctx, nl_peer_id_t peer, const uint8_t *packet, size_t len) {
+static void ep_send_wire(void *ctx, wn_peer_id_t peer, const uint8_t *packet, size_t len) {
     (void)peer;
     conn_ctx_t *c = (conn_ctx_t *)ctx;
-    ep_send_nl(c->ep, &c->conn->addr, c->conn->addr_len, packet, len);
+    ep_send_wn(c->ep, &c->conn->addr, c->conn->addr_len, packet, len);
 }
 
-static bool ep_on_data(void *ctx, nl_peer_id_t peer, uint8_t channel, nl_delivery_t delivery,
+static bool ep_on_data(void *ctx, wn_peer_id_t peer, uint8_t channel, wn_delivery_t delivery,
                         const uint8_t *data, uint32_t len) {
     (void)delivery;
     conn_ctx_t *c = (conn_ctx_t *)ctx;
-    nl_event_t ev; memset(&ev, 0, sizeof(ev));
-    ev.event_type = NL_EVENT_DATA;
+    wn_event_t ev; memset(&ev, 0, sizeof(ev));
+    ev.event_type = WN_EVENT_DATA;
     ev.peer = peer;
     ev.channel = channel;
     /* False means the endpoint's event cap refused the event: on_channel_
@@ -666,27 +666,27 @@ static bool ep_on_data(void *ctx, nl_peer_id_t peer, uint8_t channel, nl_deliver
 
 /* Called while connections_lock is ALREADY held (see file header). Must
  * not attempt to lock it again. */
-static void ep_on_disconnected(void *ctx, nl_peer_id_t peer, nl_result_t reason) {
+static void ep_on_disconnected(void *ctx, wn_peer_id_t peer, wn_result_t reason) {
     conn_ctx_t *c = (conn_ctx_t *)ctx;
     bool never_confirmed = c->conn->is_client_side && !c->conn->handshake_confirmed;
 
     int slot = find_connection_slot_by_ptr_locked(c->ep, c->conn);
     if (slot >= 0) c->ep->connections[slot] = NULL;
-    /* WebSocket: the TCP link dies with the NetLink connection.
+    /* WebSocket: the TCP link dies with the weft-net connection.
      * ws_close_link_by_addr only takes ws_links_lock (allowed under
      * connections_lock) and moves the link to the dead list. */
-    if (c->ep->config.transport == NL_TRANSPORT_WEBSOCKET)
+    if (c->ep->config.transport == WN_TRANSPORT_WEBSOCKET)
         ws_close_link_by_addr(c->ep, &c->conn->addr);
-    nl_connection_destroy(c->conn);
+    wn_connection_destroy(c->conn);
 
-    nl_event_t ev; memset(&ev, 0, sizeof(ev));
-    ev.event_type = never_confirmed ? NL_EVENT_CONNECT_FAILED : NL_EVENT_DISCONNECTED;
+    wn_event_t ev; memset(&ev, 0, sizeof(ev));
+    ev.event_type = never_confirmed ? WN_EVENT_CONNECT_FAILED : WN_EVENT_DISCONNECTED;
     ev.peer = peer;
     ev.disconnect_reason = reason;
     push_event(c->ep, ev, NULL, 0);
 }
 
-static void ep_on_connected(void *ctx, nl_peer_id_t peer) {
+static void ep_on_connected(void *ctx, wn_peer_id_t peer) {
     conn_ctx_t *c = (conn_ctx_t *)ctx;
     /* Client-side ACCEPTED confirmed: stop retransmitting the RESPONSE.
      * Nesting connections_lock -> pending_lock is the one allowed order
@@ -694,15 +694,15 @@ static void ep_on_connected(void *ctx, nl_peer_id_t peer) {
      * directly from handle_connect_response). */
     release_pending_by_connid(c->ep, peer, PENDING_CLIENT_AWAIT_ACCEPTED);
 
-    nl_event_t ev; memset(&ev, 0, sizeof(ev));
-    ev.event_type = NL_EVENT_CONNECTED;
+    wn_event_t ev; memset(&ev, 0, sizeof(ev));
+    ev.event_type = WN_EVENT_CONNECTED;
     ev.peer = peer;
-    sockaddr_to_nl_address(&c->conn->addr, c->conn->addr_len, &ev.from_address);
+    sockaddr_to_wn_address(&c->conn->addr, c->conn->addr_len, &ev.from_address);
     push_event(c->ep, ev, NULL, 0);
 }
 
-static nl_conn_callbacks_t make_callbacks(conn_ctx_t *cctx) {
-    nl_conn_callbacks_t cb;
+static wn_conn_callbacks_t make_callbacks(conn_ctx_t *cctx) {
+    wn_conn_callbacks_t cb;
     cb.on_data = ep_on_data;
     cb.on_disconnected = ep_on_disconnected;
     cb.send_wire = ep_send_wire;
@@ -714,18 +714,18 @@ static nl_conn_callbacks_t make_callbacks(conn_ctx_t *cctx) {
 /* ---- pending table helpers ---- */
 
 static void release_pending_locked(pending_t *p) {
-    if (p->my_keypair) { nl_keypair_free(p->my_keypair); p->my_keypair = NULL; }
+    if (p->my_keypair) { wn_keypair_free(p->my_keypair); p->my_keypair = NULL; }
     memset(p, 0, sizeof(*p));
 }
 
-static pending_t *acquire_pending_slot_locked(nl_endpoint_t *ep, uint64_t now) {
-    for (int i = 0; i < NL_MAX_PENDING; i++) {
+static pending_t *acquire_pending_slot_locked(wn_endpoint_t *ep, uint64_t now) {
+    for (int i = 0; i < WN_MAX_PENDING; i++) {
         if (!ep->pending[i].in_use) return &ep->pending[i];
     }
     /* Table full: evict the oldest entry that has NEVER been progressed
      * (req_refreshed false). A live handshake is refreshed the moment its
      * peer retransmits the REQUEST (existing-entry path in
-     * handle_connect_request, at most NL_HANDSHAKE_RETRY_MS in the
+     * handle_connect_request, at most WN_HANDSHAKE_RETRY_MS in the
      * making), so a never-refreshed entry is almost certainly a one-shot
      * flood packet whose "client" never followed up. Plain created_ms LRU
      * here would instead pick the entry built BEFORE the flood -- a
@@ -735,7 +735,7 @@ static pending_t *acquire_pending_slot_locked(nl_endpoint_t *ep, uint64_t now) {
      * retx-consistent attacker), deny the new request via NULL rather
      * than steal a slot that may be mid-RESPONSE. */
     int victim = -1;
-    for (int i = 0; i < NL_MAX_PENDING; i++) {
+    for (int i = 0; i < WN_MAX_PENDING; i++) {
         if (ep->pending[i].req_refreshed) continue;
         if (victim < 0 || ep->pending[i].created_ms < ep->pending[victim].created_ms) victim = i;
     }
@@ -745,9 +745,9 @@ static pending_t *acquire_pending_slot_locked(nl_endpoint_t *ep, uint64_t now) {
     return &ep->pending[victim];
 }
 
-static pending_t *find_pending_by_addr_locked(nl_endpoint_t *ep, const struct sockaddr_storage *addr,
+static pending_t *find_pending_by_addr_locked(wn_endpoint_t *ep, const struct sockaddr_storage *addr,
                                                pending_role_t role) {
-    for (int i = 0; i < NL_MAX_PENDING; i++) {
+    for (int i = 0; i < WN_MAX_PENDING; i++) {
         if (ep->pending[i].in_use && ep->pending[i].role == role && addr_equal(&ep->pending[i].addr, addr)) {
             return &ep->pending[i];
         }
@@ -759,14 +759,14 @@ static pending_t *find_pending_by_addr_locked(nl_endpoint_t *ep, const struct so
  * client echoes back (cookie + pubkey + nonce), not address alone. Two
  * in-flight handshakes from the same source address would otherwise
  * collide on addr-only lookup and cross-derive keys. */
-static pending_t *find_pending_response_locked(nl_endpoint_t *ep, const struct sockaddr_storage *addr,
+static pending_t *find_pending_response_locked(wn_endpoint_t *ep, const struct sockaddr_storage *addr,
                                                const uint8_t cookie[16], const uint8_t pub[32],
                                                const uint8_t nonce[16]) {
-    for (int i = 0; i < NL_MAX_PENDING; i++) {
+    for (int i = 0; i < WN_MAX_PENDING; i++) {
         pending_t *p = &ep->pending[i];
         if (!p->in_use || p->role != PENDING_SERVER_AWAIT_RESPONSE) continue;
         if (!addr_equal(&p->addr, addr)) continue;
-        if (!nl_crypto_const_time_eq(cookie, p->cookie, 16)) continue;
+        if (!wn_crypto_const_time_eq(cookie, p->cookie, 16)) continue;
         if (memcmp(pub, p->peer_pubkey, 32) != 0) continue;
         if (memcmp(nonce, p->peer_nonce, 16) != 0) continue;
         return p;
@@ -774,9 +774,9 @@ static pending_t *find_pending_response_locked(nl_endpoint_t *ep, const struct s
     return NULL;
 }
 
-static void release_pending_by_connid(nl_endpoint_t *ep, nl_peer_id_t connid, pending_role_t role) {
+static void release_pending_by_connid(wn_endpoint_t *ep, wn_peer_id_t connid, pending_role_t role) {
     pthread_mutex_lock(&ep->pending_lock);
-    for (int i = 0; i < NL_MAX_PENDING; i++) {
+    for (int i = 0; i < WN_MAX_PENDING; i++) {
         pending_t *p = &ep->pending[i];
         if (p->in_use && p->role == role && p->connection_id == connid) {
             release_pending_locked(p);
@@ -790,11 +790,11 @@ static void release_pending_by_connid(nl_endpoint_t *ep, nl_peer_id_t connid, pe
  * handshake slots. Lets regression tests assert a failed connect doesn't
  * leak its entry. Also not ABI: exported only so tests can read endpoint
  * internals. */
-int nl_endpoint_pending_used_for_test(nl_endpoint_t *ep) {
+int wn_endpoint_pending_used_for_test(wn_endpoint_t *ep) {
     if (!ep) return 0;
     int n = 0;
     pthread_mutex_lock(&ep->pending_lock);
-    for (int i = 0; i < NL_MAX_PENDING; i++) if (ep->pending[i].in_use) n++;
+    for (int i = 0; i < WN_MAX_PENDING; i++) if (ep->pending[i].in_use) n++;
     pthread_mutex_unlock(&ep->pending_lock);
     return n;
 }
@@ -803,7 +803,7 @@ int nl_endpoint_pending_used_for_test(nl_endpoint_t *ep) {
  * currently queued endpoint-wide (the event-level cap target). Not ABI:
  * exported only so tests can assert the event_queue_max_bytes invariant
  * and that legit traffic still fits. */
-size_t nl_endpoint_event_queue_bytes_for_test(nl_endpoint_t *ep) {
+size_t wn_endpoint_event_queue_bytes_for_test(wn_endpoint_t *ep) {
     if (!ep) return 0;
     pthread_mutex_lock(&ep->queue_lock);
     size_t n = (size_t)ep->event_queue_bytes;
@@ -815,7 +815,7 @@ size_t nl_endpoint_event_queue_bytes_for_test(nl_endpoint_t *ep) {
  * WebSocket links on either side. Lets regression tests assert the link
  * reap sweep actually closes pre-upgrade links (M2). Not ABI: exported
  * only so tests can read endpoint internals. */
-int nl_endpoint_ws_links_used_for_test(nl_endpoint_t *ep) {
+int wn_endpoint_ws_links_used_for_test(wn_endpoint_t *ep) {
     if (!ep) return 0;
     int n = 0;
     pthread_mutex_lock(&ep->ws_links_lock);
@@ -824,33 +824,33 @@ int nl_endpoint_ws_links_used_for_test(nl_endpoint_t *ep) {
     return n;
 }
 
-static void expire_pending(nl_endpoint_t *ep, uint64_t now) {
+static void expire_pending(wn_endpoint_t *ep, uint64_t now) {
     /* Collect AWAIT_ACCEPTED timeouts first: those have a live (but never
      * confirmed) client-side connection that must be torn down under
      * connections_lock -- and that lock must not be taken while holding
      * pending_lock (see file-header locking discipline). */
-    nl_peer_id_t accepted_timeouts[NL_MAX_PENDING];
+    wn_peer_id_t accepted_timeouts[WN_MAX_PENDING];
     int n_accepted = 0;
 
     pthread_mutex_lock(&ep->pending_lock);
-    for (int i = 0; i < NL_MAX_PENDING; i++) {
-        if (ep->pending[i].in_use && (now - ep->pending[i].created_ms) > NL_PENDING_TIMEOUT_MS) {
+    for (int i = 0; i < WN_MAX_PENDING; i++) {
+        if (ep->pending[i].in_use && (now - ep->pending[i].created_ms) > WN_PENDING_TIMEOUT_MS) {
             pending_role_t role = ep->pending[i].role;
             uint64_t connid = ep->pending[i].connection_id;
             struct sockaddr_storage paddr = ep->pending[i].addr;
             release_pending_locked(&ep->pending[i]);
             if (role == PENDING_CLIENT_AWAIT_CHALLENGE) {
-                nl_event_t ev; memset(&ev, 0, sizeof(ev));
-                ev.event_type = NL_EVENT_CONNECT_FAILED;
+                wn_event_t ev; memset(&ev, 0, sizeof(ev));
+                ev.event_type = WN_EVENT_CONNECT_FAILED;
                 ev.peer = connid;
-                ev.disconnect_reason = NL_ERR_TIMEOUT;
+                ev.disconnect_reason = WN_ERR_TIMEOUT;
                 push_event(ep, ev, NULL, 0);
                 /* WebSocket: abandon the dial-out link too. */
-                if (ep->config.transport == NL_TRANSPORT_WEBSOCKET)
+                if (ep->config.transport == WN_TRANSPORT_WEBSOCKET)
                     ws_close_link_by_addr(ep, &paddr);
-            } else if (role == PENDING_CLIENT_AWAIT_ACCEPTED && n_accepted < NL_MAX_PENDING) {
+            } else if (role == PENDING_CLIENT_AWAIT_ACCEPTED && n_accepted < WN_MAX_PENDING) {
                 accepted_timeouts[n_accepted++] = connid;
-                if (ep->config.transport == NL_TRANSPORT_WEBSOCKET)
+                if (ep->config.transport == WN_TRANSPORT_WEBSOCKET)
                     ws_close_link_by_addr(ep, &paddr);
             }
         }
@@ -860,15 +860,15 @@ static void expire_pending(nl_endpoint_t *ep, uint64_t now) {
     if (n_accepted > 0) {
         pthread_mutex_lock(&ep->connections_lock);
         for (int j = 0; j < n_accepted; j++) {
-            nl_connection_t *conn = find_connection_locked(ep, accepted_timeouts[j]);
+            wn_connection_t *conn = find_connection_locked(ep, accepted_timeouts[j]);
             if (!conn || !conn->is_client_side || conn->handshake_confirmed) continue;
             int slot = find_connection_slot_by_ptr_locked(ep, conn);
             if (slot >= 0) ep->connections[slot] = NULL;
-            nl_connection_destroy(conn);
-            nl_event_t ev; memset(&ev, 0, sizeof(ev));
-            ev.event_type = NL_EVENT_CONNECT_FAILED;
+            wn_connection_destroy(conn);
+            wn_event_t ev; memset(&ev, 0, sizeof(ev));
+            ev.event_type = WN_EVENT_CONNECT_FAILED;
             ev.peer = accepted_timeouts[j];
-            ev.disconnect_reason = NL_ERR_TIMEOUT;
+            ev.disconnect_reason = WN_ERR_TIMEOUT;
             push_event(ep, ev, NULL, 0);
         }
         pthread_mutex_unlock(&ep->connections_lock);
@@ -877,27 +877,27 @@ static void expire_pending(nl_endpoint_t *ep, uint64_t now) {
 
 /* Retransmit any pending cleartext handshake datagram that is due. Runs on
  * the IO thread each poll cycle; entries stop retrying when released (or
- * when expire_pending reclaims them at NL_PENDING_TIMEOUT_MS). */
-static void retry_pending_handshakes(nl_endpoint_t *ep, uint64_t now) {
+ * when expire_pending reclaims them at WN_PENDING_TIMEOUT_MS). */
+static void retry_pending_handshakes(wn_endpoint_t *ep, uint64_t now) {
     /* Copy due packets out under pending_lock, then send after release:
-     * ep_send_nl on the WebSocket path can block up to ~1s on a stalled
+     * ep_send_wn on the WebSocket path can block up to ~1s on a stalled
      * TCP write, and holding pending_lock that long would freeze the
      * whole handshake table. */
-    /* pkt is sized NL_CONNECT_MAX_PACKET_SIZE, not a specific handshake
+    /* pkt is sized WN_CONNECT_MAX_PACKET_SIZE, not a specific handshake
      * packet's size: a server entry retains a CONNECT_CHALLENGE, and a
      * RESPONSE-sized buffer overflowed by 4 bytes here -- on the I/O
      * thread's stack -- on every retransmitted server handshake. */
     struct { struct sockaddr_storage addr; socklen_t addr_len;
-             uint8_t pkt[NL_CONNECT_MAX_PACKET_SIZE];
-             uint16_t len; } due[NL_MAX_PENDING];
+             uint8_t pkt[WN_CONNECT_MAX_PACKET_SIZE];
+             uint16_t len; } due[WN_MAX_PENDING];
     int n_due = 0;
 
     pthread_mutex_lock(&ep->pending_lock);
-    for (int i = 0; i < NL_MAX_PENDING; i++) {
+    for (int i = 0; i < WN_MAX_PENDING; i++) {
         pending_t *p = &ep->pending[i];
         if (!p->in_use || p->retry_packet_len == 0) continue;
-        if (now - p->last_retry_ms < NL_HANDSHAKE_RETRY_MS) continue;
-        if (n_due >= NL_MAX_PENDING) break;
+        if (now - p->last_retry_ms < WN_HANDSHAKE_RETRY_MS) continue;
+        if (n_due >= WN_MAX_PENDING) break;
         due[n_due].addr = p->addr;
         due[n_due].addr_len = p->addr_len;
         memcpy(due[n_due].pkt, p->retry_packet, p->retry_packet_len);
@@ -908,20 +908,20 @@ static void retry_pending_handshakes(nl_endpoint_t *ep, uint64_t now) {
     pthread_mutex_unlock(&ep->pending_lock);
 
     for (int i = 0; i < n_due; i++)
-        ep_send_nl(ep, &due[i].addr, due[i].addr_len, due[i].pkt, due[i].len);
+        ep_send_wn(ep, &due[i].addr, due[i].addr_len, due[i].pkt, due[i].len);
 }
 
-static bool rate_limit_check(nl_endpoint_t *ep, uint64_t now) {
+static bool rate_limit_check(wn_endpoint_t *ep, uint64_t now) {
     /* Simple fixed-window counter -- bounds how much handshake-processing
      * CPU an attacker can force us to spend per second. Not as smooth as
      * a token bucket, but a great deal simpler and sufficient to blunt a
      * flood without adding real complexity. */
-    if (now - ep->rate_window_start_ms > NL_RATE_LIMIT_WINDOW_MS) {
+    if (now - ep->rate_window_start_ms > WN_RATE_LIMIT_WINDOW_MS) {
         ep->rate_window_start_ms = now;
         ep->rate_count = 0;
     }
     ep->rate_count++;
-    return ep->rate_count <= NL_RATE_LIMIT_MAX_PER_WINDOW;
+    return ep->rate_count <= WN_RATE_LIMIT_MAX_PER_WINDOW;
 }
 
 /* Separate fixed-window counter for discovery responses. Shares neither
@@ -929,28 +929,28 @@ static bool rate_limit_check(nl_endpoint_t *ep, uint64_t now) {
  * also starve legitimate CONNECT_REQUESTs (and vice versa). Caller holds
  * discovery_lock (the window is mutated from the IO thread while probes
  * can run on a user thread). */
-static bool rate_limit_discovery_locked(nl_endpoint_t *ep, uint64_t now) {
-    if (now - ep->discovery_rate_window_start_ms > NL_RATE_LIMIT_WINDOW_MS) {
+static bool rate_limit_discovery_locked(wn_endpoint_t *ep, uint64_t now) {
+    if (now - ep->discovery_rate_window_start_ms > WN_RATE_LIMIT_WINDOW_MS) {
         ep->discovery_rate_window_start_ms = now;
         ep->discovery_rate_count = 0;
     }
     ep->discovery_rate_count++;
-    return ep->discovery_rate_count <= NL_RATE_LIMIT_MAX_PER_WINDOW;
+    return ep->discovery_rate_count <= WN_RATE_LIMIT_MAX_PER_WINDOW;
 }
 
-static nl_result_t deny_reason_to_result(uint8_t reason) {
+static wn_result_t deny_reason_to_result(uint8_t reason) {
     switch (reason) {
-        case NL_DENY_SERVER_FULL: return NL_ERR_SERVER_FULL;
-        case NL_DENY_PROTOCOL_MISMATCH: return NL_ERR_PROTOCOL_MISMATCH;
-        default: return NL_ERR_DENIED;
+        case WN_DENY_SERVER_FULL: return WN_ERR_SERVER_FULL;
+        case WN_DENY_PROTOCOL_MISMATCH: return WN_ERR_PROTOCOL_MISMATCH;
+        default: return WN_ERR_DENIED;
     }
 }
 
-static void send_denied(nl_endpoint_t *ep, const struct sockaddr_storage *addr, socklen_t addr_len, uint8_t reason) {
-    uint8_t out[NL_CONNECT_DENIED_SIZE];
-    out[0] = NL_PKT_CONNECT_DENIED;
+static void send_denied(wn_endpoint_t *ep, const struct sockaddr_storage *addr, socklen_t addr_len, uint8_t reason) {
+    uint8_t out[WN_CONNECT_DENIED_SIZE];
+    out[0] = WN_PKT_CONNECT_DENIED;
     out[1] = reason;
-    ep_send_nl(ep, addr, addr_len, out, sizeof(out));
+    ep_send_wn(ep, addr, addr_len, out, sizeof(out));
 }
 
 /* ---- HKDF-derived session key/salt bundle ---- */
@@ -966,37 +966,37 @@ static bool derive_session_keys(const uint8_t shared[32], const uint8_t client_n
     memcpy(salt, client_nonce, 16);
     memcpy(salt + 16, server_nonce, 16);
     bool ok = true;
-    ok &= nl_crypto_hkdf_sha256(shared, 32, salt, 32, (const uint8_t *)"netlink v1 c2s key", 18, out->c2s_key, 32);
-    ok &= nl_crypto_hkdf_sha256(shared, 32, salt, 32, (const uint8_t *)"netlink v1 s2c key", 18, out->s2c_key, 32);
-    ok &= nl_crypto_hkdf_sha256(shared, 32, salt, 32, (const uint8_t *)"netlink v1 c2s salt", 19, out->c2s_salt, 12);
-    ok &= nl_crypto_hkdf_sha256(shared, 32, salt, 32, (const uint8_t *)"netlink v1 s2c salt", 19, out->s2c_salt, 12);
+    ok &= wn_crypto_hkdf_sha256(shared, 32, salt, 32, (const uint8_t *)"weft-net v1 c2s key", 19, out->c2s_key, 32);
+    ok &= wn_crypto_hkdf_sha256(shared, 32, salt, 32, (const uint8_t *)"weft-net v1 s2c key", 19, out->s2c_key, 32);
+    ok &= wn_crypto_hkdf_sha256(shared, 32, salt, 32, (const uint8_t *)"weft-net v1 c2s salt", 20, out->c2s_salt, 12);
+    ok &= wn_crypto_hkdf_sha256(shared, 32, salt, 32, (const uint8_t *)"weft-net v1 s2c salt", 20, out->s2c_salt, 12);
     return ok;
 }
 
 /* ---- handshake: server side ---- */
 
-static void handle_connect_request(nl_endpoint_t *ep, const uint8_t *buf, size_t len,
+static void handle_connect_request(wn_endpoint_t *ep, const uint8_t *buf, size_t len,
                                     const struct sockaddr_storage *from, socklen_t from_len, uint64_t now) {
     /* v1 clients send a 64-byte REQUEST without capabilities and with
      * version==1; parse the stable prefix first so they get an explicit
      * PROTOCOL_MISMATCH deny instead of a silent drop. */
-    if (len < NL_CONNECT_REQUEST_SIZE - 4) return;
+    if (len < WN_CONNECT_REQUEST_SIZE - 4) return;
     size_t off = 1;
-    uint32_t magic = nl_get_u32(buf + off); off += 4;
-    uint16_t version = nl_get_u16(buf + off); off += 2;
-    if (magic != NL_MAGIC || version != NL_PROTOCOL_VERSION) {
-        send_denied(ep, from, from_len, NL_DENY_PROTOCOL_MISMATCH);
+    uint32_t magic = wn_get_u32(buf + off); off += 4;
+    uint16_t version = wn_get_u16(buf + off); off += 2;
+    if (magic != WN_MAGIC || version != WN_PROTOCOL_VERSION) {
+        send_denied(ep, from, from_len, WN_DENY_PROTOCOL_MISMATCH);
         return;
     }
-    if (len < NL_CONNECT_REQUEST_SIZE) return; /* truncated v2 */
+    if (len < WN_CONNECT_REQUEST_SIZE) return; /* truncated v2 */
     uint8_t req_channels = buf[off]; off += 1;
-    uint64_t client_connid = nl_get_u64(buf + off); off += 8;
+    uint64_t client_connid = wn_get_u64(buf + off); off += 8;
     uint8_t client_pub[32]; memcpy(client_pub, buf + off, 32); off += 32;
     uint8_t client_nonce[16]; memcpy(client_nonce, buf + off, 16); off += 16;
-    uint32_t client_caps = nl_get_u32(buf + off); off += 4;
+    uint32_t client_caps = wn_get_u32(buf + off); off += 4;
 
     /* The connection id doubles as the peer handle the application sees, and
-     * 0 is NL_INVALID_PEER. Drop silently: nothing to reflect or allocate. */
+     * 0 is WN_INVALID_PEER. Drop silently: nothing to reflect or allocate. */
     if (client_connid == 0) return;
 
     /* A retransmitted REQUEST for a handshake that was already admitted needs
@@ -1014,11 +1014,11 @@ static void handle_connect_request(nl_endpoint_t *ep, const uint8_t *buf, size_t
          * what protects this entry from flood eviction (see
          * acquire_pending_slot_locked). */
         retrans->req_refreshed = true;
-        if (now - retrans->last_retry_ms < NL_HANDSHAKE_MIN_RESEND_MS) {
+        if (now - retrans->last_retry_ms < WN_HANDSHAKE_MIN_RESEND_MS) {
             pthread_mutex_unlock(&ep->pending_lock);
             return;
         }
-        uint8_t copy[NL_CONNECT_CHALLENGE_SIZE];
+        uint8_t copy[WN_CONNECT_CHALLENGE_SIZE];
         memcpy(copy, retrans->retry_packet, retrans->retry_packet_len);
         uint16_t clen = retrans->retry_packet_len;
         struct sockaddr_storage faddr = *from;
@@ -1026,7 +1026,7 @@ static void handle_connect_request(nl_endpoint_t *ep, const uint8_t *buf, size_t
         retrans->last_retry_ms = now;
         retrans->req_refreshed = true;
         pthread_mutex_unlock(&ep->pending_lock);
-        ep_send_nl(ep, &faddr, flen, copy, clen);
+        ep_send_wn(ep, &faddr, flen, copy, clen);
         return;
     }
     pthread_mutex_unlock(&ep->pending_lock);
@@ -1038,12 +1038,12 @@ static void handle_connect_request(nl_endpoint_t *ep, const uint8_t *buf, size_t
     pthread_mutex_unlock(&ep->connections_lock);
     uint32_t max_conn = ep->config.max_connections ? ep->config.max_connections : 64;
     if (active >= max_conn) {
-        send_denied(ep, from, from_len, NL_DENY_SERVER_FULL);
+        send_denied(ep, from, from_len, WN_DENY_SERVER_FULL);
         return;
     }
 
     /* Negotiate the channel count down to what THIS server was configured
-     * to serve: a client can ask for up to NL_MAX_CHANNELS (32), and
+     * to serve: a client can ask for up to WN_MAX_CHANNELS (32), and
      * honoring it would multiply this connection's per-channel buffers
      * (channels x lanes x reassembly slots) at attacker-controlled cost,
      * unrelated to the server's own configured limit. Clamping to
@@ -1054,7 +1054,7 @@ static void handle_connect_request(nl_endpoint_t *ep, const uint8_t *buf, size_t
      * DATA on a channel the server did not negotiate is dropped by the
      * receiver's channel-bounds check. */
     uint8_t channel_count = req_channels;
-    if (channel_count == 0 || channel_count > NL_MAX_CHANNELS ||
+    if (channel_count == 0 || channel_count > WN_MAX_CHANNELS ||
         channel_count > ep->config.channel_count) {
         channel_count = ep->config.channel_count;
     }
@@ -1068,7 +1068,7 @@ static void handle_connect_request(nl_endpoint_t *ep, const uint8_t *buf, size_t
         memcmp(client_pub, existing->peer_pubkey, 32) == 0 &&
         memcmp(client_nonce, existing->peer_nonce, 16) == 0 &&
         existing->retry_packet_len > 0) {
-        uint8_t copy[NL_CONNECT_CHALLENGE_SIZE];
+        uint8_t copy[WN_CONNECT_CHALLENGE_SIZE];
         memcpy(copy, existing->retry_packet, existing->retry_packet_len);
         uint16_t clen = existing->retry_packet_len;
         struct sockaddr_storage faddr = *from;
@@ -1076,7 +1076,7 @@ static void handle_connect_request(nl_endpoint_t *ep, const uint8_t *buf, size_t
         existing->last_retry_ms = now;
         existing->req_refreshed = true;
         pthread_mutex_unlock(&ep->pending_lock);
-        ep_send_nl(ep, &faddr, flen, copy, clen);
+        ep_send_wn(ep, &faddr, flen, copy, clen);
         return;
     }
 
@@ -1087,16 +1087,16 @@ static void handle_connect_request(nl_endpoint_t *ep, const uint8_t *buf, size_t
          * silently dropping: clients learn the truth immediately, and the
          * rate limiter above bounds the reply volume. */
         pthread_mutex_unlock(&ep->pending_lock);
-        send_denied(ep, from, from_len, NL_DENY_SERVER_FULL);
+        send_denied(ep, from, from_len, WN_DENY_SERVER_FULL);
         return;
     }
-    p->my_keypair = nl_keypair_generate();
+    p->my_keypair = wn_keypair_generate();
     if (!p->my_keypair) { memset(p, 0, sizeof(*p)); pthread_mutex_unlock(&ep->pending_lock); return; }
     p->in_use = true;
     p->role = PENDING_SERVER_AWAIT_RESPONSE;
     memcpy(&p->addr, from, sizeof(*from));
     p->addr_len = from_len;
-    nl_crypto_random(p->my_nonce, 16);
+    wn_crypto_random(p->my_nonce, 16);
     memcpy(p->peer_pubkey, client_pub, 32);
     memcpy(p->peer_nonce, client_nonce, 16);
     p->connection_id = client_connid;
@@ -1112,14 +1112,14 @@ static void handle_connect_request(nl_endpoint_t *ep, const uint8_t *buf, size_t
     memcpy(cookie_input + ci, client_pub, 32); ci += 32;
     memcpy(cookie_input + ci, client_nonce, 16); ci += 16;
     memcpy(cookie_input + ci, p->my_nonce, 16); ci += 16;
-    if (!nl_crypto_hmac_sha256(ep->server_secret, 32, cookie_input, ci, p->cookie, 16)) {
+    if (!wn_crypto_hmac_sha256(ep->server_secret, 32, cookie_input, ci, p->cookie, 16)) {
         release_pending_locked(p);
         pthread_mutex_unlock(&ep->pending_lock);
         return;
     }
 
     uint8_t server_pub[32];
-    if (!nl_keypair_public(p->my_keypair, server_pub)) {
+    if (!wn_keypair_public(p->my_keypair, server_pub)) {
         release_pending_locked(p);
         pthread_mutex_unlock(&ep->pending_lock);
         return;
@@ -1129,25 +1129,25 @@ static void handle_connect_request(nl_endpoint_t *ep, const uint8_t *buf, size_t
      * retransmitted REQUEST can find it already armed for retry. */
     uint8_t *out = p->retry_packet;
     size_t o = 0;
-    out[o++] = NL_PKT_CONNECT_CHALLENGE;
+    out[o++] = WN_PKT_CONNECT_CHALLENGE;
     memcpy(out + o, server_pub, 32); o += 32;
     memcpy(out + o, p->my_nonce, 16); o += 16;
     memcpy(out + o, p->cookie, 16); o += 16;
-    nl_put_u32(out + o, ep->config.capabilities); o += 4;
+    wn_put_u32(out + o, ep->config.capabilities); o += 4;
     p->retry_packet_len = (uint16_t)o;
     p->last_retry_ms = now;
-    uint8_t copy[NL_CONNECT_CHALLENGE_SIZE];
+    uint8_t copy[WN_CONNECT_CHALLENGE_SIZE];
     memcpy(copy, out, o);
     struct sockaddr_storage faddr = *from;
     socklen_t flen = from_len;
     pthread_mutex_unlock(&ep->pending_lock);
-    ep_send_nl(ep, &faddr, flen, copy, o);
+    ep_send_wn(ep, &faddr, flen, copy, o);
 }
 
-static void handle_connect_response(nl_endpoint_t *ep, const uint8_t *buf, size_t len,
+static void handle_connect_response(wn_endpoint_t *ep, const uint8_t *buf, size_t len,
                                      const struct sockaddr_storage *from, socklen_t from_len, uint64_t now) {
     (void)from_len; /* the pending entry's own stored addr_len is used instead, see below */
-    if (len < NL_CONNECT_RESPONSE_SIZE) return;
+    if (len < WN_CONNECT_RESPONSE_SIZE) return;
     /* No draw on the shared handshake budget here. The expensive part
      * (X25519 + HKDF) only runs for a RESPONSE that echoes a genuine cookie
      * for a pending entry, and that entry is consumed by the first success, so
@@ -1168,10 +1168,10 @@ static void handle_connect_response(nl_endpoint_t *ep, const uint8_t *buf, size_
     }
 
     uint8_t shared[32];
-    bool ok = nl_crypto_x25519(p->my_keypair, p->peer_pubkey, shared);
+    bool ok = wn_crypto_x25519(p->my_keypair, p->peer_pubkey, shared);
     session_keys_t keys;
     if (ok) ok = derive_session_keys(shared, p->peer_nonce /*client nonce*/, p->my_nonce /*server nonce*/, &keys);
-    nl_crypto_wipe(shared, sizeof(shared));
+    wn_crypto_wipe(shared, sizeof(shared));
     if (!ok) { release_pending_locked(p); pthread_mutex_unlock(&ep->pending_lock); return; }
 
     uint64_t connid = p->connection_id;
@@ -1185,14 +1185,14 @@ static void handle_connect_response(nl_endpoint_t *ep, const uint8_t *buf, size_
     pthread_mutex_lock(&ep->connections_lock);
     if (find_connection_locked(ep, connid)) {
         pthread_mutex_unlock(&ep->connections_lock); /* astronomically-unlikely id collision: reject */
-        nl_crypto_wipe(&keys, sizeof(keys));
+        wn_crypto_wipe(&keys, sizeof(keys));
         return;
     }
-    nl_connection_t *conn = nl_connection_create(connid, &paddr, paddr_len, false, channel_count,
+    wn_connection_t *conn = wn_connection_create(connid, &paddr, paddr_len, false, channel_count,
                                                   keys.s2c_key, keys.c2s_key, keys.s2c_salt, keys.c2s_salt,
                                                   ep->config.connection_timeout_ms, ep->config.keepalive_interval_ms,
                                                   now);
-    nl_crypto_wipe(&keys, sizeof(keys));
+    wn_crypto_wipe(&keys, sizeof(keys));
     if (!conn) { pthread_mutex_unlock(&ep->connections_lock); return; }
     conn->capabilities = negotiated_caps;
     conn->rate_bps = ep->config.max_send_bytes_per_sec;
@@ -1200,7 +1200,7 @@ static void handle_connect_response(nl_endpoint_t *ep, const uint8_t *buf, size_
     conn->rate_last_refill_ms = now;
     if (ep->config.recv_window_bytes) {
         uint32_t rw = ep->config.recv_window_bytes;
-        if (rw > NL_RECV_WINDOW_MAX) rw = NL_RECV_WINDOW_MAX;
+        if (rw > WN_RECV_WINDOW_MAX) rw = WN_RECV_WINDOW_MAX;
         conn->recv_window_size = rw;
     }
     int slot = find_free_connection_slot_locked(ep);
@@ -1209,21 +1209,21 @@ static void handle_connect_response(nl_endpoint_t *ep, const uint8_t *buf, size_
          * and now (or max_connections was raised above the hard internal
          * cap). Fail closed with an explicit deny so the client doesn't
          * hang until its pending timeout. */
-        nl_connection_destroy(conn);
-        send_denied(ep, &paddr, paddr_len, NL_DENY_SERVER_FULL);
+        wn_connection_destroy(conn);
+        send_denied(ep, &paddr, paddr_len, WN_DENY_SERVER_FULL);
         pthread_mutex_unlock(&ep->connections_lock);
         return;
     }
     ep->connections[slot] = conn;
 
     conn_ctx_t cctx = { ep, conn };
-    nl_conn_callbacks_t cb = make_callbacks(&cctx);
-    nl_connection_send_handshake_complete(conn, now, /*is_retry*/ false, &cb);
+    wn_conn_callbacks_t cb = make_callbacks(&cctx);
+    wn_connection_send_handshake_complete(conn, now, /*is_retry*/ false, &cb);
 
-    nl_event_t ev; memset(&ev, 0, sizeof(ev));
-    ev.event_type = NL_EVENT_CONNECTED;
+    wn_event_t ev; memset(&ev, 0, sizeof(ev));
+    ev.event_type = WN_EVENT_CONNECTED;
     ev.peer = connid;
-    sockaddr_to_nl_address(&paddr, paddr_len, &ev.from_address);
+    sockaddr_to_wn_address(&paddr, paddr_len, &ev.from_address);
     push_event(ep, ev, NULL, 0);
 
     pthread_mutex_unlock(&ep->connections_lock);
@@ -1231,9 +1231,9 @@ static void handle_connect_response(nl_endpoint_t *ep, const uint8_t *buf, size_
 
 /* ---- handshake: client side ---- */
 
-static void handle_connect_challenge(nl_endpoint_t *ep, const uint8_t *buf, size_t len,
+static void handle_connect_challenge(wn_endpoint_t *ep, const uint8_t *buf, size_t len,
                                       const struct sockaddr_storage *from, socklen_t from_len, uint64_t now) {
-    if (len < NL_CONNECT_CHALLENGE_SIZE) return;
+    if (len < WN_CONNECT_CHALLENGE_SIZE) return;
     /* Rate-limit before the pending lookup: the X25519 below consumes the
      * server_pub straight off the wire, so an attacker-controlled packet
      * must not be able to force unbounded key agreement per second. */
@@ -1242,31 +1242,31 @@ static void handle_connect_challenge(nl_endpoint_t *ep, const uint8_t *buf, size
     uint8_t server_pub[32]; memcpy(server_pub, buf + off, 32); off += 32;
     uint8_t server_nonce[16]; memcpy(server_nonce, buf + off, 16); off += 16;
     uint8_t cookie[16]; memcpy(cookie, buf + off, 16); off += 16;
-    uint32_t server_caps = nl_get_u32(buf + off); off += 4;
+    uint32_t server_caps = wn_get_u32(buf + off); off += 4;
 
     pthread_mutex_lock(&ep->pending_lock);
     pending_t *p = find_pending_by_addr_locked(ep, from, PENDING_CLIENT_AWAIT_CHALLENGE);
     if (!p) { pthread_mutex_unlock(&ep->pending_lock); return; /* not expecting this, or already handled */ }
 
     uint8_t shared[32];
-    bool ok = nl_crypto_x25519(p->my_keypair, server_pub, shared);
+    bool ok = wn_crypto_x25519(p->my_keypair, server_pub, shared);
     session_keys_t keys;
     if (ok) ok = derive_session_keys(shared, p->my_nonce /*client nonce*/, server_nonce, &keys);
-    nl_crypto_wipe(shared, sizeof(shared));
+    wn_crypto_wipe(shared, sizeof(shared));
     if (!ok) { release_pending_locked(p); pthread_mutex_unlock(&ep->pending_lock); return; }
 
     uint64_t connid = p->connection_id;
     uint8_t channel_count = p->channel_count;
     uint32_t negotiated_caps = ep->config.capabilities & server_caps;
-    uint8_t client_pub[32]; nl_keypair_public(p->my_keypair, client_pub);
+    uint8_t client_pub[32]; wn_keypair_public(p->my_keypair, client_pub);
 
     /* Keep the pending entry as AWAIT_ACCEPTED with the RESPONSE armed for
      * retry: a lost RESPONSE would otherwise stall until the 5s timeout.
      * Released by ep_on_connected when ACCEPTED decrypts, by DENIED, or by
      * expire_pending. The keypair is only needed through RESPONSE. */
-    uint8_t out[NL_CONNECT_RESPONSE_SIZE];
+    uint8_t out[WN_CONNECT_RESPONSE_SIZE];
     size_t o = 0;
-    out[o++] = NL_PKT_CONNECT_RESPONSE;
+    out[o++] = WN_PKT_CONNECT_RESPONSE;
     memcpy(out + o, cookie, 16); o += 16;
     memcpy(out + o, client_pub, 32); o += 32;
     memcpy(out + o, p->my_nonce, 16); o += 16;
@@ -1274,12 +1274,12 @@ static void handle_connect_challenge(nl_endpoint_t *ep, const uint8_t *buf, size
     p->retry_packet_len = (uint16_t)o;
     p->last_retry_ms = now;
     p->role = PENDING_CLIENT_AWAIT_ACCEPTED;
-    if (p->my_keypair) { nl_keypair_free(p->my_keypair); p->my_keypair = NULL; }
+    if (p->my_keypair) { wn_keypair_free(p->my_keypair); p->my_keypair = NULL; }
     pthread_mutex_unlock(&ep->pending_lock);
 
     pthread_mutex_lock(&ep->connections_lock);
     if (!find_connection_locked(ep, connid)) {
-        nl_connection_t *conn = nl_connection_create(connid, from, from_len, true, channel_count,
+        wn_connection_t *conn = wn_connection_create(connid, from, from_len, true, channel_count,
                                                        keys.c2s_key, keys.s2c_key, keys.c2s_salt, keys.s2c_salt,
                                                        ep->config.connection_timeout_ms,
                                                        ep->config.keepalive_interval_ms, now);
@@ -1290,25 +1290,25 @@ static void handle_connect_challenge(nl_endpoint_t *ep, const uint8_t *buf, size
             conn->rate_last_refill_ms = now;
             if (ep->config.recv_window_bytes) {
                 uint32_t rw = ep->config.recv_window_bytes;
-                if (rw > NL_RECV_WINDOW_MAX) rw = NL_RECV_WINDOW_MAX;
+                if (rw > WN_RECV_WINDOW_MAX) rw = WN_RECV_WINDOW_MAX;
                 conn->recv_window_size = rw;
             }
             int slot = find_free_connection_slot_locked(ep);
-            if (slot >= 0) ep->connections[slot] = conn; else nl_connection_destroy(conn);
+            if (slot >= 0) ep->connections[slot] = conn; else wn_connection_destroy(conn);
         }
     }
     pthread_mutex_unlock(&ep->connections_lock);
-    nl_crypto_wipe(&keys, sizeof(keys));
+    wn_crypto_wipe(&keys, sizeof(keys));
 
-    ep_send_nl(ep, from, from_len, out, o);
+    ep_send_wn(ep, from, from_len, out, o);
 }
 
-static void handle_connect_denied(nl_endpoint_t *ep, const uint8_t *buf, size_t len,
+static void handle_connect_denied(wn_endpoint_t *ep, const uint8_t *buf, size_t len,
                                    const struct sockaddr_storage *from) {
-    if (len < NL_CONNECT_DENIED_SIZE) return;
+    if (len < WN_CONNECT_DENIED_SIZE) return;
     uint8_t reason = buf[1];
 
-    nl_peer_id_t connid = NL_INVALID_PEER;
+    wn_peer_id_t connid = WN_INVALID_PEER;
     bool was_accepted = false;
 
     pthread_mutex_lock(&ep->pending_lock);
@@ -1331,19 +1331,19 @@ static void handle_connect_denied(nl_endpoint_t *ep, const uint8_t *buf, size_t 
      * (server's table filled between CHALLENGE and RESPONSE). Tear that
      * half-open connection down so CONNECT_FAILED isn't followed later by
      * a spurious DISCONNECT. */
-    if (was_accepted && connid != NL_INVALID_PEER) {
+    if (was_accepted && connid != WN_INVALID_PEER) {
         pthread_mutex_lock(&ep->connections_lock);
-        nl_connection_t *conn = find_connection_locked(ep, connid);
+        wn_connection_t *conn = find_connection_locked(ep, connid);
         if (conn && conn->is_client_side && !conn->handshake_confirmed) {
             int slot = find_connection_slot_by_ptr_locked(ep, conn);
             if (slot >= 0) ep->connections[slot] = NULL;
-            nl_connection_destroy(conn);
+            wn_connection_destroy(conn);
         }
         pthread_mutex_unlock(&ep->connections_lock);
     }
 
-    nl_event_t ev; memset(&ev, 0, sizeof(ev));
-    ev.event_type = NL_EVENT_CONNECT_FAILED;
+    wn_event_t ev; memset(&ev, 0, sizeof(ev));
+    ev.event_type = WN_EVENT_CONNECT_FAILED;
     ev.peer = connid;
     ev.disconnect_reason = deny_reason_to_result(reason);
     push_event(ep, ev, NULL, 0);
@@ -1351,16 +1351,16 @@ static void handle_connect_denied(nl_endpoint_t *ep, const uint8_t *buf, size_t 
 
 /* ---- discovery ---- */
 
-static void process_discovery_packet(nl_endpoint_t *ep, const uint8_t *buf, size_t len,
+static void process_discovery_packet(wn_endpoint_t *ep, const uint8_t *buf, size_t len,
                                       const struct sockaddr_storage *from, socklen_t from_len) {
     if (len < 1) return;
     uint8_t type = buf[0];
-    if (type == NL_PKT_DISCOVERY_REQUEST && ep->is_server) {
-        if (ep->config.transport == NL_TRANSPORT_WEBSOCKET) return; /* discovery is UDP/LAN only */
-        if (len < NL_DISCOVERY_REQUEST_SIZE) return;
-        uint32_t magic = nl_get_u32(buf + 1);
-        if (magic != NL_MAGIC) return;
-        uint32_t nonce = nl_get_u32(buf + 5);
+    if (type == WN_PKT_DISCOVERY_REQUEST && ep->is_server) {
+        if (ep->config.transport == WN_TRANSPORT_WEBSOCKET) return; /* discovery is UDP/LAN only */
+        if (len < WN_DISCOVERY_REQUEST_SIZE) return;
+        uint32_t magic = wn_get_u32(buf + 1);
+        if (magic != WN_MAGIC) return;
+        uint32_t nonce = wn_get_u32(buf + 5);
         /* Own budget so a discovery flood can't starve the handshake
          * rate limiter (and vice versa). */
         pthread_mutex_lock(&ep->discovery_lock);
@@ -1374,21 +1374,21 @@ static void process_discovery_packet(nl_endpoint_t *ep, const uint8_t *buf, size
 
         const char *name = ep->config.server_name ? ep->config.server_name : "";
         size_t name_len = strlen(name);
-        if (name_len > NL_SERVER_NAME_MAX - 1) name_len = NL_SERVER_NAME_MAX - 1;
+        if (name_len > WN_SERVER_NAME_MAX - 1) name_len = WN_SERVER_NAME_MAX - 1;
 
-        uint8_t out[NL_DISCOVERY_RESPONSE_MIN_SIZE + NL_SERVER_NAME_MAX];
+        uint8_t out[WN_DISCOVERY_RESPONSE_MIN_SIZE + WN_SERVER_NAME_MAX];
         size_t o = 0;
-        out[o++] = NL_PKT_DISCOVERY_RESPONSE;
-        nl_put_u32(out + o, nonce); o += 4;
+        out[o++] = WN_PKT_DISCOVERY_RESPONSE;
+        wn_put_u32(out + o, nonce); o += 4;
         struct sockaddr_storage local_addr; socklen_t local_len = sizeof(local_addr);
         uint16_t server_port = 0;
         if (getsockname(ep->sock, (struct sockaddr *)&local_addr, &local_len) == 0) {
-            nl_address_t a; sockaddr_to_nl_address(&local_addr, local_len, &a);
+            wn_address_t a; sockaddr_to_wn_address(&local_addr, local_len, &a);
             server_port = a.port;
         }
-        nl_put_u16(out + o, server_port); o += 2;
-        nl_put_u32(out + o, player_count); o += 4;
-        nl_put_u32(out + o, ep->config.max_connections ? ep->config.max_connections : 64); o += 4;
+        wn_put_u16(out + o, server_port); o += 2;
+        wn_put_u32(out + o, player_count); o += 4;
+        wn_put_u32(out + o, ep->config.max_connections ? ep->config.max_connections : 64); o += 4;
         out[o++] = (uint8_t)name_len;
         memcpy(out + o, name, name_len); o += name_len;
 
@@ -1400,17 +1400,17 @@ static void process_discovery_packet(nl_endpoint_t *ep, const uint8_t *buf, size
          * main socket replying to an IPv4 prober). */
         if (sendto(ep->sock, out, o, 0, (const struct sockaddr *)from, from_len) < 0) {
             pthread_mutex_lock(&ep->discovery_lock);
-            nl_socket_t dsock = ep->discovery_sock;
+            wn_socket_t dsock = ep->discovery_sock;
             pthread_mutex_unlock(&ep->discovery_lock);
-            if (dsock != NL_INVALID_SOCKET) {
+            if (dsock != WN_INVALID_SOCKET) {
                 sendto(dsock, out, o, 0, (const struct sockaddr *)from, from_len);
             }
         }
-    } else if (type == NL_PKT_DISCOVERY_RESPONSE && !ep->is_server) {
-        if (ep->config.transport == NL_TRANSPORT_WEBSOCKET) return;
-        if (len < NL_DISCOVERY_RESPONSE_MIN_SIZE) return;
+    } else if (type == WN_PKT_DISCOVERY_RESPONSE && !ep->is_server) {
+        if (ep->config.transport == WN_TRANSPORT_WEBSOCKET) return;
+        if (len < WN_DISCOVERY_RESPONSE_MIN_SIZE) return;
         size_t off = 1;
-        uint32_t nonce = nl_get_u32(buf + off); off += 4;
+        uint32_t nonce = wn_get_u32(buf + off); off += 4;
         /* Only the most recent probe's nonce is accepted: a delayed or
          * spoofed reply from an earlier probe (or a forged one, which
          * would also have to race the random nonce) is dropped rather
@@ -1424,17 +1424,17 @@ static void process_discovery_packet(nl_endpoint_t *ep, const uint8_t *buf, size
          * The socket source is the only trustworthy origin -- and with
          * servers replying from the game socket, it IS the game port. */
         off += 2; /* skip server_port */
-        uint32_t player_count = nl_get_u32(buf + off); off += 4;
-        uint32_t max_players = nl_get_u32(buf + off); off += 4;
+        uint32_t player_count = wn_get_u32(buf + off); off += 4;
+        uint32_t max_players = wn_get_u32(buf + off); off += 4;
         uint8_t name_len = buf[off++];
         if (off + name_len > len) return;
 
-        nl_event_t ev; memset(&ev, 0, sizeof(ev));
-        ev.event_type = NL_EVENT_DISCOVERY_REPLY;
-        sockaddr_to_nl_address(from, from_len, &ev.from_address);
+        wn_event_t ev; memset(&ev, 0, sizeof(ev));
+        ev.event_type = WN_EVENT_DISCOVERY_REPLY;
+        sockaddr_to_wn_address(from, from_len, &ev.from_address);
         ev.server_player_count = player_count;
         ev.server_max_players = max_players;
-        size_t copy_len = name_len < NL_SERVER_NAME_MAX - 1 ? name_len : NL_SERVER_NAME_MAX - 1;
+        size_t copy_len = name_len < WN_SERVER_NAME_MAX - 1 ? name_len : WN_SERVER_NAME_MAX - 1;
         memcpy(ev.server_name, buf + off, copy_len);
         ev.server_name[copy_len] = '\0';
         push_event(ep, ev, NULL, 0);
@@ -1443,36 +1443,36 @@ static void process_discovery_packet(nl_endpoint_t *ep, const uint8_t *buf, size
 
 /* ---- main packet dispatch ---- */
 
-static void process_main_packet(nl_endpoint_t *ep, const uint8_t *buf, size_t len,
+static void process_main_packet(wn_endpoint_t *ep, const uint8_t *buf, size_t len,
                                  const struct sockaddr_storage *from, socklen_t from_len, uint64_t now) {
     if (len < 1) return;
     uint8_t type = buf[0];
     switch (type) {
-        case NL_PKT_CONNECT_REQUEST:
+        case WN_PKT_CONNECT_REQUEST:
             if (ep->is_server) handle_connect_request(ep, buf, len, from, from_len, now);
             break;
-        case NL_PKT_CONNECT_CHALLENGE:
+        case WN_PKT_CONNECT_CHALLENGE:
             if (!ep->is_server) handle_connect_challenge(ep, buf, len, from, from_len, now);
             break;
-        case NL_PKT_CONNECT_RESPONSE:
+        case WN_PKT_CONNECT_RESPONSE:
             if (ep->is_server) handle_connect_response(ep, buf, len, from, from_len, now);
             break;
-        case NL_PKT_CONNECT_DENIED:
+        case WN_PKT_CONNECT_DENIED:
             if (!ep->is_server) handle_connect_denied(ep, buf, len, from);
             break;
-        case NL_PKT_DATA:
-        case NL_PKT_ACK:
-        case NL_PKT_KEEPALIVE:
-        case NL_PKT_DISCONNECT:
-        case NL_PKT_CONNECT_ACCEPTED: {
+        case WN_PKT_DATA:
+        case WN_PKT_ACK:
+        case WN_PKT_KEEPALIVE:
+        case WN_PKT_DISCONNECT:
+        case WN_PKT_CONNECT_ACCEPTED: {
             if (len < 1 + 8) return;
-            uint64_t connid = nl_get_u64(buf + 1);
+            uint64_t connid = wn_get_u64(buf + 1);
             pthread_mutex_lock(&ep->connections_lock);
-            nl_connection_t *conn = find_connection_locked(ep, connid);
+            wn_connection_t *conn = find_connection_locked(ep, connid);
             if (conn) {
                 conn_ctx_t cctx = { ep, conn };
-                nl_conn_callbacks_t cb = make_callbacks(&cctx);
-                nl_connection_on_packet(conn, type, buf + 1, len - 1, now, &cb);
+                wn_conn_callbacks_t cb = make_callbacks(&cctx);
+                wn_connection_on_packet(conn, type, buf + 1, len - 1, now, &cb);
             }
             pthread_mutex_unlock(&ep->connections_lock);
             break;
@@ -1482,15 +1482,15 @@ static void process_main_packet(nl_endpoint_t *ep, const uint8_t *buf, size_t le
     }
 }
 
-static void tick_all_connections(nl_endpoint_t *ep, uint64_t now) {
+static void tick_all_connections(wn_endpoint_t *ep, uint64_t now) {
     pthread_mutex_lock(&ep->connections_lock);
-    for (int i = 0; i < NL_MAX_CONNECTIONS_INTERNAL; i++) {
-        nl_connection_t *conn = ep->connections[i];
+    for (int i = 0; i < WN_MAX_CONNECTIONS_INTERNAL; i++) {
+        wn_connection_t *conn = ep->connections[i];
         if (!conn) continue;
         conn_ctx_t cctx = { ep, conn };
-        nl_conn_callbacks_t cb = make_callbacks(&cctx);
-        nl_connection_tick(conn, now, &cb);
-        /* Note: if nl_connection_tick disconnected this connection, its
+        wn_conn_callbacks_t cb = make_callbacks(&cctx);
+        wn_connection_tick(conn, now, &cb);
+        /* Note: if wn_connection_tick disconnected this connection, its
          * on_disconnected callback already nulled ep->connections[i] and
          * freed conn -- we must not touch `conn` again after this call. */
     }
@@ -1501,45 +1501,45 @@ static void tick_all_connections(nl_endpoint_t *ep, uint64_t now) {
  * have set ack_dirty on a lane with no reverse traffic to piggyback on.
  * Without this, a one-way sender would only ever learn of delivery via
  * its own retransmissions (or the 1s keepalive cadence at best). */
-static void flush_all_acks(nl_endpoint_t *ep, uint64_t now) {
+static void flush_all_acks(wn_endpoint_t *ep, uint64_t now) {
     pthread_mutex_lock(&ep->connections_lock);
-    for (int i = 0; i < NL_MAX_CONNECTIONS_INTERNAL; i++) {
-        nl_connection_t *conn = ep->connections[i];
+    for (int i = 0; i < WN_MAX_CONNECTIONS_INTERNAL; i++) {
+        wn_connection_t *conn = ep->connections[i];
         if (!conn) continue;
         conn_ctx_t cctx = { ep, conn };
-        nl_conn_callbacks_t cb = make_callbacks(&cctx);
-        nl_connection_flush_acks(conn, now, &cb);
+        wn_conn_callbacks_t cb = make_callbacks(&cctx);
+        wn_connection_flush_acks(conn, now, &cb);
     }
     pthread_mutex_unlock(&ep->connections_lock);
 }
 
 /* ---- I/O thread ---- */
 
-/* Deliver one complete WebSocket message (an NL packet, or a control
+/* Deliver one complete WebSocket message (an WN packet, or a control
  * frame to answer). Returns false if the link should be torn down. */
-static bool ws_handle_message(nl_endpoint_t *ep, ws_link_t *link, uint8_t opcode,
+static bool ws_handle_message(wn_endpoint_t *ep, ws_link_t *link, uint8_t opcode,
                               const uint8_t *msg, size_t len, uint64_t now) {
-    if (opcode == NL_WS_OPCODE_PING) {
+    if (opcode == WN_WS_OPCODE_PING) {
         uint8_t pong[128];
-        size_t n = nl_ws_encode(NL_WS_OPCODE_PONG, msg, len, !ep->is_server, pong, sizeof(pong));
+        size_t n = wn_ws_encode(WN_WS_OPCODE_PONG, msg, len, !ep->is_server, pong, sizeof(pong));
         if (n > 0) sock_write_all(link->sock, pong, n);
         return true;
     }
-    if (opcode == NL_WS_OPCODE_PONG) return true;
-    if (opcode == NL_WS_OPCODE_CLOSE) {
+    if (opcode == WN_WS_OPCODE_PONG) return true;
+    if (opcode == WN_WS_OPCODE_CLOSE) {
         /* Echo close then drop. */
         uint8_t cl[16];
-        size_t n = nl_ws_encode(NL_WS_OPCODE_CLOSE, msg, len, !ep->is_server, cl, sizeof(cl));
+        size_t n = wn_ws_encode(WN_WS_OPCODE_CLOSE, msg, len, !ep->is_server, cl, sizeof(cl));
         if (n > 0) sock_write_all(link->sock, cl, n);
         return false;
     }
-    if (opcode != NL_WS_OPCODE_BINARY && opcode != NL_WS_OPCODE_TEXT) return false;
+    if (opcode != WN_WS_OPCODE_BINARY && opcode != WN_WS_OPCODE_TEXT) return false;
     process_main_packet(ep, msg, len, &link->addr, link->addr_len, now);
     return true;
 }
 
 /* After TCP is readable on a WS link: complete HTTP upgrade if needed,
- * then decode frames and dispatch NL packets. Returns false if the link
+ * then decode frames and dispatch WN packets. Returns false if the link
  * should be closed. */
 /* Max 2KB recv chunks one link may cost the IO thread per ready cycle.
  * The recv loop below otherwise drains the socket until EAGAIN, so a
@@ -1548,48 +1548,48 @@ static bool ws_handle_message(nl_endpoint_t *ep, ws_link_t *link, uint8_t opcode
  * UDP socket for as long as it keeps sending. poll() is level-triggered,
  * so anything the peer sent beyond the cap is still picked up next
  * cycle. */
-#define NL_WS_READ_CHUNKS_PER_CYCLE 32
+#define WN_WS_READ_CHUNKS_PER_CYCLE 32
 
-static bool ws_read_link(nl_endpoint_t *ep, ws_link_t *link, uint64_t now) {
-    uint8_t chunk[NL_WS_RECV_CHUNK];
+static bool ws_read_link(wn_endpoint_t *ep, ws_link_t *link, uint64_t now) {
+    uint8_t chunk[WN_WS_RECV_CHUNK];
     int chunks = 0;
     for (;;) {
-        if (++chunks > NL_WS_READ_CHUNKS_PER_CYCLE) break; /* resumed next poll cycle */
+        if (++chunks > WN_WS_READ_CHUNKS_PER_CYCLE) break; /* resumed next poll cycle */
         ssize_t n = recv(link->sock, chunk, sizeof(chunk), 0);
         if (n == 0) return false; /* orderly shutdown */
         if (n < 0) {
-            int e = nl_sock_errno();
+            int e = wn_sock_errno();
             if (e == EAGAIN || e == EWOULDBLOCK) return true;
             return false;
         }
         link->last_activity_ms = now;
 
         if (!link->upgraded) {
-            if (link->http_len + (size_t)n > NL_WS_HTTP_MAX) return false;
+            if (link->http_len + (size_t)n > WN_WS_HTTP_MAX) return false;
             memcpy(link->http_buf + link->http_len, chunk, (size_t)n);
             link->http_len += (size_t)n;
             size_t hdr_end = 0;
-            if (!nl_ws_http_header_complete(link->http_buf, link->http_len, &hdr_end))
+            if (!wn_ws_http_header_complete(link->http_buf, link->http_len, &hdr_end))
                 continue; /* need more HTTP bytes; poll again on this fd */
 
             if (link->is_server_side) {
                 char resp[512];
                 size_t resp_len = 0;
-                if (!nl_ws_build_server_response(link->http_buf, hdr_end, resp, sizeof(resp), &resp_len))
+                if (!wn_ws_build_server_response(link->http_buf, hdr_end, resp, sizeof(resp), &resp_len))
                     return false;
                 if (!sock_write_all(link->sock, (const uint8_t *)resp, resp_len))
                     return false;
                 link->upgraded = true;
             } else {
                 if (!link->client_sent_request ||
-                    !nl_ws_check_server_response(link->http_buf, hdr_end, link->client_key))
+                    !wn_ws_check_server_response(link->http_buf, hdr_end, link->client_key))
                     return false;
                 link->upgraded = true;
                 /* Flush the CONNECT_REQUEST we held back until the
-                 * upgrade completed (UDP would have sent it in nl_connect). */
+                 * upgrade completed (UDP would have sent it in wn_connect). */
                 pthread_mutex_lock(&ep->pending_lock);
                 pending_t *p = find_pending_by_addr_locked(ep, &link->addr, PENDING_CLIENT_AWAIT_CHALLENGE);
-                uint8_t req[NL_CONNECT_REQUEST_SIZE];
+                uint8_t req[WN_CONNECT_REQUEST_SIZE];
                 uint16_t req_len = 0;
                 if (p && p->retry_packet_len) {
                     memcpy(req, p->retry_packet, p->retry_packet_len);
@@ -1598,8 +1598,8 @@ static bool ws_read_link(nl_endpoint_t *ep, ws_link_t *link, uint64_t now) {
                 }
                 pthread_mutex_unlock(&ep->pending_lock);
                 if (req_len > 0) {
-                    uint8_t frame[16 + NL_WS_MAX_MESSAGE];
-                    size_t fn = nl_ws_encode_binary(req, req_len, !ep->is_server, frame, sizeof(frame));
+                    uint8_t frame[16 + WN_WS_MAX_MESSAGE];
+                    size_t fn = wn_ws_encode_binary(req, req_len, !ep->is_server, frame, sizeof(frame));
                     if (fn == 0 || !sock_write_all(link->sock, frame, fn)) return false;
                 }
             }
@@ -1607,32 +1607,32 @@ static bool ws_read_link(nl_endpoint_t *ep, ws_link_t *link, uint64_t now) {
             /* Any bytes past the HTTP header are already-started frames. */
             size_t left = link->http_len - hdr_end;
             if (left > 0) {
-                if (nl_ws_decoder_feed(&link->decoder, (const uint8_t *)link->http_buf + hdr_end, left) < 0)
+                if (wn_ws_decoder_feed(&link->decoder, (const uint8_t *)link->http_buf + hdr_end, left) < 0)
                     return false;
             }
             link->http_len = 0;
         } else {
-            if (nl_ws_decoder_feed(&link->decoder, chunk, (size_t)n) < 0) return false;
+            if (wn_ws_decoder_feed(&link->decoder, chunk, (size_t)n) < 0) return false;
         }
 
         /* Drain any complete messages (both right after upgrade and on
          * subsequent reads). */
         for (;;) {
-            uint8_t op = 0, msg[NL_WS_MAX_MESSAGE];
+            uint8_t op = 0, msg[WN_WS_MAX_MESSAGE];
             size_t mlen = 0;
-            int r = nl_ws_decoder_next(&link->decoder, &op, msg, sizeof(msg), &mlen);
+            int r = wn_ws_decoder_next(&link->decoder, &op, msg, sizeof(msg), &mlen);
             if (r == 0) break;
             if (r < 0) return false;
             if (!ws_handle_message(ep, link, op, msg, mlen, now)) return false;
         }
         /* Loop for more TCP data until EAGAIN or the per-cycle chunk cap
-         * (fair share: see NL_WS_READ_CHUNKS_PER_CYCLE). */
+         * (fair share: see WN_WS_READ_CHUNKS_PER_CYCLE). */
     }
     return true;
 }
 
 /* Client-only: nonblocking TCP connect completed (POLLOUT). */
-static bool ws_client_finish_connect(nl_endpoint_t *ep, ws_link_t *link) {
+static bool ws_client_finish_connect(wn_endpoint_t *ep, ws_link_t *link) {
     int err = 0;
     socklen_t elen = sizeof(err);
     if (getsockopt(link->sock, SOL_SOCKET, SO_ERROR, &err, &elen) != 0 || err != 0) {
@@ -1641,10 +1641,10 @@ static bool ws_client_finish_connect(nl_endpoint_t *ep, ws_link_t *link) {
     }
     link->client_connecting = false;
 
-    nl_address_t ha;
-    sockaddr_to_nl_address(&link->addr, link->addr_len, &ha);
+    wn_address_t ha;
+    sockaddr_to_wn_address(&link->addr, link->addr_len, &ha);
     size_t req_len = 0;
-    if (!nl_ws_build_client_request(ha.host, ha.port, "/", link->http_buf, sizeof(link->http_buf),
+    if (!wn_ws_build_client_request(ha.host, ha.port, "/", link->http_buf, sizeof(link->http_buf),
                                     &req_len, link->client_key))
         return false;
     if (!sock_write_all(link->sock, (const uint8_t *)link->http_buf, req_len)) {
@@ -1659,33 +1659,33 @@ static bool ws_client_finish_connect(nl_endpoint_t *ep, ws_link_t *link) {
 }
 
 /* Accept one inbound TCP connection on a WebSocket server. */
-static void ws_accept_one(nl_endpoint_t *ep) {
+static void ws_accept_one(wn_endpoint_t *ep) {
     struct sockaddr_storage addr;
     socklen_t alen = sizeof(addr);
     memset(&addr, 0, sizeof(addr));
-    nl_socket_t s = accept(ep->listen_sock, (struct sockaddr *)&addr, &alen);
-    if (s == NL_INVALID_SOCKET) return;
+    wn_socket_t s = accept(ep->listen_sock, (struct sockaddr *)&addr, &alen);
+    if (s == WN_INVALID_SOCKET) return;
 
     pthread_mutex_lock(&ep->ws_links_lock);
     int live = 0;
     for (ws_link_t *l = ep->ws_links; l; l = l->next) live++;
-    if (live >= NL_WS_LINK_MAX) {
+    if (live >= WN_WS_LINK_MAX) {
         pthread_mutex_unlock(&ep->ws_links_lock);
-        nl_close_socket(s);
+        wn_close_socket(s);
         return;
     }
     pthread_mutex_unlock(&ep->ws_links_lock);
 
     ws_link_t *link = (ws_link_t *)calloc(1, sizeof(ws_link_t));
-    if (!link) { nl_close_socket(s); return; }
+    if (!link) { wn_close_socket(s); return; }
     link->sock = s;
     link->addr = addr;
     link->addr_len = alen;
     link->is_server_side = true;
     link->created_ms = now_ms();
     link->last_activity_ms = link->created_ms;
-    nl_ws_decoder_init(&link->decoder);
-    nl_socket_set_nonblocking(s);
+    wn_ws_decoder_init(&link->decoder);
+    wn_socket_set_nonblocking(s);
 
     pthread_mutex_lock(&ep->ws_links_lock);
     ws_add_link_locked(ep, link);
@@ -1693,38 +1693,38 @@ static void ws_accept_one(nl_endpoint_t *ep) {
 }
 
 static void *io_thread_main(void *arg) {
-    nl_endpoint_t *ep = (nl_endpoint_t *)arg;
-    uint8_t buf[NL_RECV_BUFFER_SIZE];
+    wn_endpoint_t *ep = (wn_endpoint_t *)arg;
+    uint8_t buf[WN_RECV_BUFFER_SIZE];
 
     /* poll slots: [optional udp main] [optional discovery] [optional listen]
      *             [ws links...] */
     enum { POLL_STATIC = 3 };
-    struct pollfd fds[POLL_STATIC + NL_WS_LINK_MAX];
-    ws_link_t *link_of[POLL_STATIC + NL_WS_LINK_MAX];
+    struct pollfd fds[POLL_STATIC + WN_WS_LINK_MAX];
+    ws_link_t *link_of[POLL_STATIC + WN_WS_LINK_MAX];
 
     while (atomic_load(&ep->running)) {
         int nfds = 0;
         int main_idx = -1, disc_idx = -1, listen_idx = -1;
 
-        if (ep->sock != NL_INVALID_SOCKET) {
+        if (ep->sock != WN_INVALID_SOCKET) {
             main_idx = nfds;
             fds[nfds].fd = ep->sock; fds[nfds].events = POLLIN; fds[nfds].revents = 0; nfds++;
         }
         pthread_mutex_lock(&ep->discovery_lock);
-        nl_socket_t dsock = ep->discovery_sock;
+        wn_socket_t dsock = ep->discovery_sock;
         pthread_mutex_unlock(&ep->discovery_lock);
-        if (dsock != NL_INVALID_SOCKET) {
+        if (dsock != WN_INVALID_SOCKET) {
             disc_idx = nfds;
             fds[nfds].fd = dsock; fds[nfds].events = POLLIN; fds[nfds].revents = 0; nfds++;
         }
-        if (ep->listen_sock != NL_INVALID_SOCKET) {
+        if (ep->listen_sock != WN_INVALID_SOCKET) {
             listen_idx = nfds;
             fds[nfds].fd = ep->listen_sock; fds[nfds].events = POLLIN; fds[nfds].revents = 0; nfds++;
         }
 
         int nlinks = 0;
         pthread_mutex_lock(&ep->ws_links_lock);
-        for (ws_link_t *l = ep->ws_links; l && nfds < POLL_STATIC + NL_WS_LINK_MAX; l = l->next) {
+        for (ws_link_t *l = ep->ws_links; l && nfds < POLL_STATIC + WN_WS_LINK_MAX; l = l->next) {
             /* While the nonblocking connect is in flight the socket is
              * not readable for HTTP yet -- only watch for writability. */
             short ev = l->client_connecting ? POLLOUT : POLLIN;
@@ -1741,7 +1741,7 @@ static void *io_thread_main(void *arg) {
          * checking the pointer is still reachable from ws_links. */
         pthread_mutex_unlock(&ep->ws_links_lock);
 
-        int rc = poll(fds, (nfds_t)nfds, NL_IO_POLL_INTERVAL_MS);
+        int rc = poll(fds, (nfds_t)nfds, WN_IO_POLL_INTERVAL_MS);
         bool got_packets = false;
         uint64_t now = now_ms();
 
@@ -1785,7 +1785,7 @@ static void *io_thread_main(void *arg) {
              * (process_main_packet takes connections_lock; we must not
              * hold ws_links_lock across that). */
             typedef struct { ws_link_t *l; short revents; } ready_t;
-            ready_t ready[NL_WS_LINK_MAX];
+            ready_t ready[WN_WS_LINK_MAX];
             int nready = 0;
             pthread_mutex_lock(&ep->ws_links_lock);
             for (int i = 0; i < nfds; i++) {
@@ -1795,7 +1795,7 @@ static void *io_thread_main(void *arg) {
                 bool live = false;
                 for (ws_link_t *it = ep->ws_links; it; it = it->next)
                     if (it == l) { live = true; break; }
-                if (live && nready < NL_WS_LINK_MAX) {
+                if (live && nready < WN_WS_LINK_MAX) {
                     ready[nready].l = l;
                     ready[nready].revents = fds[i].revents;
                     nready++;
@@ -1820,7 +1820,7 @@ static void *io_thread_main(void *arg) {
                 if (drop) {
                     struct sockaddr_storage a = l->addr;
                     ws_close_link(ep, l);
-                    /* Tear down NL state for this peer (if any). Safe:
+                    /* Tear down WN state for this peer (if any). Safe:
                      * we do not hold connections/pending locks. */
                     ws_link_drop_peer_state(ep, &a);
                 }
@@ -1846,48 +1846,48 @@ static void *io_thread_main(void *arg) {
 
 /* ---- endpoint construction ---- */
 
-static nl_endpoint_t *endpoint_alloc(bool is_server, const nl_config_t *cfg) {
-    nl_endpoint_t *ep = (nl_endpoint_t *)calloc(1, sizeof(nl_endpoint_t));
+static wn_endpoint_t *endpoint_alloc(bool is_server, const wn_config_t *cfg) {
+    wn_endpoint_t *ep = (wn_endpoint_t *)calloc(1, sizeof(wn_endpoint_t));
     if (!ep) return NULL;
     ep->is_server = is_server;
     ep->config = *cfg;
     if (ep->config.channel_count == 0) ep->config.channel_count = 4;
-    if (ep->config.channel_count > NL_MAX_CHANNELS) ep->config.channel_count = NL_MAX_CHANNELS;
+    if (ep->config.channel_count > WN_MAX_CHANNELS) ep->config.channel_count = WN_MAX_CHANNELS;
     if (ep->config.max_connections == 0) ep->config.max_connections = 64;
-    /* Hard internal table is NL_MAX_CONNECTIONS_INTERNAL; a larger config
+    /* Hard internal table is WN_MAX_CONNECTIONS_INTERNAL; a larger config
      * value would make REQUEST-time checks pass and then fail silently at
      * slot allocation. Clamp so discovery's advertised max matches reality. */
-    if (ep->config.max_connections > NL_MAX_CONNECTIONS_INTERNAL)
-        ep->config.max_connections = NL_MAX_CONNECTIONS_INTERNAL;
+    if (ep->config.max_connections > WN_MAX_CONNECTIONS_INTERNAL)
+        ep->config.max_connections = WN_MAX_CONNECTIONS_INTERNAL;
     if (ep->config.connection_timeout_ms == 0) ep->config.connection_timeout_ms = 10000;
     if (ep->config.keepalive_interval_ms == 0) ep->config.keepalive_interval_ms = 1000;
-    if (ep->config.capabilities == 0) ep->config.capabilities = NL_CAP_DEFAULT;
+    if (ep->config.capabilities == 0) ep->config.capabilities = WN_CAP_DEFAULT;
     /* v2 DATA always carries rwnd: never allow the flow-control bit off. */
-    ep->config.capabilities |= NL_CAP_FLOW_CONTROL;
-    if (ep->config.recv_window_bytes > NL_RECV_WINDOW_MAX)
-        ep->config.recv_window_bytes = NL_RECV_WINDOW_MAX;
+    ep->config.capabilities |= WN_CAP_FLOW_CONTROL;
+    if (ep->config.recv_window_bytes > WN_RECV_WINDOW_MAX)
+        ep->config.recv_window_bytes = WN_RECV_WINDOW_MAX;
     /* Resolve the event-queue byte cap: 0 (hand-rolled config) behaves as
      * the library default; the UNLIMITED sentinel restores 1.1.x behavior
      * explicitly. */
     ep->event_queue_cap = ep->config.event_queue_max_bytes
                               ? ep->config.event_queue_max_bytes
-                              : NL_EVENT_QUEUE_MAX_BYTES_DEFAULT;
+                              : WN_EVENT_QUEUE_MAX_BYTES_DEFAULT;
     ep->event_queue_bytes = 0;
     if (cfg->server_name) {
-        strncpy(ep->server_name_buf, cfg->server_name, NL_SERVER_NAME_MAX - 1);
-        ep->server_name_buf[NL_SERVER_NAME_MAX - 1] = '\0';
+        strncpy(ep->server_name_buf, cfg->server_name, WN_SERVER_NAME_MAX - 1);
+        ep->server_name_buf[WN_SERVER_NAME_MAX - 1] = '\0';
         ep->config.server_name = ep->server_name_buf;
     } else {
         ep->config.server_name = NULL;
     }
-    ep->sock = NL_INVALID_SOCKET;
-    ep->listen_sock = NL_INVALID_SOCKET;
-    ep->discovery_sock = NL_INVALID_SOCKET;
+    ep->sock = WN_INVALID_SOCKET;
+    ep->listen_sock = WN_INVALID_SOCKET;
+    ep->discovery_sock = WN_INVALID_SOCKET;
     ep->shutdown = false;
     ep->active_pollers = 0;
     atomic_init(&ep->running, false);
     atomic_init(&ep->io_thread_started, false);
-    nl_crypto_random(ep->server_secret, 32);
+    wn_crypto_random(ep->server_secret, 32);
     pthread_mutex_init(&ep->pending_lock, NULL);
     pthread_mutex_init(&ep->connections_lock, NULL);
     pthread_mutex_init(&ep->queue_lock, NULL);
@@ -1897,7 +1897,7 @@ static nl_endpoint_t *endpoint_alloc(bool is_server, const nl_config_t *cfg) {
     return ep;
 }
 
-static nl_result_t start_io_thread(nl_endpoint_t *ep) {
+static wn_result_t start_io_thread(wn_endpoint_t *ep) {
     /* Both flags are published BEFORE pthread_create: the new thread reads
      * them on its first cycle (ws_drain_dead), and a store after the
      * create leaves a window where it observes them unset. */
@@ -1906,19 +1906,19 @@ static nl_result_t start_io_thread(nl_endpoint_t *ep) {
     if (pthread_create(&ep->io_thread, NULL, io_thread_main, ep) != 0) {
         atomic_store(&ep->running, false);
         atomic_store(&ep->io_thread_started, false);
-        return NL_ERR_INTERNAL;
+        return WN_ERR_INTERNAL;
     }
-    return NL_OK;
+    return WN_OK;
 }
 
 /* Free an endpoint that never started its IO thread (construction failure
  * path) or after destroy has joined it. Destroys mutexes/sockets/queue --
  * the previous bare free(ep) leaked all of those and left ASan noise. */
-static void endpoint_free(nl_endpoint_t *ep) {
-    for (int i = 0; i < NL_MAX_CONNECTIONS_INTERNAL; i++) {
-        if (ep->connections[i]) nl_connection_destroy(ep->connections[i]);
+static void endpoint_free(wn_endpoint_t *ep) {
+    for (int i = 0; i < WN_MAX_CONNECTIONS_INTERNAL; i++) {
+        if (ep->connections[i]) wn_connection_destroy(ep->connections[i]);
     }
-    for (int i = 0; i < NL_MAX_PENDING; i++) {
+    for (int i = 0; i < WN_MAX_PENDING; i++) {
         if (ep->pending[i].in_use) release_pending_locked(&ep->pending[i]);
     }
 
@@ -1933,9 +1933,9 @@ static void endpoint_free(nl_endpoint_t *ep) {
         free(b);
     }
 
-    if (ep->sock != NL_INVALID_SOCKET) nl_close_socket(ep->sock);
-    if (ep->listen_sock != NL_INVALID_SOCKET) nl_close_socket(ep->listen_sock);
-    if (ep->discovery_sock != NL_INVALID_SOCKET) nl_close_socket(ep->discovery_sock);
+    if (ep->sock != WN_INVALID_SOCKET) wn_close_socket(ep->sock);
+    if (ep->listen_sock != WN_INVALID_SOCKET) wn_close_socket(ep->listen_sock);
+    if (ep->discovery_sock != WN_INVALID_SOCKET) wn_close_socket(ep->discovery_sock);
     /* Reclaim any WebSocket links still on the live or dead lists. IO
      * thread has already joined (or never started), so nothing else
      * holds pointers into them. */
@@ -1948,36 +1948,36 @@ static void endpoint_free(nl_endpoint_t *ep) {
     pthread_mutex_destroy(&ep->ws_links_lock);
     pthread_cond_destroy(&ep->queue_cond);
 
-    nl_crypto_wipe(ep->server_secret, sizeof(ep->server_secret));
+    wn_crypto_wipe(ep->server_secret, sizeof(ep->server_secret));
     free(ep);
 }
 
-nl_result_t nl_server_create(const nl_address_t *bind_addr, const nl_config_t *cfg, nl_endpoint_t **out_endpoint) {
-    if (!bind_addr || !out_endpoint) return NL_ERR_INVALID_ARGUMENT;
-    nl_sockets_global_init();
-    nl_config_t local_cfg;
-    if (cfg) local_cfg = *cfg; else nl_config_default(&local_cfg);
+wn_result_t wn_server_create(const wn_address_t *bind_addr, const wn_config_t *cfg, wn_endpoint_t **out_endpoint) {
+    if (!bind_addr || !out_endpoint) return WN_ERR_INVALID_ARGUMENT;
+    wn_sockets_global_init();
+    wn_config_t local_cfg;
+    if (cfg) local_cfg = *cfg; else wn_config_default(&local_cfg);
 
-    if (local_cfg.transport != NL_TRANSPORT_UDP && local_cfg.transport != NL_TRANSPORT_WEBSOCKET)
-        return NL_ERR_UNSUPPORTED;
+    if (local_cfg.transport != WN_TRANSPORT_UDP && local_cfg.transport != WN_TRANSPORT_WEBSOCKET)
+        return WN_ERR_UNSUPPORTED;
     /* No cleartext mode: the handshake always X25519+HKDFs session keys and
      * every post-handshake packet is AEAD-encrypted. Reject at construction
      * rather than silently encrypting anyway or shipping a protocol hole. */
-    if (!local_cfg.encryption_enabled) return NL_ERR_UNSUPPORTED;
+    if (!local_cfg.encryption_enabled) return WN_ERR_UNSUPPORTED;
 
-    nl_endpoint_t *ep = endpoint_alloc(true, &local_cfg);
-    if (!ep) return NL_ERR_OUT_OF_MEMORY;
+    wn_endpoint_t *ep = endpoint_alloc(true, &local_cfg);
+    if (!ep) return WN_ERR_OUT_OF_MEMORY;
 
-    int socktype = (local_cfg.transport == NL_TRANSPORT_WEBSOCKET) ? SOCK_STREAM : SOCK_DGRAM;
+    int socktype = (local_cfg.transport == WN_TRANSPORT_WEBSOCKET) ? SOCK_STREAM : SOCK_DGRAM;
     struct sockaddr_storage addr; socklen_t addr_len; int family;
     if (!resolve_address(bind_addr, true, socktype, &addr, &addr_len, &family)) {
         endpoint_free(ep);
-        return NL_ERR_INVALID_ARGUMENT;
+        return WN_ERR_INVALID_ARGUMENT;
     }
 
-    if (local_cfg.transport == NL_TRANSPORT_WEBSOCKET) {
+    if (local_cfg.transport == WN_TRANSPORT_WEBSOCKET) {
         ep->listen_sock = socket(family, SOCK_STREAM, IPPROTO_TCP);
-        if (ep->listen_sock == NL_INVALID_SOCKET) { endpoint_free(ep); return NL_ERR_SOCKET; }
+        if (ep->listen_sock == WN_INVALID_SOCKET) { endpoint_free(ep); return WN_ERR_SOCKET; }
         int reuse = 1;
         setsockopt(ep->listen_sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 #ifdef IPV6_V6ONLY
@@ -1988,16 +1988,16 @@ nl_result_t nl_server_create(const nl_address_t *bind_addr, const nl_config_t *c
 #endif
         if (bind(ep->listen_sock, (struct sockaddr *)&addr, addr_len) != 0) {
             endpoint_free(ep);
-            return NL_ERR_BIND_FAILED;
+            return WN_ERR_BIND_FAILED;
         }
         if (listen(ep->listen_sock, 128) != 0) {
             endpoint_free(ep);
-            return NL_ERR_SOCKET;
+            return WN_ERR_SOCKET;
         }
-        nl_socket_set_nonblocking(ep->listen_sock);
+        wn_socket_set_nonblocking(ep->listen_sock);
     } else {
         ep->sock = socket(family, SOCK_DGRAM, IPPROTO_UDP);
-        if (ep->sock == NL_INVALID_SOCKET) { endpoint_free(ep); return NL_ERR_SOCKET; }
+        if (ep->sock == WN_INVALID_SOCKET) { endpoint_free(ep); return WN_ERR_SOCKET; }
 
         int reuse = 1;
         setsockopt(ep->sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
@@ -2010,106 +2010,106 @@ nl_result_t nl_server_create(const nl_address_t *bind_addr, const nl_config_t *c
 
         if (bind(ep->sock, (struct sockaddr *)&addr, addr_len) != 0) {
             endpoint_free(ep);
-            return NL_ERR_BIND_FAILED;
+            return WN_ERR_BIND_FAILED;
         }
-        nl_socket_set_nonblocking(ep->sock);
+        wn_socket_set_nonblocking(ep->sock);
     }
 
-    nl_result_t r = start_io_thread(ep);
-    if (r != NL_OK) {
+    wn_result_t r = start_io_thread(ep);
+    if (r != WN_OK) {
         endpoint_free(ep);
         return r;
     }
 
     *out_endpoint = ep;
-    return NL_OK;
+    return WN_OK;
 }
 
-nl_result_t nl_client_create(const nl_config_t *cfg, nl_endpoint_t **out_endpoint) {
-    if (!out_endpoint) return NL_ERR_INVALID_ARGUMENT;
-    nl_sockets_global_init();
-    nl_config_t local_cfg;
-    if (cfg) local_cfg = *cfg; else nl_config_default(&local_cfg);
-    if (local_cfg.transport != NL_TRANSPORT_UDP && local_cfg.transport != NL_TRANSPORT_WEBSOCKET)
-        return NL_ERR_UNSUPPORTED;
-    if (!local_cfg.encryption_enabled) return NL_ERR_UNSUPPORTED;
+wn_result_t wn_client_create(const wn_config_t *cfg, wn_endpoint_t **out_endpoint) {
+    if (!out_endpoint) return WN_ERR_INVALID_ARGUMENT;
+    wn_sockets_global_init();
+    wn_config_t local_cfg;
+    if (cfg) local_cfg = *cfg; else wn_config_default(&local_cfg);
+    if (local_cfg.transport != WN_TRANSPORT_UDP && local_cfg.transport != WN_TRANSPORT_WEBSOCKET)
+        return WN_ERR_UNSUPPORTED;
+    if (!local_cfg.encryption_enabled) return WN_ERR_UNSUPPORTED;
 
-    nl_endpoint_t *ep = endpoint_alloc(false, &local_cfg);
-    if (!ep) return NL_ERR_OUT_OF_MEMORY;
+    wn_endpoint_t *ep = endpoint_alloc(false, &local_cfg);
+    if (!ep) return WN_ERR_OUT_OF_MEMORY;
 
-    if (local_cfg.transport == NL_TRANSPORT_UDP) {
-        int family = (local_cfg.family == NL_AF_INET) ? AF_INET
-                   : (local_cfg.family == NL_AF_INET6) ? AF_INET6
+    if (local_cfg.transport == WN_TRANSPORT_UDP) {
+        int family = (local_cfg.family == WN_AF_INET) ? AF_INET
+                   : (local_cfg.family == WN_AF_INET6) ? AF_INET6
                    : AF_INET; /* default to IPv4 for the ephemeral client socket; connect() re-resolves per target */
         ep->sock = socket(family, SOCK_DGRAM, IPPROTO_UDP);
-        if (ep->sock == NL_INVALID_SOCKET) { endpoint_free(ep); return NL_ERR_SOCKET; }
-        nl_socket_set_nonblocking(ep->sock);
+        if (ep->sock == WN_INVALID_SOCKET) { endpoint_free(ep); return WN_ERR_SOCKET; }
+        wn_socket_set_nonblocking(ep->sock);
     }
-    /* WebSocket clients open their TCP socket in nl_connect (one dial-out
+    /* WebSocket clients open their TCP socket in wn_connect (one dial-out
      * link per server address); no UDP socket is needed. */
 
-    nl_result_t r = start_io_thread(ep);
-    if (r != NL_OK) {
+    wn_result_t r = start_io_thread(ep);
+    if (r != WN_OK) {
         endpoint_free(ep);
         return r;
     }
 
     *out_endpoint = ep;
-    return NL_OK;
+    return WN_OK;
 }
 
-nl_result_t nl_connect(nl_endpoint_t *ep, const nl_address_t *server_addr, nl_peer_id_t *out_peer) {
-    if (!ep || !server_addr || !out_peer || ep->is_server) return NL_ERR_INVALID_ARGUMENT;
+wn_result_t wn_connect(wn_endpoint_t *ep, const wn_address_t *server_addr, wn_peer_id_t *out_peer) {
+    if (!ep || !server_addr || !out_peer || ep->is_server) return WN_ERR_INVALID_ARGUMENT;
     /* Empty host never defaults to 127.0.0.1: the caller must name an address. */
-    if (server_addr->host[0] == '\0') return NL_ERR_INVALID_ARGUMENT;
+    if (server_addr->host[0] == '\0') return WN_ERR_INVALID_ARGUMENT;
 
-    int socktype = (ep->config.transport == NL_TRANSPORT_WEBSOCKET) ? SOCK_STREAM : SOCK_DGRAM;
+    int socktype = (ep->config.transport == WN_TRANSPORT_WEBSOCKET) ? SOCK_STREAM : SOCK_DGRAM;
     struct sockaddr_storage addr; socklen_t addr_len; int family;
     if (!resolve_address(server_addr, false, socktype, &addr, &addr_len, &family))
-        return NL_ERR_INVALID_ARGUMENT;
+        return WN_ERR_INVALID_ARGUMENT;
 
     /* One in-flight (or established) handshake per server address: two
-     * concurrent nl_connect()s to the same addr would collide on the
+     * concurrent wn_connect()s to the same addr would collide on the
      * pending table's address-keyed lookups and cross-derive keys. */
     pthread_mutex_lock(&ep->connections_lock);
     bool already = false;
-    for (int i = 0; i < NL_MAX_CONNECTIONS_INTERNAL; i++) {
+    for (int i = 0; i < WN_MAX_CONNECTIONS_INTERNAL; i++) {
         if (ep->connections[i] && addr_equal(&ep->connections[i]->addr, &addr)) { already = true; break; }
     }
     pthread_mutex_unlock(&ep->connections_lock);
-    if (already) return NL_ERR_ALREADY_CONNECTED;
+    if (already) return WN_ERR_ALREADY_CONNECTED;
 
-    nl_keypair_t *kp = nl_keypair_generate();
-    if (!kp) return NL_ERR_CRYPTO;
+    wn_keypair_t *kp = wn_keypair_generate();
+    if (!kp) return WN_ERR_CRYPTO;
     uint8_t pub[32];
-    nl_keypair_public(kp, pub);
+    wn_keypair_public(kp, pub);
     uint8_t nonce[16];
-    nl_crypto_random(nonce, 16);
+    wn_crypto_random(nonce, 16);
     uint64_t connid;
     do {
-        nl_crypto_random((uint8_t *)&connid, sizeof(connid));
-    } while (connid == NL_INVALID_PEER);
+        wn_crypto_random((uint8_t *)&connid, sizeof(connid));
+    } while (connid == WN_INVALID_PEER);
 
-    uint8_t out[NL_CONNECT_REQUEST_SIZE];
+    uint8_t out[WN_CONNECT_REQUEST_SIZE];
     size_t o = 0;
-    out[o++] = NL_PKT_CONNECT_REQUEST;
-    nl_put_u32(out + o, NL_MAGIC); o += 4;
-    nl_put_u16(out + o, NL_PROTOCOL_VERSION); o += 2;
+    out[o++] = WN_PKT_CONNECT_REQUEST;
+    wn_put_u32(out + o, WN_MAGIC); o += 4;
+    wn_put_u16(out + o, WN_PROTOCOL_VERSION); o += 2;
     out[o++] = ep->config.channel_count;
-    nl_put_u64(out + o, connid); o += 8;
+    wn_put_u64(out + o, connid); o += 8;
     memcpy(out + o, pub, 32); o += 32;
     memcpy(out + o, nonce, 16); o += 16;
-    nl_put_u32(out + o, ep->config.capabilities); o += 4;
+    wn_put_u32(out + o, ep->config.capabilities); o += 4;
 
     pthread_mutex_lock(&ep->pending_lock);
     if (find_pending_by_addr_locked(ep, &addr, PENDING_CLIENT_AWAIT_CHALLENGE) ||
         find_pending_by_addr_locked(ep, &addr, PENDING_CLIENT_AWAIT_ACCEPTED)) {
         pthread_mutex_unlock(&ep->pending_lock);
-        nl_keypair_free(kp);
-        return NL_ERR_ALREADY_CONNECTED;
+        wn_keypair_free(kp);
+        return WN_ERR_ALREADY_CONNECTED;
     }
     pending_t *p = acquire_pending_slot_locked(ep, now_ms());
-    if (!p) { nl_keypair_free(kp); pthread_mutex_unlock(&ep->pending_lock); return NL_ERR_SERVER_FULL; }
+    if (!p) { wn_keypair_free(kp); pthread_mutex_unlock(&ep->pending_lock); return WN_ERR_SERVER_FULL; }
     p->in_use = true;
     p->role = PENDING_CLIENT_AWAIT_CHALLENGE;
     memcpy(&p->addr, &addr, sizeof(addr));
@@ -2123,34 +2123,34 @@ nl_result_t nl_connect(nl_endpoint_t *ep, const nl_address_t *server_addr, nl_pe
     p->retry_packet_len = (uint16_t)o;
     p->last_retry_ms = p->created_ms;
 
-    if (ep->config.transport == NL_TRANSPORT_WEBSOCKET) {
+    if (ep->config.transport == WN_TRANSPORT_WEBSOCKET) {
         /* Open a nonblocking TCP dial-out; the HTTP upgrade and the
          * CONNECT_REQUEST are driven from the IO thread once the socket
          * is writable / the 101 response arrives. REQUEST stays in
-         * pending->retry_packet until then (ep_send_nl refuses to send
+         * pending->retry_packet until then (ep_send_wn refuses to send
          * on a not-yet-upgraded link). */
-        nl_socket_t s = socket(family, SOCK_STREAM, IPPROTO_TCP);
-        if (s == NL_INVALID_SOCKET) {
+        wn_socket_t s = socket(family, SOCK_STREAM, IPPROTO_TCP);
+        if (s == WN_INVALID_SOCKET) {
             release_pending_locked(p);
             pthread_mutex_unlock(&ep->pending_lock);
-            return NL_ERR_SOCKET;
+            return WN_ERR_SOCKET;
         }
-        nl_socket_set_nonblocking(s);
+        wn_socket_set_nonblocking(s);
         int crc = connect(s, (struct sockaddr *)&addr, addr_len);
-        bool in_progress = (crc != 0 && (nl_sock_errno() == EINPROGRESS || nl_sock_errno() == EALREADY));
+        bool in_progress = (crc != 0 && (wn_sock_errno() == EINPROGRESS || wn_sock_errno() == EALREADY));
         if (crc != 0 && !in_progress) {
-            nl_close_socket(s);
+            wn_close_socket(s);
             release_pending_locked(p);
             pthread_mutex_unlock(&ep->pending_lock);
-            return NL_ERR_SOCKET;
+            return WN_ERR_SOCKET;
         }
 
         ws_link_t *link = (ws_link_t *)calloc(1, sizeof(ws_link_t));
         if (!link) {
-            nl_close_socket(s);
+            wn_close_socket(s);
             release_pending_locked(p);
             pthread_mutex_unlock(&ep->pending_lock);
-            return NL_ERR_OUT_OF_MEMORY;
+            return WN_ERR_OUT_OF_MEMORY;
         }
         link->sock = s;
         link->addr = addr;
@@ -2159,7 +2159,7 @@ nl_result_t nl_connect(nl_endpoint_t *ep, const nl_address_t *server_addr, nl_pe
         link->client_connecting = in_progress;
         link->created_ms = now_ms();
         link->last_activity_ms = link->created_ms;
-        nl_ws_decoder_init(&link->decoder);
+        wn_ws_decoder_init(&link->decoder);
         if (!in_progress) {
             /* Connected immediately (rare for nonblocking, but possible
              * on loopback): send the HTTP upgrade right away. */
@@ -2174,17 +2174,17 @@ nl_result_t nl_connect(nl_endpoint_t *ep, const nl_address_t *server_addr, nl_pe
                  * not (e.g. request-build failure), release it here so the
                  * slot doesn't leak until the 5s pending timeout. */
                 release_pending_by_connid(ep, connid, PENDING_CLIENT_AWAIT_CHALLENGE);
-                return NL_ERR_SOCKET;
+                return WN_ERR_SOCKET;
             }
             *out_peer = connid;
-            return NL_OK;
+            return WN_OK;
         }
         pthread_mutex_lock(&ep->ws_links_lock);
         ws_add_link_locked(ep, link);
         pthread_mutex_unlock(&ep->ws_links_lock);
         pthread_mutex_unlock(&ep->pending_lock);
         *out_peer = connid;
-        return NL_OK;
+        return WN_OK;
     }
 
     /* UDP: send the REQUEST datagram while still holding pending_lock so
@@ -2195,36 +2195,36 @@ nl_result_t nl_connect(nl_endpoint_t *ep, const nl_address_t *server_addr, nl_pe
     if (sent < 0) {
         release_pending_locked(p);
         pthread_mutex_unlock(&ep->pending_lock);
-        return NL_ERR_SOCKET;
+        return WN_ERR_SOCKET;
     }
     pthread_mutex_unlock(&ep->pending_lock);
 
     *out_peer = connid;
-    return NL_OK;
+    return WN_OK;
 }
 
-nl_result_t nl_disconnect(nl_endpoint_t *ep, nl_peer_id_t peer) {
-    if (!ep) return NL_ERR_INVALID_ARGUMENT;
+wn_result_t wn_disconnect(wn_endpoint_t *ep, wn_peer_id_t peer) {
+    if (!ep) return WN_ERR_INVALID_ARGUMENT;
     pthread_mutex_lock(&ep->connections_lock);
-    nl_connection_t *conn = find_connection_locked(ep, peer);
-    if (!conn) { pthread_mutex_unlock(&ep->connections_lock); return NL_ERR_PEER_NOT_FOUND; }
+    wn_connection_t *conn = find_connection_locked(ep, peer);
+    if (!conn) { pthread_mutex_unlock(&ep->connections_lock); return WN_ERR_PEER_NOT_FOUND; }
     conn_ctx_t cctx = { ep, conn };
-    nl_conn_callbacks_t cb = make_callbacks(&cctx);
-    nl_connection_send_disconnect(conn, now_ms(), &cb);
+    wn_conn_callbacks_t cb = make_callbacks(&cctx);
+    wn_connection_send_disconnect(conn, now_ms(), &cb);
     int slot = find_connection_slot_by_ptr_locked(ep, conn);
     if (slot >= 0) ep->connections[slot] = NULL;
-    if (ep->config.transport == NL_TRANSPORT_WEBSOCKET)
+    if (ep->config.transport == WN_TRANSPORT_WEBSOCKET)
         ws_close_link_by_addr(ep, &conn->addr);
-    nl_connection_destroy(conn);
+    wn_connection_destroy(conn);
     pthread_mutex_unlock(&ep->connections_lock);
-    return NL_OK;
+    return WN_OK;
 }
 
-void nl_endpoint_destroy(nl_endpoint_t *ep) {
+void wn_endpoint_destroy(wn_endpoint_t *ep) {
     if (!ep) return;
-    /* Contract (see include/netlink.h): no other thread may be inside any
-     * nl_* call on `ep` when destroy is invoked, with one exception: a
-     * thread already blocked in nl_poll_event at that moment is woken and
+    /* Contract (see include/weft_net.h): no other thread may be inside any
+     * wn_* call on `ep` when destroy is invoked, with one exception: a
+     * thread already blocked in wn_poll_event at that moment is woken and
      * returned safely (it then re-checks its own loop condition before
      * calling in again). The steps below make that exception hold: set
      * shutdown under queue_lock and broadcast, so waiters leave instead of
@@ -2255,20 +2255,20 @@ void nl_endpoint_destroy(nl_endpoint_t *ep) {
     endpoint_free(ep);
 }
 
-nl_result_t nl_send(nl_endpoint_t *ep, nl_peer_id_t peer, uint8_t channel, nl_delivery_t delivery,
+wn_result_t wn_send(wn_endpoint_t *ep, wn_peer_id_t peer, uint8_t channel, wn_delivery_t delivery,
                      const uint8_t *data, size_t len) {
-    return nl_send_ex(ep, peer, channel, delivery, data, len, NL_PRIORITY_NORMAL);
+    return wn_send_ex(ep, peer, channel, delivery, data, len, WN_PRIORITY_NORMAL);
 }
 
-nl_result_t nl_send_ex(nl_endpoint_t *ep, nl_peer_id_t peer, uint8_t channel, nl_delivery_t delivery,
+wn_result_t wn_send_ex(wn_endpoint_t *ep, wn_peer_id_t peer, uint8_t channel, wn_delivery_t delivery,
                        const uint8_t *data, size_t len, uint8_t priority) {
-    if (!ep || (len > 0 && !data)) return NL_ERR_INVALID_ARGUMENT;
+    if (!ep || (len > 0 && !data)) return WN_ERR_INVALID_ARGUMENT;
     pthread_mutex_lock(&ep->connections_lock);
-    nl_connection_t *conn = find_connection_locked(ep, peer);
-    if (!conn) { pthread_mutex_unlock(&ep->connections_lock); return NL_ERR_PEER_NOT_FOUND; }
+    wn_connection_t *conn = find_connection_locked(ep, peer);
+    if (!conn) { pthread_mutex_unlock(&ep->connections_lock); return WN_ERR_PEER_NOT_FOUND; }
     conn_ctx_t cctx = { ep, conn };
-    nl_conn_callbacks_t cb = make_callbacks(&cctx);
-    nl_result_t r = nl_connection_send(conn, channel, delivery, data, len, priority, now_ms(), &cb);
+    wn_conn_callbacks_t cb = make_callbacks(&cctx);
+    wn_result_t r = wn_connection_send(conn, channel, delivery, data, len, priority, now_ms(), &cb);
     pthread_mutex_unlock(&ep->connections_lock);
     return r;
 }
@@ -2277,14 +2277,14 @@ nl_result_t nl_send_ex(nl_endpoint_t *ep, nl_peer_id_t peer, uint8_t channel, nl
  * back their receive-window charges. Must be called with queue_lock DROPPED
  * (it takes connections_lock, and the lock order is connections_lock ->
  * queue_lock, never the reverse). */
-static void consume_window_for_borrows(nl_endpoint_t *ep, borrow_node_t *borrows) {
+static void consume_window_for_borrows(wn_endpoint_t *ep, borrow_node_t *borrows) {
     while (borrows) {
         borrow_node_t *b = borrows;
         borrows = b->next;
         if (b->is_data && b->len > 0) {
             pthread_mutex_lock(&ep->connections_lock);
-            nl_connection_t *c = find_connection_locked(ep, b->peer);
-            if (c) nl_connection_consume_window(c, b->len);
+            wn_connection_t *c = find_connection_locked(ep, b->peer);
+            if (c) wn_connection_consume_window(c, b->len);
             pthread_mutex_unlock(&ep->connections_lock);
         }
         free(b->data);
@@ -2292,19 +2292,19 @@ static void consume_window_for_borrows(nl_endpoint_t *ep, borrow_node_t *borrows
     }
 }
 
-/* Drop out of nl_poll_event: must be the LAST ep-touching operation on
- * every exit path. nl_endpoint_destroy drains on active_pollers == 0 and
+/* Drop out of wn_poll_event: must be the LAST ep-touching operation on
+ * every exit path. wn_endpoint_destroy drains on active_pollers == 0 and
  * then frees the endpoint, so any ep access after the decrement would race
  * a concurrent destroy (lock a destroyed mutex, read freed borrows); the
  * decrement therefore moves to here, after consume_window_for_borrows and
  * after the borrow booking. Takes only queue_lock, no nesting. */
-static void poller_exit(nl_endpoint_t *ep) {
+static void poller_exit(wn_endpoint_t *ep) {
     pthread_mutex_lock(&ep->queue_lock);
     ep->active_pollers--;
     pthread_mutex_unlock(&ep->queue_lock);
 }
 
-bool nl_poll_event(nl_endpoint_t *ep, nl_event_t *out, int timeout_ms) {
+bool wn_poll_event(wn_endpoint_t *ep, wn_event_t *out, int timeout_ms) {
     if (!ep || !out) return false;
 
     /* Up to a few of THIS thread's own previous borrows may still be
@@ -2403,8 +2403,8 @@ bool nl_poll_event(nl_endpoint_t *ep, nl_event_t *out, int timeout_ms) {
         borrow_node_t *b = (borrow_node_t *)calloc(1, sizeof(borrow_node_t));
         if (!b) {
             uint32_t plen = node->payload_len;
-            nl_peer_id_t ppeer = node->pub.peer;
-            bool is_data = (node->pub.event_type == NL_EVENT_DATA);
+            wn_peer_id_t ppeer = node->pub.peer;
+            bool is_data = (node->pub.event_type == WN_EVENT_DATA);
             free(node->payload);
             free(node);
             out->data = NULL;
@@ -2413,8 +2413,8 @@ bool nl_poll_event(nl_endpoint_t *ep, nl_event_t *out, int timeout_ms) {
              * receive-window charge now rather than leaking window. */
             if (is_data && plen > 0) {
                 pthread_mutex_lock(&ep->connections_lock);
-                nl_connection_t *c = find_connection_locked(ep, ppeer);
-                if (c) nl_connection_consume_window(c, plen);
+                wn_connection_t *c = find_connection_locked(ep, ppeer);
+                if (c) wn_connection_consume_window(c, plen);
                 pthread_mutex_unlock(&ep->connections_lock);
             }
             poller_exit(ep); /* last ep touch */
@@ -2425,7 +2425,7 @@ bool nl_poll_event(nl_endpoint_t *ep, nl_event_t *out, int timeout_ms) {
         b->data = node->payload;
         b->len = (uint32_t)node->payload_len;
         b->peer = node->pub.peer;
-        b->is_data = (node->pub.event_type == NL_EVENT_DATA);
+        b->is_data = (node->pub.event_type == WN_EVENT_DATA);
         b->owner = pthread_self();
         pthread_mutex_lock(&ep->queue_lock);
         b->next = ep->borrows;
@@ -2444,15 +2444,15 @@ bool nl_poll_event(nl_endpoint_t *ep, nl_event_t *out, int timeout_ms) {
     return true;
 }
 
-nl_result_t nl_discovery_enable(nl_endpoint_t *ep, uint16_t discovery_port) {
-    if (!ep || !ep->is_server) return NL_ERR_INVALID_ARGUMENT;
+wn_result_t wn_discovery_enable(wn_endpoint_t *ep, uint16_t discovery_port) {
+    if (!ep || !ep->is_server) return WN_ERR_INVALID_ARGUMENT;
     /* Discovery is a UDP LAN broadcast protocol; a WebSocket endpoint has
      * no datagram socket to probe/reply on. */
-    if (ep->config.transport == NL_TRANSPORT_WEBSOCKET) return NL_ERR_UNSUPPORTED;
+    if (ep->config.transport == WN_TRANSPORT_WEBSOCKET) return WN_ERR_UNSUPPORTED;
     pthread_mutex_lock(&ep->discovery_lock);
-    if (ep->discovery_sock != NL_INVALID_SOCKET) {
+    if (ep->discovery_sock != WN_INVALID_SOCKET) {
         pthread_mutex_unlock(&ep->discovery_lock);
-        return NL_OK; /* already enabled */
+        return WN_OK; /* already enabled */
     }
 
     struct sockaddr_in addr;
@@ -2461,10 +2461,10 @@ nl_result_t nl_discovery_enable(nl_endpoint_t *ep, uint16_t discovery_port) {
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(discovery_port);
 
-    nl_socket_t sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock == NL_INVALID_SOCKET) {
+    wn_socket_t sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock == WN_INVALID_SOCKET) {
         pthread_mutex_unlock(&ep->discovery_lock);
-        return NL_ERR_SOCKET;
+        return WN_ERR_SOCKET;
     }
     int reuse = 1;
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
@@ -2472,34 +2472,34 @@ nl_result_t nl_discovery_enable(nl_endpoint_t *ep, uint16_t discovery_port) {
     setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
 
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        nl_close_socket(sock);
+        wn_close_socket(sock);
         pthread_mutex_unlock(&ep->discovery_lock);
-        return NL_ERR_BIND_FAILED;
+        return WN_ERR_BIND_FAILED;
     }
-    nl_socket_set_nonblocking(sock);
+    wn_socket_set_nonblocking(sock);
     ep->discovery_sock = sock;
     ep->discovery_port = discovery_port;
     pthread_mutex_unlock(&ep->discovery_lock);
-    return NL_OK;
+    return WN_OK;
 }
 
-nl_result_t nl_discovery_probe(nl_endpoint_t *ep, uint16_t discovery_port, int timeout_ms) {
+wn_result_t wn_discovery_probe(wn_endpoint_t *ep, uint16_t discovery_port, int timeout_ms) {
     (void)timeout_ms; /* replies simply arrive as events over the following poll calls */
-    if (!ep || ep->is_server) return NL_ERR_INVALID_ARGUMENT;
-    if (ep->config.transport == NL_TRANSPORT_WEBSOCKET) return NL_ERR_UNSUPPORTED;
+    if (!ep || ep->is_server) return WN_ERR_INVALID_ARGUMENT;
+    if (ep->config.transport == WN_TRANSPORT_WEBSOCKET) return WN_ERR_UNSUPPORTED;
 
     pthread_mutex_lock(&ep->discovery_lock);
 
-    nl_socket_t sock = ep->discovery_sock;
-    if (sock == NL_INVALID_SOCKET) {
+    wn_socket_t sock = ep->discovery_sock;
+    if (sock == WN_INVALID_SOCKET) {
         sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (sock == NL_INVALID_SOCKET) {
+        if (sock == WN_INVALID_SOCKET) {
             pthread_mutex_unlock(&ep->discovery_lock);
-            return NL_ERR_SOCKET;
+            return WN_ERR_SOCKET;
         }
         int broadcast = 1;
         setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
-        nl_socket_set_nonblocking(sock);
+        wn_socket_set_nonblocking(sock);
         ep->discovery_sock = sock;
     }
 
@@ -2513,12 +2513,12 @@ nl_result_t nl_discovery_probe(nl_endpoint_t *ep, uint16_t discovery_port, int t
      * accepted, so an off-path forger can't win by guessing a counter.
      * Written under discovery_lock -- the IO thread compares against it. */
     uint32_t nonce = 0;
-    while (nonce == 0) nl_crypto_random((uint8_t *)&nonce, sizeof(nonce));
+    while (nonce == 0) wn_crypto_random((uint8_t *)&nonce, sizeof(nonce));
     ep->discovery_expected_nonce = nonce;
-    uint8_t out[NL_DISCOVERY_REQUEST_SIZE];
-    out[0] = NL_PKT_DISCOVERY_REQUEST;
-    nl_put_u32(out + 1, NL_MAGIC);
-    nl_put_u32(out + 5, nonce);
+    uint8_t out[WN_DISCOVERY_REQUEST_SIZE];
+    out[0] = WN_PKT_DISCOVERY_REQUEST;
+    wn_put_u32(out + 1, WN_MAGIC);
+    wn_put_u32(out + 5, nonce);
 
     /* Broadcast for real LAN servers, plus an unconditional loopback copy
      * so a local server is always reachable (broadcast can silently go
@@ -2529,31 +2529,31 @@ nl_result_t nl_discovery_probe(nl_endpoint_t *ep, uint16_t discovery_port, int t
     local.sin_addr.s_addr = htonl(0x7F000001); /* INADDR_LOOPBACK is BSD-only under strict POSIX */
     ssize_t sent = sendto(sock, out, sizeof(out), 0, (struct sockaddr *)&local, sizeof(local));
     pthread_mutex_unlock(&ep->discovery_lock);
-    if (sent < 0) return NL_ERR_SOCKET;
-    return NL_OK;
+    if (sent < 0) return WN_ERR_SOCKET;
+    return WN_OK;
 }
 
-bool nl_peer_address(nl_endpoint_t *ep, nl_peer_id_t peer, nl_address_t *out) {
+bool wn_peer_address(wn_endpoint_t *ep, wn_peer_id_t peer, wn_address_t *out) {
     if (!ep || !out) return false;
     pthread_mutex_lock(&ep->connections_lock);
-    nl_connection_t *conn = find_connection_locked(ep, peer);
+    wn_connection_t *conn = find_connection_locked(ep, peer);
     bool found = conn != NULL;
-    if (found) sockaddr_to_nl_address(&conn->addr, conn->addr_len, out);
+    if (found) sockaddr_to_wn_address(&conn->addr, conn->addr_len, out);
     pthread_mutex_unlock(&ep->connections_lock);
     return found;
 }
 
-uint32_t nl_peer_rtt_ms(nl_endpoint_t *ep, nl_peer_id_t peer) {
+uint32_t wn_peer_rtt_ms(wn_endpoint_t *ep, wn_peer_id_t peer) {
     if (!ep) return 0;
     pthread_mutex_lock(&ep->connections_lock);
-    nl_connection_t *conn = find_connection_locked(ep, peer);
+    wn_connection_t *conn = find_connection_locked(ep, peer);
     uint32_t rtt = 0;
-    if (conn) rtt = nl_connection_rtt_ms(conn);
+    if (conn) rtt = wn_connection_rtt_ms(conn);
     pthread_mutex_unlock(&ep->connections_lock);
     return rtt;
 }
 
-uint32_t nl_peer_count(nl_endpoint_t *ep) {
+uint32_t wn_peer_count(wn_endpoint_t *ep) {
     if (!ep) return 0;
     pthread_mutex_lock(&ep->connections_lock);
     uint32_t n = count_active_connections_locked(ep);
@@ -2561,14 +2561,14 @@ uint32_t nl_peer_count(nl_endpoint_t *ep) {
     return n;
 }
 
-bool nl_peer_stats(nl_endpoint_t *ep, nl_peer_id_t peer, nl_peer_stats_t *out) {
+bool wn_peer_stats(wn_endpoint_t *ep, wn_peer_id_t peer, wn_peer_stats_t *out) {
     if (!ep || !out) return false;
     pthread_mutex_lock(&ep->connections_lock);
-    nl_connection_t *conn = find_connection_locked(ep, peer);
+    wn_connection_t *conn = find_connection_locked(ep, peer);
     bool found = conn != NULL;
     if (found) {
-        nl_connection_stats_t cstats;
-        nl_connection_get_stats(conn, &cstats);
+        wn_connection_stats_t cstats;
+        wn_connection_get_stats(conn, &cstats);
         out->packets_sent = cstats.packets_sent;
         out->packets_received = cstats.packets_received;
         out->bytes_sent = cstats.bytes_sent;
@@ -2583,12 +2583,12 @@ bool nl_peer_stats(nl_endpoint_t *ep, nl_peer_id_t peer, nl_peer_stats_t *out) {
     return found;
 }
 
-bool nl_peer_capabilities(nl_endpoint_t *ep, nl_peer_id_t peer, uint32_t *out_caps) {
+bool wn_peer_capabilities(wn_endpoint_t *ep, wn_peer_id_t peer, uint32_t *out_caps) {
     if (!ep || !out_caps) return false;
     pthread_mutex_lock(&ep->connections_lock);
-    nl_connection_t *conn = find_connection_locked(ep, peer);
+    wn_connection_t *conn = find_connection_locked(ep, peer);
     bool found = conn != NULL;
-    if (found) *out_caps = nl_connection_capabilities(conn);
+    if (found) *out_caps = wn_connection_capabilities(conn);
     pthread_mutex_unlock(&ep->connections_lock);
     return found;
 }
