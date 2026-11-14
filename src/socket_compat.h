@@ -7,16 +7,16 @@
  * "should work, please file an issue if it doesn't" rather than
  * battle-tested.
  */
-#ifndef NETLINK_SOCKET_COMPAT_H
-#define NETLINK_SOCKET_COMPAT_H
+#ifndef WEFT_NET_SOCKET_COMPAT_H
+#define WEFT_NET_SOCKET_COMPAT_H
 
 #ifdef _WIN32
   #include <winsock2.h>
   #include <ws2tcpip.h>
-  typedef SOCKET nl_socket_t;
-  #define NL_INVALID_SOCKET INVALID_SOCKET
-  #define nl_close_socket(s) closesocket(s)
-  #define nl_sock_errno() WSAGetLastError()
+  typedef SOCKET wn_socket_t;
+  #define WN_INVALID_SOCKET INVALID_SOCKET
+  #define wn_close_socket(s) closesocket(s)
+  #define wn_sock_errno() WSAGetLastError()
 #else
   #include <sys/socket.h>
   #include <sys/types.h>
@@ -26,16 +26,16 @@
   #include <fcntl.h>
   #include <errno.h>
   #include <poll.h>
-  typedef int nl_socket_t;
-  #define NL_INVALID_SOCKET (-1)
-  #define nl_close_socket(s) close(s)
-  #define nl_sock_errno() errno
+  typedef int wn_socket_t;
+  #define WN_INVALID_SOCKET (-1)
+  #define wn_close_socket(s) close(s)
+  #define wn_sock_errno() errno
 #endif
 
 #include <string.h>
 #include <stdbool.h>
 
-static inline int nl_socket_set_nonblocking(nl_socket_t sock) {
+static inline int wn_socket_set_nonblocking(wn_socket_t sock) {
 #ifdef _WIN32
     u_long mode = 1;
     return ioctlsocket(sock, FIONBIO, &mode) == 0 ? 0 : -1;
@@ -46,7 +46,7 @@ static inline int nl_socket_set_nonblocking(nl_socket_t sock) {
 #endif
 }
 
-static inline void nl_sockets_global_init(void) {
+static inline void wn_sockets_global_init(void) {
 #ifdef _WIN32
     static bool done = false;
     if (!done) {
@@ -57,4 +57,4 @@ static inline void nl_sockets_global_init(void) {
 #endif
 }
 
-#endif /* NETLINK_SOCKET_COMPAT_H */
+#endif /* WEFT_NET_SOCKET_COMPAT_H */

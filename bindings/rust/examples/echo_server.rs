@@ -1,4 +1,4 @@
-//! echo_server.rs - a NetLink server written in Rust, using the FFI
+//! echo_server.rs - a weft-net server written in Rust, using the FFI
 //! bindings in this crate. Speaks the exact same wire protocol as the C
 //! core, so any C/C++, Python, or Go client in this repository can
 //! connect to it without modification.
@@ -6,9 +6,9 @@
 //! Build/run (from bindings/rust/):
 //!   cargo run --example echo_server -- 9000
 
-use netlink::{Config, Delivery, EventType, Server};
 use std::env;
 use std::time::Duration;
+use weft_net::{Config, Delivery, EventType, Server};
 
 fn main() {
     let port: u16 = env::args()
@@ -17,7 +17,7 @@ fn main() {
         .unwrap_or(9000);
 
     let mut cfg = Config::default();
-    cfg.server_name = Some("NetLink Rust Example Server".to_string());
+    cfg.server_name = Some("weft-net Rust Example Server".to_string());
 
     let server = Server::new("0.0.0.0", port, cfg).unwrap_or_else(|e| {
         eprintln!("failed to start server: {}", e);
@@ -29,7 +29,7 @@ fn main() {
     }
 
     println!(
-        "NetLink (Rust) echo server listening on UDP port {} (discovery on {})",
+        "weft-net (Rust) echo server listening on UDP port {} (discovery on {})",
         port,
         port + 1
     );

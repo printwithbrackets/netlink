@@ -1,3 +1,3 @@
-module github.com/printwithbrackets/netlink/bindings/go
+module github.com/printwithbrackets/weft-net/bindings/go
 
 go 1.21

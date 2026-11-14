@@ -1,23 +1,23 @@
 """
-netlink - Python bindings for the NetLink C library.
+weft-net - Python bindings for the weft-net C library.
 
-These bindings load libnetlink (built via the top-level Makefile:
-`make` produces build/libnetlink.so) with ctypes and wrap it in a small,
+These bindings load libweft_net (built via the top-level Makefile:
+`make` produces build/libweft_net.so) with ctypes and wrap it in a small,
 Pythonic API. The wire protocol, encryption, reliability, and all other
 protocol logic live entirely in the C library -- this module is just a
 thin, careful translation of its ABI, so a Python client and a C/Go/Rust
 peer using the same library are fully wire-compatible.
 
 Example:
-    import netlink
+    import weft_net
 
-    client = netlink.Client()
+    client = weft_net.Client()
     peer = client.connect("127.0.0.1", 9000)
 
     for event in client.events(timeout=1.0):
-        if event.type == netlink.EventType.CONNECTED:
-            client.send(peer, channel=0, data=b"hello", delivery=netlink.Delivery.RELIABLE_ORDERED)
-        elif event.type == netlink.EventType.DATA:
+        if event.type == weft_net.EventType.CONNECTED:
+            client.send(peer, channel=0, data=b"hello", delivery=weft_net.Delivery.RELIABLE_ORDERED)
+        elif event.type == weft_net.EventType.DATA:
             print("got", event.data)
 """
 
@@ -36,12 +36,12 @@ __version__ = "1.3.0"
 
 __all__ = [
     "Delivery", "EventType", "AddressFamily", "Transport", "Priority",
-    "NetLinkError", "Event", "Config", "Endpoint", "Server", "Client",
+    "WeftNetError", "Event", "Config", "Endpoint", "Server", "Client",
     "PeerStats", "version", "__version__",
 ]
 
 # --------------------------------------------------------------------------
-# Priority constants (mirrors include/netlink.h -- keep in sync)
+# Priority constants (mirrors include/weft_net.h -- keep in sync)
 # --------------------------------------------------------------------------
 
 class Priority:
@@ -51,7 +51,7 @@ class Priority:
     CRITICAL = 192
 
 
-# Capability bits (mirrors NL_CAP_* -- keep in sync).
+# Capability bits (mirrors WN_CAP_* -- keep in sync).
 CapFlowControl = 0x00000001
 CapPriority = 0x00000002
 CapRateLimit = 0x00000004
@@ -61,20 +61,20 @@ CapRateLimit = 0x00000004
 # --------------------------------------------------------------------------
 
 def _find_library() -> str:
-    env = os.environ.get("NETLINK_LIBRARY_PATH")
+    env = os.environ.get("WEFT_NET_LIBRARY_PATH")
     if env and os.path.exists(env):
         return env
 
     system = platform.system()
     names = {
-        "Linux": "libnetlink.so",
-        "Darwin": "libnetlink.dylib",
-        "Windows": "netlink.dll",
-    }.get(system, "libnetlink.so")
+        "Linux": "libweft_net.so",
+        "Darwin": "libweft_net.dylib",
+        "Windows": "weft_net.dll",
+    }.get(system, "libweft_net.so")
 
     here = os.path.dirname(os.path.abspath(__file__))
     candidates = [
-        os.path.join(here, "..", "..", "..", "build", names),  # repo layout: bindings/python/netlink/
+        os.path.join(here, "..", "..", "..", "build", names),  # repo layout: bindings/python/weft_net/
         os.path.join(here, names),
         names,
     ]
@@ -82,21 +82,21 @@ def _find_library() -> str:
         if os.path.exists(c):
             return c
 
-    found = ctypes.util.find_library("netlink")
+    found = ctypes.util.find_library("weft_net")
     if found:
         return found
 
     raise OSError(
-        "Could not locate the NetLink shared library. Build it first with "
-        "`make` in the repository root (produces build/libnetlink.so), or "
-        "set the NETLINK_LIBRARY_PATH environment variable to its path."
+        "Could not locate the weft-net shared library. Build it first with "
+        "`make` in the repository root (produces build/libweft_net.so), or "
+        "set the WEFT_NET_LIBRARY_PATH environment variable to its path."
     )
 
 
 _lib = ctypes.CDLL(_find_library())
 
 # --------------------------------------------------------------------------
-# Enums (mirrors include/netlink.h exactly -- keep in sync)
+# Enums (mirrors include/weft_net.h exactly -- keep in sync)
 # --------------------------------------------------------------------------
 
 class Delivery(enum.IntEnum):
@@ -126,19 +126,19 @@ class EventType(enum.IntEnum):
     DISCOVERY_REPLY = 5
 
 
-class NetLinkError(Exception):
-    """Raised for library calls that return a non-OK nl_result_t."""
+class WeftNetError(Exception):
+    """Raised for library calls that return a non-OK wn_result_t."""
     def __init__(self, code: int):
         self.code = code
-        message = _lib.nl_error_string(ctypes.c_int(code))
+        message = _lib.wn_error_string(ctypes.c_int(code))
         super().__init__(message.decode("utf-8") if message else f"error {code}")
 
 
 # --------------------------------------------------------------------------
-# ctypes struct definitions (must match include/netlink.h byte-for-byte)
+# ctypes struct definitions (must match include/weft_net.h byte-for-byte)
 # --------------------------------------------------------------------------
 
-NL_SERVER_NAME_MAX = 64
+WN_SERVER_NAME_MAX = 64
 
 
 class _Address(ctypes.Structure):
@@ -159,7 +159,7 @@ class _Config(ctypes.Structure):
         ("keepalive_interval_ms", ctypes.c_uint32),
         ("encryption_enabled", ctypes.c_bool),
         ("server_name", ctypes.c_char_p),
-        # Fields added with protocol v2 (keep in sync with nl_config_t).
+        # Fields added with protocol v2 (keep in sync with wn_config_t).
         ("max_send_bytes_per_sec", ctypes.c_uint32),
         ("recv_window_bytes", ctypes.c_uint32),
         ("event_queue_max_bytes", ctypes.c_uint32),
@@ -176,7 +176,7 @@ class _Event(ctypes.Structure):
         ("data_len", ctypes.c_size_t),
         ("disconnect_reason", ctypes.c_int),
         ("from_address", _Address),
-        ("server_name", ctypes.c_char * NL_SERVER_NAME_MAX),
+        ("server_name", ctypes.c_char * WN_SERVER_NAME_MAX),
         ("server_player_count", ctypes.c_uint32),
         ("server_max_players", ctypes.c_uint32),
     ]
@@ -200,68 +200,68 @@ class _PeerStats(ctypes.Structure):
 # Function signatures
 # --------------------------------------------------------------------------
 
-_lib.nl_error_string.argtypes = [ctypes.c_int]
-_lib.nl_error_string.restype = ctypes.c_char_p
+_lib.wn_error_string.argtypes = [ctypes.c_int]
+_lib.wn_error_string.restype = ctypes.c_char_p
 
-_lib.nl_version_string.argtypes = []
-_lib.nl_version_string.restype = ctypes.c_char_p
+_lib.wn_version_string.argtypes = []
+_lib.wn_version_string.restype = ctypes.c_char_p
 
-_lib.nl_config_default.argtypes = [ctypes.POINTER(_Config)]
-_lib.nl_config_default.restype = None
+_lib.wn_config_default.argtypes = [ctypes.POINTER(_Config)]
+_lib.wn_config_default.restype = None
 
-_lib.nl_server_create.argtypes = [ctypes.POINTER(_Address), ctypes.POINTER(_Config), ctypes.POINTER(ctypes.c_void_p)]
-_lib.nl_server_create.restype = ctypes.c_int
+_lib.wn_server_create.argtypes = [ctypes.POINTER(_Address), ctypes.POINTER(_Config), ctypes.POINTER(ctypes.c_void_p)]
+_lib.wn_server_create.restype = ctypes.c_int
 
-_lib.nl_client_create.argtypes = [ctypes.POINTER(_Config), ctypes.POINTER(ctypes.c_void_p)]
-_lib.nl_client_create.restype = ctypes.c_int
+_lib.wn_client_create.argtypes = [ctypes.POINTER(_Config), ctypes.POINTER(ctypes.c_void_p)]
+_lib.wn_client_create.restype = ctypes.c_int
 
-_lib.nl_connect.argtypes = [ctypes.c_void_p, ctypes.POINTER(_Address), ctypes.POINTER(ctypes.c_uint64)]
-_lib.nl_connect.restype = ctypes.c_int
+_lib.wn_connect.argtypes = [ctypes.c_void_p, ctypes.POINTER(_Address), ctypes.POINTER(ctypes.c_uint64)]
+_lib.wn_connect.restype = ctypes.c_int
 
-_lib.nl_disconnect.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
-_lib.nl_disconnect.restype = ctypes.c_int
+_lib.wn_disconnect.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+_lib.wn_disconnect.restype = ctypes.c_int
 
-_lib.nl_endpoint_destroy.argtypes = [ctypes.c_void_p]
-_lib.nl_endpoint_destroy.restype = None
+_lib.wn_endpoint_destroy.argtypes = [ctypes.c_void_p]
+_lib.wn_endpoint_destroy.restype = None
 
-_lib.nl_send.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint8, ctypes.c_int,
+_lib.wn_send.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint8, ctypes.c_int,
                          ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t]
-_lib.nl_send.restype = ctypes.c_int
+_lib.wn_send.restype = ctypes.c_int
 
-_lib.nl_send_ex.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint8, ctypes.c_int,
+_lib.wn_send_ex.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint8, ctypes.c_int,
                             ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.c_uint8]
-_lib.nl_send_ex.restype = ctypes.c_int
+_lib.wn_send_ex.restype = ctypes.c_int
 
-_lib.nl_poll_event.argtypes = [ctypes.c_void_p, ctypes.POINTER(_Event), ctypes.c_int]
-_lib.nl_poll_event.restype = ctypes.c_bool
+_lib.wn_poll_event.argtypes = [ctypes.c_void_p, ctypes.POINTER(_Event), ctypes.c_int]
+_lib.wn_poll_event.restype = ctypes.c_bool
 
-_lib.nl_discovery_enable.argtypes = [ctypes.c_void_p, ctypes.c_uint16]
-_lib.nl_discovery_enable.restype = ctypes.c_int
+_lib.wn_discovery_enable.argtypes = [ctypes.c_void_p, ctypes.c_uint16]
+_lib.wn_discovery_enable.restype = ctypes.c_int
 
-_lib.nl_discovery_probe.argtypes = [ctypes.c_void_p, ctypes.c_uint16, ctypes.c_int]
-_lib.nl_discovery_probe.restype = ctypes.c_int
+_lib.wn_discovery_probe.argtypes = [ctypes.c_void_p, ctypes.c_uint16, ctypes.c_int]
+_lib.wn_discovery_probe.restype = ctypes.c_int
 
-_lib.nl_peer_rtt_ms.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
-_lib.nl_peer_rtt_ms.restype = ctypes.c_uint32
+_lib.wn_peer_rtt_ms.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+_lib.wn_peer_rtt_ms.restype = ctypes.c_uint32
 
-_lib.nl_peer_count.argtypes = [ctypes.c_void_p]
-_lib.nl_peer_count.restype = ctypes.c_uint32
+_lib.wn_peer_count.argtypes = [ctypes.c_void_p]
+_lib.wn_peer_count.restype = ctypes.c_uint32
 
-_lib.nl_peer_stats.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(_PeerStats)]
-_lib.nl_peer_stats.restype = ctypes.c_bool
+_lib.wn_peer_stats.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(_PeerStats)]
+_lib.wn_peer_stats.restype = ctypes.c_bool
 
-_lib.nl_peer_capabilities.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint32)]
-_lib.nl_peer_capabilities.restype = ctypes.c_bool
+_lib.wn_peer_capabilities.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint32)]
+_lib.wn_peer_capabilities.restype = ctypes.c_bool
 
 
 def _check(code: int) -> None:
     if code != 0:
-        raise NetLinkError(code)
+        raise WeftNetError(code)
 
 
 def version() -> str:
     """Return the loaded C library's version string (e.g. "1.3.0")."""
-    raw = _lib.nl_version_string()
+    raw = _lib.wn_version_string()
     return raw.decode("utf-8") if raw else ""
 
 
@@ -304,7 +304,7 @@ class Event:
 
 @dataclass
 class PeerStats:
-    """Snapshot of per-peer counters and RTT estimates (nl_peer_stats)."""
+    """Snapshot of per-peer counters and RTT estimates (wn_peer_stats)."""
     packets_sent: int
     packets_received: int
     bytes_sent: int
@@ -328,13 +328,13 @@ class Config:
     transport: Transport = Transport.UDP
     max_send_bytes_per_sec: int = 0
     recv_window_bytes: int = 32768
-    # 0 = C default (NL_EVENT_QUEUE_MAX_BYTES_DEFAULT); 0xFFFFFFFF = unlimited.
+    # 0 = C default (WN_EVENT_QUEUE_MAX_BYTES_DEFAULT); 0xFFFFFFFF = unlimited.
     event_queue_max_bytes: int = 0
     capabilities: int = CapFlowControl | CapPriority | CapRateLimit
 
     def _to_raw(self) -> _Config:
         raw = _Config()
-        _lib.nl_config_default(ctypes.byref(raw))
+        _lib.wn_config_default(ctypes.byref(raw))
         raw.channel_count = self.channel_count
         raw.max_connections = self.max_connections
         raw.connection_timeout_ms = self.connection_timeout_ms
@@ -365,7 +365,7 @@ def _timeout_ms(timeout: float) -> int:
 def _make_address(host: str, port: int, family: AddressFamily = AddressFamily.UNSPEC) -> _Address:
     raw = host.encode("utf-8")
     if len(raw) >= 64:
-        raise NetLinkError(-1)  # NL_ERR_INVALID_ARGUMENT: host must fit in 64-byte buffer
+        raise WeftNetError(-1)  # WN_ERR_INVALID_ARGUMENT: host must fit in 64-byte buffer
     addr = _Address()
     addr.host = raw
     addr.port = port
@@ -381,22 +381,22 @@ class Endpoint:
 
     def send(self, peer: int, channel: int, data: bytes, delivery: Delivery = Delivery.RELIABLE_ORDERED) -> None:
         buf = (ctypes.c_uint8 * len(data)).from_buffer_copy(data)
-        _check(_lib.nl_send(self._handle, peer, channel, int(delivery), buf, len(data)))
+        _check(_lib.wn_send(self._handle, peer, channel, int(delivery), buf, len(data)))
 
     def send_ex(self, peer: int, channel: int, data: bytes, delivery: Delivery = Delivery.RELIABLE_ORDERED,
                 priority: int = Priority.NORMAL) -> None:
         """Like send(), with an explicit priority (0..255; see Priority)."""
         buf = (ctypes.c_uint8 * len(data)).from_buffer_copy(data)
-        _check(_lib.nl_send_ex(self._handle, peer, channel, int(delivery), buf, len(data), priority))
+        _check(_lib.wn_send_ex(self._handle, peer, channel, int(delivery), buf, len(data), priority))
 
     def disconnect(self, peer: int) -> None:
-        _check(_lib.nl_disconnect(self._handle, peer))
+        _check(_lib.wn_disconnect(self._handle, peer))
 
     def poll(self, timeout: float = 0.0) -> Optional[Event]:
         """Poll for a single event. timeout is in seconds; negative blocks forever."""
         raw = _Event()
         timeout_ms = _timeout_ms(timeout)
-        if _lib.nl_poll_event(self._handle, ctypes.byref(raw), timeout_ms):
+        if _lib.wn_poll_event(self._handle, ctypes.byref(raw), timeout_ms):
             return Event._from_raw(raw)
         return None
 
@@ -412,15 +412,15 @@ class Endpoint:
                 yield ev
 
     def peer_rtt_ms(self, peer: int) -> int:
-        return _lib.nl_peer_rtt_ms(self._handle, peer)
+        return _lib.wn_peer_rtt_ms(self._handle, peer)
 
     def peer_count(self) -> int:
-        return _lib.nl_peer_count(self._handle)
+        return _lib.wn_peer_count(self._handle)
 
     def peer_stats(self, peer: int) -> Optional[PeerStats]:
         """Snapshot of per-peer counters/RTT estimates, or None if unknown."""
         raw = _PeerStats()
-        if not _lib.nl_peer_stats(self._handle, peer, ctypes.byref(raw)):
+        if not _lib.wn_peer_stats(self._handle, peer, ctypes.byref(raw)):
             return None
         return PeerStats(
             packets_sent=raw.packets_sent,
@@ -435,15 +435,15 @@ class Endpoint:
         )
 
     def peer_capabilities(self, peer: int) -> Optional[int]:
-        """Negotiated NL_CAP_* bitmask with this peer, or None if unknown."""
+        """Negotiated WN_CAP_* bitmask with this peer, or None if unknown."""
         caps = ctypes.c_uint32(0)
-        if not _lib.nl_peer_capabilities(self._handle, peer, ctypes.byref(caps)):
+        if not _lib.wn_peer_capabilities(self._handle, peer, ctypes.byref(caps)):
             return None
         return caps.value
 
     def close(self) -> None:
         if self._handle:
-            _lib.nl_endpoint_destroy(self._handle)
+            _lib.wn_endpoint_destroy(self._handle)
             self._handle = None
 
     def __enter__(self):
@@ -466,11 +466,11 @@ class Server(Endpoint):
         addr = _make_address(host, port, config.family)
         raw_cfg = config._to_raw()
         handle = ctypes.c_void_p()
-        _check(_lib.nl_server_create(ctypes.byref(addr), ctypes.byref(raw_cfg), ctypes.byref(handle)))
+        _check(_lib.wn_server_create(ctypes.byref(addr), ctypes.byref(raw_cfg), ctypes.byref(handle)))
         self._handle = handle
 
     def enable_discovery(self, discovery_port: int) -> None:
-        _check(_lib.nl_discovery_enable(self._handle, discovery_port))
+        _check(_lib.wn_discovery_enable(self._handle, discovery_port))
 
 
 class Client(Endpoint):
@@ -479,17 +479,17 @@ class Client(Endpoint):
         config = config or Config()
         raw_cfg = config._to_raw()
         handle = ctypes.c_void_p()
-        _check(_lib.nl_client_create(ctypes.byref(raw_cfg), ctypes.byref(handle)))
+        _check(_lib.wn_client_create(ctypes.byref(raw_cfg), ctypes.byref(handle)))
         self._handle = handle
 
     def connect(self, host: str, port: int, family: AddressFamily = AddressFamily.UNSPEC) -> int:
         addr = _make_address(host, port, family)
         peer = ctypes.c_uint64()
-        _check(_lib.nl_connect(self._handle, ctypes.byref(addr), ctypes.byref(peer)))
+        _check(_lib.wn_connect(self._handle, ctypes.byref(addr), ctypes.byref(peer)))
         return peer.value
 
     def probe_lan(self, discovery_port: int, timeout: float = 1.0) -> None:
-        _check(_lib.nl_discovery_probe(self._handle, discovery_port, _timeout_ms(timeout)))
+        _check(_lib.wn_discovery_probe(self._handle, discovery_port, _timeout_ms(timeout)))
 
     def wait_connected(self, timeout: float = 5.0) -> Event:
         """Block until CONNECTED or CONNECT_FAILED, or raise TimeoutError."""

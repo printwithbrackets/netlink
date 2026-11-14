@@ -2,15 +2,15 @@
 //! loopback UDP, speaking the same wire protocol as the C core.
 //!
 //! Requires the C library to be built first (`make` at the repository
-//! root produces `build/libnetlink.a`). Run with:
+//! root produces `build/libweft_net.a`). Run with:
 //!
 //! ```sh
 //! cd bindings/rust && cargo test
 //! ```
 
-use netlink::{Client, Config, Delivery, EventType, PeerId, Server};
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
+use weft_net::{Client, Config, Delivery, EventType, PeerId, Server};
 
 /// Ports come from the OS, not a fixed base.
 ///
@@ -30,7 +30,7 @@ fn next_port() -> u16 {
         .port()
 }
 
-fn wait_for(ep: &netlink::Endpoint, typ: EventType, timeout: Duration) -> netlink::Event {
+fn wait_for(ep: &weft_net::Endpoint, typ: EventType, timeout: Duration) -> weft_net::Event {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if let Some(ev) = ep.poll_event(Duration::from_millis(50)) {
@@ -72,7 +72,7 @@ fn connected_pair() -> Pair {
 
 #[test]
 fn version_is_semver() {
-    let v = netlink::version();
+    let v = weft_net::version();
     assert!(!v.is_empty(), "version() returned empty");
     assert!(v.contains('.'), "version() = {:?}, expected X.Y.Z", v);
 }
@@ -151,7 +151,7 @@ fn send_ex_and_peer_stats() {
             0,
             Delivery::ReliableOrdered,
             b"urgent",
-            netlink::priority::HIGH,
+            weft_net::priority::HIGH,
         )
         .expect("send_ex");
     let ev = wait_for(&p.server, EventType::Data, Duration::from_secs(3));
@@ -175,7 +175,7 @@ fn send_ex_and_peer_stats() {
         .peer_capabilities(p.client_peer)
         .expect("caps for known peer");
     assert!(
-        caps & netlink::caps::FLOW_CONTROL != 0,
+        caps & weft_net::caps::FLOW_CONTROL != 0,
         "caps = {:#x}, missing FLOW_CONTROL",
         caps
     );
@@ -251,7 +251,7 @@ fn duplicate_connect_rejected() {
         .expect_err("second connect to same address must fail");
     assert_eq!(
         err.code, -6,
-        "want NL_ERR_ALREADY_CONNECTED (-6), got {}",
+        "want WN_ERR_ALREADY_CONNECTED (-6), got {}",
         err.code
     );
     assert!(
@@ -265,8 +265,8 @@ fn duplicate_connect_rejected() {
 }
 
 #[test]
-fn netlink_error_display_and_error_trait() {
-    let e = netlink::NetLinkError {
+fn weft_net_error_display_and_error_trait() {
+    let e = weft_net::WeftNetError {
         code: -6,
         message: "already connected".into(),
     };

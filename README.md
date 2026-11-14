@@ -1,4 +1,4 @@
-# NetLink
+# weft-net
 
 A lightweight, security-first network communication library for games and
 general-purpose client/server applications. It gives you UDP's speed with
@@ -16,10 +16,10 @@ Python, Go, and Rust all speaking the same wire protocol.
 
 Netcode bugs are usually protocol bugs, and protocol bugs multiply when
 the same handshake/reliability/encryption logic is written N times in N
-languages that inevitably drift out of sync. NetLink implements the
+languages that inevitably drift out of sync. weft-net implements the
 protocol exactly once, in portable C11 (`src/`), and every language
 binding (`bindings/`) is a thin wrapper over its stable C ABI
-(`include/netlink.h`). A Python client and a Go server are running the
+(`include/weft_net.h`). A Python client and a Go server are running the
 literal same reliability and crypto code, not two independent
 reimplementations that happen to agree today.
 
@@ -47,19 +47,19 @@ reimplementations that happen to agree today.
   server doesn't allocate full connection state until a client echoes
   back a server-issued cookie, proving it can receive at its claimed
   source address; handshake processing is additionally rate-limited.
-- **WebSocket transport** (`NL_TRANSPORT_WEBSOCKET`): TCP + RFC6455
-  framing for browser/interoperability use. The same encrypted NetLink
+- **WebSocket transport** (`WN_TRANSPORT_WEBSOCKET`): TCP + RFC6455
+  framing for browser/interoperability use. The same encrypted weft-net
   handshake and reliability machinery rides inside binary WebSocket
-  messages (one NL packet per frame); the opening HTTP upgrade is a
+  messages (one WN packet per frame); the opening HTTP upgrade is a
   standards-compliant `Sec-WebSocket-Key`/`Accept` exchange (SHA-1 via
   OpenSSL EVP). LAN discovery remains UDP-only and returns
-  `NL_ERR_UNSUPPORTED` on WebSocket endpoints. Fixed path `/`.
+  `WN_ERR_UNSUPPORTED` on WebSocket endpoints. Fixed path `/`.
 - **Native thread safety.** The library runs its own background I/O
-  thread; `nl_send()` and `nl_poll_event()` can be called from any thread,
+  thread; `wn_send()` and `wn_poll_event()` can be called from any thread,
   including concurrently from several, without external locking. A polled
   event's payload is borrowed to the calling thread only — other threads
   polling in the meantime never free it. Destroying the endpoint wakes a
-  thread blocked in `nl_poll_event()` and that poll returns false.
+  thread blocked in `wn_poll_event()` and that poll returns false.
 - **IPv6 support**, dual-stack where the OS allows it (implemented and
   exercised in code review; see [Testing](#testing) for why it couldn't
   be run to completion in this project's own dev sandbox).
@@ -78,7 +78,7 @@ reimplementations that happen to agree today.
   TCP's "three duplicate acks"), the missing packet is retransmitted
   immediately rather than waiting for the RTO timer -- often shaving a
   full RTT or more off recovery latency.
-- **Per-peer statistics** (`nl_peer_stats`): packets/bytes sent and
+- **Per-peer statistics** (`wn_peer_stats`): packets/bytes sent and
   received, retransmit count, duplicate/replayed packets rejected,
   smoothed RTT, RTT variance, and current RTO -- useful for in-game
   diagnostics or server-side monitoring.
@@ -94,12 +94,12 @@ reimplementations that happen to agree today.
 - **Per-connection rate limiting.** Optional token-bucket limit on
   payload bytes/second (`config.max_send_bytes_per_sec`); retransmits
   and keepalives are exempt so loss recovery is never starved.
-- **Priority/QoS per send.** `nl_send_ex(..., priority)` parks messages
+- **Priority/QoS per send.** `wn_send_ex(..., priority)` parks messages
   when the send window is closed and flushes highest-priority first as
   budget opens (stable FIFO within a priority).
 - **Protocol capability negotiation in the handshake.** Peers advertise
-  an `NL_CAP_*` bitmask in REQUEST/CHALLENGE; the negotiated set is the
-  intersection of both sides' sets (`nl_peer_capabilities`), so future
+  an `WN_CAP_*` bitmask in REQUEST/CHALLENGE; the negotiated set is the
+  intersection of both sides' sets (`wn_peer_capabilities`), so future
   optional features don't require moving every peer in lockstep.
 
 ### Deliberately not included (see [Roadmap](#roadmap--known-limitations))
@@ -113,25 +113,25 @@ reimplementations that happen to agree today.
 ### C
 
 ```c
-#include <netlink.h>
+#include <weft_net.h>
 #include <stdio.h>
 
-nl_config_t cfg;
-nl_config_default(&cfg);
+wn_config_t cfg;
+wn_config_default(&cfg);
 
-nl_address_t addr = {0};
+wn_address_t addr = {0};
 snprintf(addr.host, sizeof(addr.host), "%s", "0.0.0.0");
 addr.port = 9000;
 
-nl_endpoint_t *server;
-nl_server_create(&addr, &cfg, &server);
+wn_endpoint_t *server;
+wn_server_create(&addr, &cfg, &server);
 
 while (1) {
-    nl_event_t ev;
-    if (!nl_poll_event(server, &ev, 100)) continue;
-    if (ev.event_type == NL_EVENT_DATA) {
-        if (nl_send(server, ev.peer, ev.channel, NL_RELIABLE_ORDERED,
-                    ev.data, ev.data_len) != NL_OK) {
+    wn_event_t ev;
+    if (!wn_poll_event(server, &ev, 100)) continue;
+    if (ev.event_type == WN_EVENT_DATA) {
+        if (wn_send(server, ev.peer, ev.channel, WN_RELIABLE_ORDERED,
+                    ev.data, ev.data_len) != WN_OK) {
             fprintf(stderr, "echo send failed\n");
         }
     }
@@ -143,37 +143,37 @@ runnable programs.
 
 ### WebSocket transport
 
-Set `cfg.transport = NL_TRANSPORT_WEBSOCKET` on both ends. The server
+Set `cfg.transport = WN_TRANSPORT_WEBSOCKET` on both ends. The server
 listens on TCP and speaks the RFC6455 opening handshake; the client
-dials out, upgrades, then runs the normal encrypted NetLink handshake.
-One NetLink packet rides in each binary WebSocket message.
+dials out, upgrades, then runs the normal encrypted weft-net handshake.
+One weft-net packet rides in each binary WebSocket message.
 
 ```c
-nl_config_t cfg;
-nl_config_default(&cfg);
-cfg.transport = NL_TRANSPORT_WEBSOCKET;
+wn_config_t cfg;
+wn_config_default(&cfg);
+cfg.transport = WN_TRANSPORT_WEBSOCKET;
 
-nl_address_t addr = {0};
+wn_address_t addr = {0};
 snprintf(addr.host, sizeof(addr.host), "%s", "0.0.0.0");
 addr.port = 9001;
 
-nl_endpoint_t *server;
-nl_server_create(&addr, &cfg, &server);
-/* ... same nl_poll_event / nl_send loop as UDP ... */
+wn_endpoint_t *server;
+wn_server_create(&addr, &cfg, &server);
+/* ... same wn_poll_event / wn_send loop as UDP ... */
 ```
 
 See `tests/integration/test_websocket_integration.c` for a full
 client/server example. Path is fixed to `/`; LAN discovery is UDP-only
-and returns `NL_ERR_UNSUPPORTED` on WebSocket endpoints.
+and returns `WN_ERR_UNSUPPORTED` on WebSocket endpoints.
 
 ### Python
 
 ```python
-import netlink
+import weft_net
 
-server = netlink.Server("0.0.0.0", 9000)
+server = weft_net.Server("0.0.0.0", 9000)
 for event in server.events(timeout=1.0):
-    if event.type == netlink.EventType.DATA:
+    if event.type == weft_net.EventType.DATA:
         server.send(event.peer, event.channel, event.data)
 ```
 
@@ -183,7 +183,7 @@ See `bindings/python/README.md`.
 
 ```go
 // see bindings/go/README.md
-server, err := netlink.NewServer("0.0.0.0", 9000, netlink.NewConfig())
+server, err := weftnet.NewServer("0.0.0.0", 9000, weftnet.NewConfig())
 ```
 
 ```rust
@@ -218,14 +218,14 @@ make CRYPTO_CFLAGS="-I/path/to/openssl/include" CRYPTO_LIBS="-L/path/to/openssl/
 make CRYPTO_CFLAGS="-I$(brew --prefix openssl)/include" CRYPTO_LIBS="-L$(brew --prefix openssl)/lib -lcrypto"
 ```
 
-This produces `build/libnetlink.a` (static) and `build/libnetlink.so`
+This produces `build/libweft_net.a` (static) and `build/libweft_net.so`
 (shared, for FFI bindings). `make test` builds and runs the full test
 suite; `make examples` builds the example programs.
 
 ## Architecture
 
 ```
-include/netlink.h    Public C ABI -- every binding targets exactly this.
+include/weft_net.h    Public C ABI -- every binding targets exactly this.
 src/
   protocol.h          Wire format constants (packet types, header layout).
   byteorder.h          Alignment-safe big-endian read/write helpers.
@@ -236,16 +236,16 @@ src/
                            -- all via OpenSSL EVP, no hand-rolled primitives.
   websocket.{h,c}         RFC6455 framing + HTTP upgrade handshake (pure
                            logic, unit-tested; no sockets). Endpoint.c
-                           drives it for NL_TRANSPORT_WEBSOCKET.
+                           drives it for WN_TRANSPORT_WEBSOCKET.
   channel.{h,c}            Per-(channel, delivery mode) "lane" state,
                             tying seqbuf + fragment together. Pure logic,
                             no sockets -- independently unit-testable by
                             feeding one instance's output into another's.
   connection.{h,c}          One established peer: encryption keys, the
                             channel array, and the mutex that makes
-                            concurrent nl_send()/receive/tick safe.
+                            concurrent wn_send()/receive/tick safe.
   util.c                     Version string, error strings, and
-                              nl_config_default -- the small public
+                              wn_config_default -- the small public
                               surface with no better home.
   socket_compat.h             Winsock/POSIX socket shims (the _WIN32
                                branch is written but not CI-tested, see
@@ -253,13 +253,13 @@ src/
   endpoint.c                  Sockets, the background I/O thread, the
                                connect handshake state machine, the
                                connection table, and the event queue --
-                               i.e. everything in include/netlink.h.
+                               i.e. everything in include/weft_net.h.
 ```
 
 ### Delivery modes and channels
 
 A `channel_id` (0-31) selects an independent lane with its own sequence
-space; a `nl_delivery_t` chosen per `nl_send()` call selects the
+space; a `wn_delivery_t` chosen per `wn_send()` call selects the
 guarantee for that specific message. The two compose freely: you might
 send player input reliably-ordered on channel 0, chat messages
 reliably-ordered on channel 1 (so a lost chat message never delays input,
@@ -294,7 +294,7 @@ or vice versa), and position updates unreliable-sequenced on channel 2.
   replayable. The window is only updated *after* successful
   authentication, so a forged packet can't "burn" a valid counter value
   and cause a legitimate later packet to be wrongly rejected (see
-  `src/crypto.c`'s `nl_replay_window_would_accept` vs `_check` split).
+  `src/crypto.c`'s `wn_replay_window_would_accept` vs `_check` split).
 - **Fragmentation bounds:** fragment count, index, and total reconstructed
   size are all validated against fixed maximums before any allocation;
   concurrent in-flight reassemblies are capped with oldest-eviction, and
@@ -332,7 +332,7 @@ and Rust):
   between the endpoint's I/O thread and user threads -- so the concurrency
   claims below were previously untested. TSan also can't follow
   `setjmp`/`longjmp`, so the harness exits on first failure under
-  `NL_TEST_NO_LONGJMP` instead.
+  `WN_TEST_NO_LONGJMP` instead.
 - `test_network_simulation.c` specifically drives thousands of messages
   through a simulated bad network (configurable packet loss, jitter/
   reordering, duplication) and verifies `RELIABLE_ORDERED` delivery stays
@@ -351,12 +351,12 @@ and Rust):
   fragmentation of a 5000-byte and 40000-byte messages (the latter
   exceeds the initial congestion window and exercises continuation
   parking + standalone acks), one-way reliable traffic (server never
-  app-sends -- acks must ride on `NL_PKT_ACK`), multiple independent
+  app-sends -- acks must ride on `WN_PKT_ACK`), multiple independent
   channels, graceful disconnect, LAN discovery (including random-nonce
   rejection and `from_address` taken from the socket source),
   server-full denial, and the previously untested introspection APIs
-  (`nl_peer_address`, `nl_peer_rtt_ms`, `nl_peer_count`, `nl_send_ex`,
-  `nl_error_string`).
+  (`wn_peer_address`, `wn_peer_rtt_ms`, `wn_peer_count`, `wn_send_ex`,
+  `wn_error_string`).
 - The **Python bindings** (11 tests), **Go bindings** (10 tests via
   `go test`), and **Rust bindings** (11 tests via `cargo test`), each
   exercised the same way: real `Server` + `Client` over real sockets,
@@ -366,8 +366,8 @@ and Rust):
 - The **example C programs** (`echo_server`/`echo_client`), run as two
   independent OS processes exchanging messages across three channels and
   delivery modes. The Go and Rust example servers also build in CI.
-- The **WebSocket transport** (`NL_TRANSPORT_WEBSOCKET`): HTTP upgrade +
-  encrypted NetLink handshake + reliable/unordered/unreliable delivery
+- The **WebSocket transport** (`WN_TRANSPORT_WEBSOCKET`): HTTP upgrade +
+  encrypted weft-net handshake + reliable/unordered/unreliable delivery
   and fragmentation over loopback TCP, exercised by
   `tests/integration/test_websocket_integration.c` (8 cases).
 
@@ -410,7 +410,7 @@ genuinely valuable contribution.
 ### Future work
 
 An external review of this project suggested a substantial list of
-additions to move NetLink from "capable UDP library" toward something
+additions to move weft-net from "capable UDP library" toward something
 closer to a full modern transport (connection migration, an RPC layer,
 built-in serialization, compression, and more -- plus infrastructure
 like CMake, fuzzing, and multi-OS CI). It's good feedback and most of it
@@ -452,25 +452,38 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Changelog
 
+### Unreleased (rename to weft-net)
+
+- Renamed the project to weft-net. The C prefix is now `wn_` / `WN_`, the
+  header is `include/weft_net.h`, and the library is `libweft_net.a` /
+  `libweft_net.so`. The Python package is `weft_net` (distribution
+  `weft-net-py`), the Go package is `weftnet`, and the Rust crate is
+  `weft-net-rs` with library name `weft_net`. Environment variables are
+  `WEFT_NET_LIBRARY_PATH` and `WEFT_NET_LIB_DIR`.
+- Wire change. The packet magic is now `WNK1` and the HKDF labels are
+  `weft-net v1 ...`, so builds from before the rename cannot connect to
+  this one. Old peers are rejected at the magic check instead of failing
+  later at decryption.
+
 ### 1.3.0 (2026-11-11)
 
 **Fixed**
 
-- **A reliable message could be lost when two large messages were in flight on `NL_RELIABLE_UNORDERED`.** A fragment was recorded in the receive window, and therefore acked, before reassembly decided whether it had room. If reassembly then refused it (byte budget or no free slot) the sender saw an ack and never retransmitted, so the message was gone for good. A new fragment that reassembly cannot take is now left unrecorded and unacked, so the normal retransmit path delivers it once an in-flight message completes. Reliable lanes also no longer evict or time out a partly reassembled message, because its fragments were already acked and would not be resent. Unreliable lanes keep both behaviors. New helpers: `nl_recv_dedupe_seen`, `nl_reassembly_tracker_set_reliable`, `nl_reassembly_would_accept`.
+- **A reliable message could be lost when two large messages were in flight on `WN_RELIABLE_UNORDERED`.** A fragment was recorded in the receive window, and therefore acked, before reassembly decided whether it had room. If reassembly then refused it (byte budget or no free slot) the sender saw an ack and never retransmitted, so the message was gone for good. A new fragment that reassembly cannot take is now left unrecorded and unacked, so the normal retransmit path delivers it once an in-flight message completes. Reliable lanes also no longer evict or time out a partly reassembled message, because its fragments were already acked and would not be resent. Unreliable lanes keep both behaviors. New helpers: `wn_recv_dedupe_seen`, `wn_reassembly_tracker_set_reliable`, `wn_reassembly_would_accept`.
 - **A one-way stream could stall after the receiving app drained its queue.** The receiver advertised a closed window in its last ack and never told the sender the window had reopened, because window updates only rode on acks and on DATA. The tick now sends a window-only ack (`ack_valid = 0`) once the window has grown by at least one fragment's worth since the last advertisement. `KEEPALIVE` now carries the local window as a 2-byte payload, so a lost update is repaired within one keepalive interval. Older peers ignore the keepalive payload and already accept window-only acks, so no protocol version bump is needed.
 - **A burst of losses cut the congestion window once per detection.** Five separate losses inside one window of data took cwnd from 32 to 2. Fast-retransmit losses detected within one smoothed RTT of the previous reduction are now treated as one congestion event and cut the window once. An RTO still always applies.
 - **The shared handshake budget could be spent to cancel handshakes already in progress.** One 200-per-second counter covered REQUEST and RESPONSE and was charged before anything was validated, so about 200 spoofed REQUESTs per second made the server drop every real retry and every RESPONSE. A retransmitted REQUEST for an entry that is already pending no longer draws on the budget (each pending entry is limited to one resend per 100 ms instead, and a throttled retry still marks the entry live so flood eviction spares it). A RESPONSE no longer draws on it either: the expensive work only runs for a genuine cookie and consumes the pending entry. New REQUESTs are still limited, so a spoofed flood can still keep new clients out. Closing that needs per-source limits and a stateless retry token.
-- **The server accepted a client-chosen connection id of 0**, which is `NL_INVALID_PEER`. Such a REQUEST is now dropped silently.
-- **Session keys were not wiped.** `memset` before `free` is a dead store and the optimizer removed it from `nl_connection_destroy`. Keys, the shared secret, and the server cookie secret now go through the new `nl_crypto_wipe` (`OPENSSL_cleanse`).
-- **Priority could reorder a `NL_RELIABLE_ORDERED` stream.** A later high-priority message on a channel jumped ahead of an earlier low-priority one on the same channel while sends were parked, so the receiver saw them swapped. Priority still applies across channels and across unordered traffic, but never within one ordered stream.
-- **AEAD finalize offset.** `nl_crypto_aead_encrypt` and `nl_crypto_aead_decrypt` reused the length reported by the AAD update as an output offset when the payload was empty. Harmless in practice, no behavior change.
+- **The server accepted a client-chosen connection id of 0**, which is `WN_INVALID_PEER`. Such a REQUEST is now dropped silently.
+- **Session keys were not wiped.** `memset` before `free` is a dead store and the optimizer removed it from `wn_connection_destroy`. Keys, the shared secret, and the server cookie secret now go through the new `wn_crypto_wipe` (`OPENSSL_cleanse`).
+- **Priority could reorder a `WN_RELIABLE_ORDERED` stream.** A later high-priority message on a channel jumped ahead of an earlier low-priority one on the same channel while sends were parked, so the receiver saw them swapped. Priority still applies across channels and across unordered traffic, but never within one ordered stream.
+- **AEAD finalize offset.** `wn_crypto_aead_encrypt` and `wn_crypto_aead_decrypt` reused the length reported by the AAD update as an output offset when the payload was empty. Harmless in practice, no behavior change.
 
 **Changed**
 
-- **Build hardening.** `-fvisibility=hidden` (the shared library now exports only the 18 `NL_API` functions, down from 99, so internal `nl_crypto_*`, `nl_channel_*` and `*_for_test` symbols are no longer ABI), `-D_FORTIFY_SOURCE=2`, and on Linux `-Wl,-z,relro,-z,now`.
-- `NL_API` expands to nothing on compilers without the GNU attribute (MSVC building the static library).
+- **Build hardening.** `-fvisibility=hidden` (the shared library now exports only the 18 `WN_API` functions, down from 99, so internal `wn_crypto_*`, `wn_channel_*` and `*_for_test` symbols are no longer ABI), `-D_FORTIFY_SOURCE=2`, and on Linux `-Wl,-z,relro,-z,now`.
+- `WN_API` expands to nothing on compilers without the GNU attribute (MSVC building the static library).
 - `examples/echo_client.c` measures its connect and echo deadlines from a fixed start instead of treating one quiet 500 ms poll as a timeout, and no longer waits forever for the unreliable-sequenced echo.
-- **`make test-tsan` passes again.** `test_threading_destroy_wakes_poll_exit_racers` had a harness race: a racer could pass its `run` check, be preempted, and call `nl_poll_event` after `nl_endpoint_destroy` had finished, which breaks the API contract (no call may begin once destroy has started) and TSan reported it as a use of a destroyed mutex. Each racer now makes exactly one last blocking call that is already inside the library before destroy runs, so destroy only races calls that started earlier. That is the property it has to tolerate, and the test still delivers fresh events while destroy drains. Four consecutive runs and the full `make test-tsan` target are clean.
+- **`make test-tsan` passes again.** `test_threading_destroy_wakes_poll_exit_racers` had a harness race: a racer could pass its `run` check, be preempted, and call `wn_poll_event` after `wn_endpoint_destroy` had finished, which breaks the API contract (no call may begin once destroy has started) and TSan reported it as a use of a destroyed mutex. Each racer now makes exactly one last blocking call that is already inside the library before destroy runs, so destroy only races calls that started earlier. That is the property it has to tolerate, and the test still delivers fresh events while destroy drains. Four consecutive runs and the full `make test-tsan` target are clean.
 - Header and README: the protocol history now covers v4 and v5, the roadmap no longer lists the 32-bit ack bitmap or the pkg-config file, and the 1.2.0 entry notes that the ack window ended at 64 bits.
 
 ### 1.2.0 (2026-10-18)
@@ -486,20 +499,20 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   destroy. The existing suite runs every test on one thread
   and never under TSan, so it could not reach the races between the
   endpoint's I/O thread and user threads — which is how both the
-  `nl_poll_event` use-after-free below and a queue-head data race
+  `wn_poll_event` use-after-free below and a queue-head data race
   survived. `tests/tsan.supp` suppresses only races wholly inside
   OpenSSL's own threading layer (it frees its lazily-allocated lock table
   as threads exit, concurrently with other threads' crypto work).
 
   That suppression file was itself a finding: its first version
   suppressed `race:libcrypto.so`, i.e. any report with a libcrypto frame
-  anywhere in it. Because NetLink's I/O thread reaches libcrypto on every
+  anywhere in it. Because weft-net's I/O thread reaches libcrypto on every
   packet, that pattern was also swallowing a genuine `queue_lock` race in
-  NetLink. It is now narrowed to OpenSSL's own symbols, with the reasoning
-  and the NetLink frames that must *not* be added recorded inline.
+  weft-net. It is now narrowed to OpenSSL's own symbols, with the reasoning
+  and the weft-net frames that must *not* be added recorded inline.
 
-- **Endpoint event-queue byte cap.** New `nl_config_t.event_queue_max_bytes`
-  (default ~4 MB, `NL_EVENT_QUEUE_UNLIMITED` = 0xFFFFFFFFu to restore the
+- **Endpoint event-queue byte cap.** New `wn_config_t.event_queue_max_bytes`
+  (default ~4 MB, `WN_EVENT_QUEUE_UNLIMITED` = 0xFFFFFFFFu to restore the
   1.1.x behavior): a hostile peer flooding DATA previously grew the
   endpoint-wide event queue without limit. When the queued payload bytes
   hit the cap, further events -- including connection and disconnect
@@ -511,7 +524,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   bursts drains and reclaims) and
   `test_event_queue_cap_legit_traffic_flows` (bidirectional traffic with
   a 2048-byte cap), both asserting the byte counter through the
-  test-only `nl_endpoint_event_queue_bytes_for_test`.
+  test-only `wn_endpoint_event_queue_bytes_for_test`.
 - **Server-side channel-count clamp.** A client's CONNECT_REQUEST named
   any channel count 1..32 and the server honored exactly that,
   allocating attacker-chosen per-connection channel/lane buffers
@@ -522,27 +535,27 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   check, same as protocol mismatches today). Regression test:
   `test_server_clamps_negotiated_channel_count`.
 - **Per-connection reassembly byte budget.** Each connection's fragment
-  trackers now carry `NL_REASSEMBLY_BYTE_BUDGET_DEFAULT` (one
-  NL_MAX_MESSAGE_SIZE + slack): an incomplete message charges its full
+  trackers now carry `WN_REASSEMBLY_BYTE_BUDGET_DEFAULT` (one
+  WN_MAX_MESSAGE_SIZE + slack): an incomplete message charges its full
   declared size at slot acquisition, and messages that would exceed the
   budget are rejected without displacing in-flight ones, so fragments
   spread across message ids cannot pin more than one maximum-size
   message. Tracker buffers are also allocated at the message's declared
-  size (`fragment_count x NL_FRAGMENT_CHUNK_SIZE`) instead of a fixed
+  size (`fragment_count x WN_FRAGMENT_CHUNK_SIZE`) instead of a fixed
   256 KB, so the common small case costs kilobytes per tracker rather
   than always-max. Regression tests:
   `test_reassembly_byte_budget_rejects_overcommitted_spread`,
   `test_reassembly_byte_budget_rejects_single_oversized_message`,
   `test_reassembly_byte_budget_does_not_reject_max_size_message`.
 - **WebSocket link lifetimes.** Links (either side) now have a connecting
-  timeout (NL_WS_CONNECT_TIMEOUT_MS, 10s) and an idle timeout
-  (NL_WS_IDLE_TIMEOUT_MS, 60s): a raw TCP peer that lands on a
+  timeout (WN_WS_CONNECT_TIMEOUT_MS, 10s) and an idle timeout
+  (WN_WS_IDLE_TIMEOUT_MS, 60s): a raw TCP peer that lands on a
   WebSocket port and never completes the upgrade previously held its
   socket + decoder memory forever. An active session keeps its link fed
   by keepalives, so healthy idle connections are untouched. Regression
   test: `test_ws_reaps_pre_upgrade_links`.
 - **WebSocket read fairness.** One link's feed loop is capped at
-  NL_WS_READ_CHUNKS_PER_CYCLE (32 x 2KB) recv chunks per ready cycle:
+  WN_WS_READ_CHUNKS_PER_CYCLE (32 x 2KB) recv chunks per ready cycle:
   a peer feeding its TCP connection as fast as packets could be
   decrypted otherwise monopolizes the single I/O thread. poll() is
   level-triggered so the rest resumes next cycle.
@@ -559,10 +572,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 **Fixed**
 
 - **Destroy could free the endpoint under a still-exiting poller.**
-  In `nl_poll_event`, `active_pollers` was decremented and `queue_lock`
+  In `wn_poll_event`, `active_pollers` was decremented and `queue_lock`
   dropped before the poller's last endpoint touches (the borrow-window
   release and borrow booking re-lock endpoint mutexes), so
-  `nl_endpoint_destroy`'s drain loop (waiting only for
+  `wn_endpoint_destroy`'s drain loop (waiting only for
   `active_pollers == 0`) could free everything underneath a poller that
   was merely preempted in that window. The decrement now happens in a
   `poller_exit()` helper called as the last epoll-touching operation on
@@ -571,24 +584,24 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   consecutive clean runs; it reports the `pthread_mutex_destroy` vs
   `pthread_mutex_lock` race against the old code).
 - **Deferred-queue byte bound changed mid-1.0.0.** The
-  `NL_DEFERRED_MAX_BYTES` bound is `NL_MAX_MESSAGE_SIZE + 64 KB`
+  `WN_DEFERRED_MAX_BYTES` bound is `WN_MAX_MESSAGE_SIZE + 64 KB`
   (~320 KB) per connection, not the "64 KB" implied before (the bound
   was raised so a full maximum-size message can always fit in the
-  deferred queue below the window). The `nl_send` docstring and the
+  deferred queue below the window). The `wn_send` docstring and the
   priority bounds above now state the real number.
 
 - **An RTT sample could be computed from a backwards clock.** `now_ms` is
   supplied by the caller, so a cross-CPU timestamp or a wrapped clock source
   can have it precede a slot's `send_time_ms`. `now_ms - send_time_ms` then
   underflowed on `uint64_t` and the `uint32_t` truncation landed near 4
-  billion ms — reported verbatim by `nl_peer_rtt_ms()` and folded into
+  billion ms — reported verbatim by `wn_peer_rtt_ms()` and folded into
   `srtt`, from which it never recovers. The sample is now discarded (the
   slot is still acked) rather than clamped, since clamping would still
   poison the estimator. Regression tests:
   `test_rtt_sample_discarded_when_now_goes_backwards` and, end to end
   through the public stats path,
   `test_backwards_now_does_not_poison_rtt_estimator`.
-- **`nl_poll_event` read `ep->queue_head` without holding `queue_lock`.**
+- **`wn_poll_event` read `ep->queue_head` without holding `queue_lock`.**
   The empty-queue paths (non-blocking poll, and a timed wait that expired)
   dropped the lock and then re-read the queue head to decide whether an
   event had arrived -- racing the I/O thread's `push_event`, which writes
@@ -610,14 +623,14 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   "Ack bitmap widened" below, so the final window is 64.) An
   ack can only name 32 sequences back from the receiver's newest one,
   while the congestion window allowed 256 packets in flight
-  (`NL_SSTHRESH_INITIAL_PACKETS` was 64). More than 32 reliable packets
+  (`WN_SSTHRESH_INITIAL_PACKETS` was 64). More than 32 reliable packets
   in flight was therefore a normal steady state: once the receiver's
   horizon advanced past a still-unacked sequence, no future ack could
   name it again, even after the sender retransmitted it and the receiver
-  had it. It burned all `NL_MAX_RETRIES` and the connection was torn
-  down with `NL_ERR_TIMEOUT`. A loss burst of >=8 consecutive packets
-  killed a healthy connection. `NL_CWND_MAX_PACKETS` and
-  `NL_SSTHRESH_INITIAL_PACKETS` are now clamped to the ack window
+  had it. It burned all `WN_MAX_RETRIES` and the connection was torn
+  down with `WN_ERR_TIMEOUT`. A loss burst of >=8 consecutive packets
+  killed a healthy connection. `WN_CWND_MAX_PACKETS` and
+  `WN_SSTHRESH_INITIAL_PACKETS` are now clamped to the ack window
   (32), enforced by `_Static_assert`, and congestion control gates on
   the *span* from each lane's oldest unacked sequence to its next
   sequence rather than the count of unacked slots -- counting
@@ -625,7 +638,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   lost, later ones acked). Regression tests:
   `test_burst_loss_at_cwnd_above_ack_window_no_teardown` (end to end,
   no teardown) and `test_oldest_unacked_tracks_span_not_count`.
-- **`nl_poll_event`'s payload borrow was a single endpoint-wide slot.**
+- **`wn_poll_event`'s payload borrow was a single endpoint-wide slot.**
   `ep->returned_owned_data` was freed by the *next* poll from *any* thread,
   so two threads polling concurrently meant one thread's poll freed a buffer
   another was still reading — a use-after-free that also made the Rust
@@ -638,7 +651,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   over 600 messages): `test_concurrent_pollers_do_not_free_each_others_payloads`
   — ASan reports a heap-use-after-free against the old code.
 - **Continuation sends reported the wrong fragment count when the send ring
-  filled up.** `nl_channel_send_range`'s ring-full path set
+  filled up.** `wn_channel_send_range`'s ring-full path set
   `*out_sent_frags = i`, but the loop counts from `start_frag`, so on a
   continuation send it over-reported by `start_frag` — claiming fragments
   it never emitted. `flush_deferred` turns that into a continuation parked at
@@ -646,24 +659,24 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   application expects whole. Now `(i - start_frag)`, matching the success
   path. Regression test: `test_partial_send_reports_fragments_actually_sent`.
 - **A dropped reorder-ring insert was still acked.**
-  `nl_reorder_ring_insert`'s return value was discarded, and the dedupe
+  `wn_reorder_ring_insert`'s return value was discarded, and the dedupe
   insert preceding it had already recorded the sequence — so a
   `RELIABLE_ORDERED` packet too far ahead of `next_expected` to buffer was
   marked as received and acked. The sender stopped retransmitting it,
   `next_expected` sat behind the gap forever, and every later message on
-  that lane was withheld with it. `nl_channel_on_receive` now checks
-  `nl_reorder_ring_reachable()` (new; extracted from the ring's own rule)
+  that lane was withheld with it. `wn_channel_on_receive` now checks
+  `wn_reorder_ring_reachable()` (new; extracted from the ring's own rule)
   *before* touching the dedupe, so an unreachable packet leaves no
   bookkeeping and no ack. Regression test:
   `test_packet_beyond_reorder_window_is_dropped_not_acked`.
 - **Receive-window charging was clamped while the release was not.** The
   charge on delivery did `used += min(len, room)`, so for a burst larger
   than the window less was charged than queued; the release on
-  `nl_poll_event` subtracted the full event length anyway. `recv_window_used`
+  `wn_poll_event` subtracted the full event length anyway. `recv_window_used`
   therefore drifted below the real outstanding bytes and the receiver kept
   advertising free window it didn't have — accepting more than it could
   buffer. The charge is now the full length (no clamp);
-  `nl_connection_adv_window()` already reports 0 for `used >= size`, so an
+  `wn_connection_adv_window()` already reports 0 for `used >= size`, so an
   over-count self-limits to "window closed" rather than corrupting the
   arithmetic. Regression test: `test_receive_window_charges_full_length`.
 - **`peer_rwnd_capacity` started at 32768, which the peer never
@@ -678,13 +691,13 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   (4096-byte peer window, 20000-byte message, must arrive).
 - **4-byte stack buffer overflow in the handshake retransmit path.**
   `retry_pending_handshakes` copied a pending entry's retained handshake
-  packet into a `pkt[NL_CONNECT_RESPONSE_SIZE]` (65-byte) array, but a
+  packet into a `pkt[WN_CONNECT_RESPONSE_SIZE]` (65-byte) array, but a
   server-side entry retains a `CONNECT_CHALLENGE`, which is 69 bytes.
   Every server handshake whose CHALLENGE was retransmitted (i.e. the
   normal retransmit path, >250 ms) overflowed the I/O thread's stack by
   four bytes. ASan/UBSan don't catch it because the clobbered bytes are
   the following struct member's fields, which the next two statements
-  overwrite. `NL_CONNECT_MAX_PACKET_SIZE` (the max over all four
+  overwrite. `WN_CONNECT_MAX_PACKET_SIZE` (the max over all four
   handshake packet sizes) is now the single source of truth for both
   `pending_t.retry_packet` and the copy-out array, with `_Static_assert`s
   covering every handshake packet so a future size change is a compile
@@ -696,24 +709,24 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 - **Fast retransmit had no cooldown and consumed the RTO give-up
   budget.** Every inbound packet whose ack horizon was >=3 sequences
   newer re-fired a retransmit for the same hole, and each of those bumped
-  `retry_count` -- the counter `nl_channel_tick` compares against
+  `retry_count` -- the counter `wn_channel_tick` compares against
   `max_retries`. About 18 acks within a second therefore drove
-  `retry_count` past `NL_MAX_RETRIES` and destroyed an otherwise healthy
+  `retry_count` past `WN_MAX_RETRIES` and destroyed an otherwise healthy
   connection. Slots now carry a `fast_retx_done` flag: set on the
   fast-retransmit path, cleared in `ack_one()`, and skipped while set, so
   each hole is fast-retransmitted at most once per flight. Fast retransmit
   refreshes `send_time_ms` (so the RTO scan doesn't immediately re-fire)
   but no longer touches `retry_count`, which is reserved for RTO retries.
-  The comment at `seqbuf.h`'s `nl_send_ring_fast_retransmit` claiming the
+  The comment at `seqbuf.h`'s `wn_send_ring_fast_retransmit` claiming the
   `send_time_ms`/`retry_count` bookkeeping prevented re-flagging was the
   source of the bug; it now describes the actual mechanism. Regression
   tests: `test_fast_retransmit_fires_once_per_hole`,
   `test_fast_retransmit_cooldown_clears_on_ack`.
-- **Ack bitmap widened from 32 to 64 bits** (`NL_ACK_WINDOW_BITS`),
+- **Ack bitmap widened from 32 to 64 bits** (`WN_ACK_WINDOW_BITS`),
   completing the fix above: a 32-bit bitmap against a 64-packet
   congestion window leaves the oldest packet of a full-window burst
   exactly at the edge of reach. The receiver already tracked 256
-  sequences (`NL_SEQ_RING_SIZE`) -- only the encoder refused to
+  sequences (`WN_SEQ_RING_SIZE`) -- only the encoder refused to
   express them. Regression tests:
   `test_ack_bitmap_window_covers_cwnd_in_flight` and
   `test_ack_bitmap_covers_burst_loss_at_full_cwnd` (both fail against a
@@ -732,20 +745,20 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   the receiver skip ack application entirely. Regression test:
   `test_no_ack_from_empty_lane_does_not_ack_peer_seq_zero`.
 - **Destroying an endpoint left threads blocked in
-  `nl_poll_event(timeout = -1)` hanging.** The wait loop woke only on a
+  `wn_poll_event(timeout = -1)` hanging.** The wait loop woke only on a
   queued event. A blocked poller never returned, and destroy went on to
   free `queue_cond` underneath it. Destroy now sets a shutdown flag and
   broadcasts under `queue_lock`, the wait loops check that flag alongside
   the queue head, and destroy waits for in-flight pollers to drain before
   freeing. A blocked poll returns false once shutdown is observed.
   Regression test: `test_threading_destroy_wakes_blocked_poll`.
-- **`nl_connect` silently dialed 127.0.0.1 when `server_addr.host` was
+- **`wn_connect` silently dialed 127.0.0.1 when `server_addr.host` was
   empty.** The resolve helper fell back to that literal for client
   sockets, hiding caller bugs. An empty host is now
-  `NL_ERR_INVALID_ARGUMENT` (a server bind still accepts an empty host
+  `WN_ERR_INVALID_ARGUMENT` (a server bind still accepts an empty host
   as "any address"). Regression test:
   `test_connect_empty_host_rejected`.
-- **A zero-length send passed NULL to `memcpy`.** `nl_send(..., NULL, 0)`
+- **A zero-length send passed NULL to `memcpy`.** `wn_send(..., NULL, 0)`
   reached the fragment encoder, where `memcpy(dst, NULL, 0)` is undefined
   behavior even at length zero. The copy is now guarded, and an empty
   payload round-trips as a zero-length DATA event. Regression test:
@@ -754,10 +767,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   receive window.** The packet was dropped without setting a result. The
   zero-initialized out-param then overwrote `peer_rwnd`, and the sender
   saw a closed window no later advertisement would reopen. Malformed
-  delivery now returns `NL_ERR_PROTOCOL_MISMATCH` before any window
+  delivery now returns `WN_ERR_PROTOCOL_MISMATCH` before any window
   bookkeeping. Regression test:
   `test_malformed_delivery_does_not_clobber_peer_window`.
-- **`nl_ws_encode` accepted reserved opcodes.** The old check only
+- **`wn_ws_encode` accepted reserved opcodes.** The old check only
   rejected opcodes above 0xF, but RFC 6455 reserves 0x3-0x7 and 0xB-0xF
   and a peer must drop frames that use them. Encoding is now an allowlist
   of the six defined opcodes. Regression test:
@@ -768,14 +781,14 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   failure held the slot until the 5 s pending expiry. The failure path
   now releases it explicitly. Regression test:
   `test_ws_failed_connect_does_not_leak_pending`.
-- **`nl_poll_event` handed out an untracked payload when borrow
+- **`wn_poll_event` handed out an untracked payload when borrow
   bookkeeping ran out of memory.** The old fallback returned the event
   and leaked the buffer. Its receive-window charge was then never
   released. The event is now dropped (poll returns false, payload freed,
   charge released) rather than handing out a buffer no later poll can
   reclaim.
-- **`nl_version_string()` was a hardcoded literal.** It is now expanded
-  from `NL_VERSION_MAJOR/MINOR/PATCH`. The string can no longer drift
+- **`wn_version_string()` was a hardcoded literal.** It is now expanded
+  from `WN_VERSION_MAJOR/MINOR/PATCH`. The string can no longer drift
   from the header. `test_version_string_matches_macros` covers it.
 
 **Added**
@@ -784,34 +797,34 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   the C structs (ctypes / `#[repr(C)]`) rather than including the header,
   so a field added on the C side and forgotten on a binding side compiles
   cleanly in both languages and only corrupts memory at runtime — exactly
-  what happened in 1.0.0, where three `nl_config_t` fields were missing
-  from both mirrors. `include/netlink.h` now has `NL_ABI_ASSERT`
-  `_Static_assert`s pinning the 64-bit sizes of `nl_config_t` (56),
-  `nl_event_t` (192), `nl_peer_stats_t` (64), and `nl_address_t` (72),
+  what happened in 1.0.0, where three `wn_config_t` fields were missing
+  from both mirrors. `include/weft_net.h` now has `WN_ABI_ASSERT`
+  `_Static_assert`s pinning the 64-bit sizes of `wn_config_t` (56),
+  `wn_event_t` (192), `wn_peer_stats_t` (64), and `wn_address_t` (72),
   and the Python test suite asserts the same numbers against the real
-  library plus reads `nl_config_default()` back through the mirror (which
+  library plus reads `wn_config_default()` back through the mirror (which
   also catches field *order* drift, where sizes agree but offsets don't).
 
 **Changed**
 
-- Wire format, two steps: DATA header `NL_DATA_HEADER_SIZE` 13 → 14
+- Wire format, two steps: DATA header `WN_DATA_HEADER_SIZE` 13 → 14
   (new `u8 ack_valid` between `ack_bits` and `rwnd`) and ACK payload
-  `NL_ACK_PAYLOAD_SIZE` 10 → 11, then `ack_bits` widened from `u32` to
-  `u64` (`NL_DATA_HEADER_SIZE` 14 → 18, `NL_ACK_PAYLOAD_SIZE` 11 → 15).
-  **`NL_PROTOCOL_VERSION` bumped 3 → 5.**
+  `WN_ACK_PAYLOAD_SIZE` 10 → 11, then `ack_bits` widened from `u32` to
+  `u64` (`WN_DATA_HEADER_SIZE` 14 → 18, `WN_ACK_PAYLOAD_SIZE` 11 → 15).
+  **`WN_PROTOCOL_VERSION` bumped 3 → 5.**
 - CI now checks Go (`gofmt -l`) and Rust (`cargo fmt --check`) formatting,
   and `make test-bindings` runs the Python suite under pytest first with
   the plain-script runner as a fallback. `CFLAGS`/`LDFLAGS` supplied on
   the command line or in the environment are appended to the required
   defaults instead of replacing them. The C examples validate their port
   argument, reject oversized hostnames instead of truncating silently,
-  and check `nl_send`'s return value.
+  and check `wn_send`'s return value.
 
 ### 1.1.1 (2026-09-25)
 
 **Fixed**
 
-- `gofmt` violations in the Go binding (`netlink.go`) and the Go
+- `gofmt` violations in the Go binding (`weftnet.go`) and the Go
   example (`examples/echo_server/main.go`) that made editors' Go
   linters (e.g. nvim-lint) report a parser error. Formatting only --
   no behavior change; `go vet` and `go test` still pass.
@@ -827,25 +840,25 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 **Added**
 
-- WebSocket transport (`NL_TRANSPORT_WEBSOCKET`): TCP + RFC6455 framing
+- WebSocket transport (`WN_TRANSPORT_WEBSOCKET`): TCP + RFC6455 framing
   with a real HTTP upgrade handshake (`Sec-WebSocket-Key`/`Accept`,
-  SHA-1 via OpenSSL EVP) and the existing encrypted NetLink protocol
-  inside binary frames (one NL packet per frame). 18 unit tests in
+  SHA-1 via OpenSSL EVP) and the existing encrypted weft-net protocol
+  inside binary frames (one WN packet per frame). 18 unit tests in
   `tests/test_websocket.c`; 5 loopback integration tests in
   `tests/integration/test_websocket_integration.c`. Path fixed to `/`;
-  LAN discovery is UDP-only and returns `NL_ERR_UNSUPPORTED` on
+  LAN discovery is UDP-only and returns `WN_ERR_UNSUPPORTED` on
   WebSocket endpoints.
 - Integration tests for the previously untested public C APIs:
-  `nl_peer_address`, `nl_peer_rtt_ms`, `nl_peer_count`, `nl_send_ex`
-  (priority + error paths), and `nl_error_string` (all codes).
-- Go binding tests (`bindings/go/netlink_test.go`, 10 real-socket
+  `wn_peer_address`, `wn_peer_rtt_ms`, `wn_peer_count`, `wn_send_ex`
+  (priority + error paths), and `wn_error_string` (all codes).
+- Go binding tests (`bindings/go/weftnet_test.go`, 10 real-socket
   tests): echo, all delivery modes, fragmentation, `SendEx` priority,
   peer stats/capabilities/RTT/count, disconnect, server-full denial,
   duplicate-connect rejection, error formatting.
 - Rust binding tests (`bindings/rust/tests/integration.rs`, 11
   real-socket tests + doctest) covering the same surface as Go.
 - Python binding tests for `peer_rtt_ms`, `peer_count`, and
-  `nl_error_string` (9 tests total, runnable without pytest).
+  `wn_error_string` (9 tests total, runnable without pytest).
 - `make test-bindings` target: runs Python + Go + Rust binding tests
   against the freshly built library.
 
@@ -857,20 +870,20 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
   `continue-on-error`; they run `go test` / `cargo test` (plus example
   builds) and fail the build on regressions.
 - cgo link flags now embed an rpath to `build/`, so `go test` finds
-  `libnetlink.so` without extra environment variables.
+  `libweft_net.so` without extra environment variables.
 - README, CONTRIBUTING, and `CROSS_LANGUAGE_TESTING.md` updated to
   reflect the verified Go/Rust status and new test counts.
 
 ### 1.0.0 (2026-09-24)
 
 First stable release. Library version is **1.0.0**
-(`NL_VERSION_MAJOR/MINOR/PATCH`, `nl_version_string()`, Python
+(`WN_VERSION_MAJOR/MINOR/PATCH`, `wn_version_string()`, Python
 `__version__` / `version()`, `Cargo.toml`, `pyproject.toml`). Wire
-protocol is **`NL_PROTOCOL_VERSION` 3**.
+protocol is **`WN_PROTOCOL_VERSION` 3**.
 
 Code review pass over the 0.1.0 core; all findings fixed with regression
 tests (`make` warning-free, `make test` green under ASan/UBSan). Wire
-format changed: **`NL_PROTOCOL_VERSION` bumped to 3** (see below).
+format changed: **`WN_PROTOCOL_VERSION` bumped to 3** (see below).
 
 Second review pass (same day): fixed one-way-reliable delivery (no
 standalone acks -- receiver had nothing to piggyback on), peer-rwnd
@@ -893,35 +906,35 @@ negotiation -- each with regression tests.
   Sends that exceed the window park in the deferred queue and flush when
   budget reopens.
 - **Flow control.** DATA headers now carry a u16 receive window (wire
-  format: `NL_DATA_HEADER_SIZE` 11 → 13). A sender defers when
+  format: `WN_DATA_HEADER_SIZE` 11 → 13). A sender defers when
   `peer_rwnd` is exhausted; the receiver releases the charge as the
-  application consumes events via `nl_poll_event`. `nl_channel_*` and
-  `nl_send_ring_ack` gained out-params for the newly-acked count and
+  application consumes events via `wn_poll_event`. `wn_channel_*` and
+  `wn_send_ring_ack` gained out-params for the newly-acked count and
   advertised window.
 - **Per-connection rate limiting.** `config.max_send_bytes_per_sec`
   (0 = unlimited) drives a token bucket with a 1 s burst cap; failed
   window checks never steal tokens; retransmits/keepalives bypass the
   limiter.
-- **Priority/QoS.** New `nl_send_ex(..., priority)` (and
-  `NL_PRIORITY_*` constants). Deferred messages are sorted descending by
+- **Priority/QoS.** New `wn_send_ex(..., priority)` (and
+  `WN_PRIORITY_*` constants). Deferred messages are sorted descending by
   priority (stable FIFO within a priority) and flushed highest-first as
   window/rate budget opens. Bounds: 128 messages /
-  (NL_MAX_MESSAGE_SIZE + 64 KB) payload bytes per connection; overflow
-  returns `NL_ERR_QUEUE_FULL`.
+  (WN_MAX_MESSAGE_SIZE + 64 KB) payload bytes per connection; overflow
+  returns `WN_ERR_QUEUE_FULL`.
 - **Capability negotiation.** REQUEST and CHALLENGE carry a u32
-  `NL_CAP_*` bitmask (`NL_CAP_FLOW_CONTROL`, `NL_CAP_PRIORITY`,
-  `NL_CAP_RATE_LIMIT`); both sides store the intersection and expose it
-  via `nl_peer_capabilities`. `NL_CAP_FLOW_CONTROL` is always forced on.
+  `WN_CAP_*` bitmask (`WN_CAP_FLOW_CONTROL`, `WN_CAP_PRIORITY`,
+  `WN_CAP_RATE_LIMIT`); both sides store the intersection and expose it
+  via `wn_peer_capabilities`. `WN_CAP_FLOW_CONTROL` is always forced on.
   Wire sizes: REQUEST 64 → 68 bytes, CHALLENGE 67 → 69.
-- **Standalone ACKs (protocol v3).** New encrypted `NL_PKT_ACK` packet so
+- **Standalone ACKs (protocol v3).** New encrypted `WN_PKT_ACK` packet so
   reliable traffic flowing one way (client → server with no reverse
   application data) still gets acks without waiting for a piggyback
   opportunity. Discovery probe nonces are now random (never zero) rather
   than a counter, so an off-path guesser can't forge a valid reply.
-  **`NL_PROTOCOL_VERSION` bumped 2 → 3** for these wire changes.
+  **`WN_PROTOCOL_VERSION` bumped 2 → 3** for these wire changes.
 - **Handshake retransmission.** `CONNECT_REQUEST`, `CONNECT_CHALLENGE`,
   and `CONNECT_ACCEPTED` are now retried on a 250 ms timer with a finite
-  budget (`NL_ACCEPT_RETRIES` for the final accept), instead of a single
+  budget (`WN_ACCEPT_RETRIES` for the final accept), instead of a single
   fire-and-forget send that left a lost packet stalling until idle
   timeout. Duplicate in-flight `REQUEST`s re-send the cached `CHALLENGE`
   rather than colliding on the pending table; `DENY` tears down a
@@ -931,12 +944,12 @@ negotiation -- each with regression tests.
   was dropped and the message never reassembled. The gate now runs once
   per complete message (against that message's highest fragment seq);
   every fragment reaches reassembly first.
-- **Reassembly expiry on every tick.** `nl_channel_tick` now calls
-  `nl_reassembly_expire` on each lane, so incomplete messages are
-  reclaimed after `NL_REASSEMBLY_TIMEOUT_MS` (8 s) instead of only under
+- **Reassembly expiry on every tick.** `wn_channel_tick` now calls
+  `wn_reassembly_expire` on each lane, so incomplete messages are
+  reclaimed after `WN_REASSEMBLY_TIMEOUT_MS` (8 s) instead of only under
   slot-eviction pressure.
 - **`encryption_enabled = false` rejected.** There is no cleartext mode;
-  `nl_server_create`/`nl_client_create` return `NL_ERR_UNSUPPORTED`
+  `wn_server_create`/`wn_client_create` return `WN_ERR_UNSUPPORTED`
   rather than silently encrypting (or shipping a protocol hole).
 - **Discovery hardening.** Replies must echo the most recent probe's
   random nonce (delayed/forged replies are dropped); the event's
@@ -950,13 +963,13 @@ negotiation -- each with regression tests.
   endpoint create, so discovery advertises the real limit instead of a
   value that would pass REQUEST-time checks and then fail silently at
   slot allocation.
-- **Duplicate `nl_connect` rejected.** A second connect to the same
+- **Duplicate `wn_connect` rejected.** A second connect to the same
   address while one is in flight or established returns
-  `NL_ERR_ALREADY_CONNECTED` instead of colliding on pending-table
+  `WN_ERR_ALREADY_CONNECTED` instead of colliding on pending-table
   lookups.
 - **`server_name` copied at create.** The endpoint owns a copy of
   `config.server_name`; clobbering the caller's buffer after
-  `nl_server_create` no longer changes what discovery reports.
+  `wn_server_create` no longer changes what discovery reports.
 - **Endpoint failure cleanup.** All create failure paths (resolve,
   socket, bind, I/O thread) free via `endpoint_free` — sockets, pending
   entries, connection table, queue, mutexes, and the server secret —
@@ -965,14 +978,14 @@ negotiation -- each with regression tests.
   released/teardown correctly on confirm, deny, and expiry (including
   destroying half-open client connections so `CONNECT_FAILED` is not
   delivered twice).
-- **Binding ABI fix.** Python's `_Config` and Rust's `nl_config_t`
-  mirror were missing the three new `nl_config_t` fields added above,
-  so `nl_config_default` wrote past the end of the binding's struct
+- **Binding ABI fix.** Python's `_Config` and Rust's `wn_config_t`
+  mirror were missing the three new `wn_config_t` fields added above,
+  so `wn_config_default` wrote past the end of the binding's struct
   (stack corruption / SIGSEGV at teardown in the Python CI job). Both
   mirrors now match C's layout (56 bytes); Go uses the real C header
   via cgo and was unaffected.
 - **Regression tests** for the above: version string matching
-  `NL_VERSION_*`, sequenced out-of-order fragments,
+  `WN_VERSION_*`, sequenced out-of-order fragments,
   channel-tick reassembly expiry, ACCEPTED retransmit budget,
   `encryption_enabled` rejection, duplicate connect, discovery wrong
   nonce + rate limit (raw-socket injection, works without broadcast),

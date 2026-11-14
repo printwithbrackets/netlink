@@ -1,12 +1,12 @@
 /* channel.h - per (channel_id, delivery_mode) "lane" state.
  *
- * Each nl_channel_t represents one user-visible channel and internally
- * splits into up to 4 independent lanes, one per nl_delivery_t value,
+ * Each wn_channel_t represents one user-visible channel and internally
+ * splits into up to 4 independent lanes, one per wn_delivery_t value,
  * allocated lazily on first use. This is what gives channels their
  * "don't block each other" property while still letting a single channel
  * carry a mix of delivery modes if the caller wants that: a lane used only
- * for NL_UNRELIABLE traffic never blocks on retransmission of a
- * NL_RELIABLE_ORDERED message sent on the same channel_id, because they
+ * for WN_UNRELIABLE traffic never blocks on retransmission of a
+ * WN_RELIABLE_ORDERED message sent on the same channel_id, because they
  * have entirely separate sequence spaces and buffers.
  *
  * This module knows nothing about sockets or encryption -- it operates on
@@ -15,42 +15,42 @@
  * makes it independently testable by literally feeding one instance's
  * output into another's input, no network required.
  */
-#ifndef NETLINK_CHANNEL_H
-#define NETLINK_CHANNEL_H
+#ifndef WEFT_NET_CHANNEL_H
+#define WEFT_NET_CHANNEL_H
 
 #include <stdint.h>
 #include <stdbool.h>
 #include "seqbuf.h"
 #include "fragment.h"
 #include "protocol.h"
-#include "../include/netlink.h"
+#include "../include/weft_net.h"
 
-#define NL_LANES_PER_CHANNEL 4 /* one per nl_delivery_t value */
+#define WN_LANES_PER_CHANNEL 4 /* one per wn_delivery_t value */
 
 /* Cap on per-slot exponential retransmit backoff: rto << min(retry,4),
  * clamped here so a long loss streak retries at ~this interval instead of
  * growing without bound (and so tests can jump time deterministically). */
-#define NL_MAX_BACKOFF_MS 10000
+#define WN_MAX_BACKOFF_MS 10000
 
 typedef struct {
-    nl_delivery_t delivery;
+    wn_delivery_t delivery;
     bool          in_use;
 
     /* send side */
     uint16_t next_sequence;
     uint16_t next_message_id;
-    nl_send_ring_t send_ring;     /* RELIABLE_* only */
+    wn_send_ring_t send_ring;     /* RELIABLE_* only */
     bool          send_ring_init;
 
     /* receive side */
-    nl_recv_dedupe_t recv_dedupe; /* RELIABLE_* only: dedupe + ack bitfield source */
+    wn_recv_dedupe_t recv_dedupe; /* RELIABLE_* only: dedupe + ack bitfield source */
     bool          recv_dedupe_init;
     /* Set when a reliable packet (even a duplicate -- the sender still
      * needs the ack) has been received and no outgoing packet on this
      * lane has piggybacked the ack since. connection.c flushes these as
-     * standalone NL_PKT_ACK packets when nothing is going the other way. */
+     * standalone WN_PKT_ACK packets when nothing is going the other way. */
     bool          ack_dirty;
-    nl_reorder_ring_t reorder_ring; /* RELIABLE_ORDERED only */
+    wn_reorder_ring_t reorder_ring; /* RELIABLE_ORDERED only */
     bool          reorder_ring_init;
     uint16_t      seq_highest_seen;      /* UNRELIABLE_SEQUENCED only */
     bool          seq_has_received_any;  /* UNRELIABLE_SEQUENCED only */
@@ -60,36 +60,36 @@ typedef struct {
     uint16_t      seq_frag_msg_id;
     uint16_t      seq_frag_max_seq;
     bool          seq_frag_active;
-    nl_reassembly_tracker_t reassembly;  /* any mode carrying fragmented messages */
+    wn_reassembly_tracker_t reassembly;  /* any mode carrying fragmented messages */
     bool          reassembly_init;
     /* Declared-size cap on in-flight reassembly messages this lane's
      * tracker may hold (0 = unlimited, unit tests). Written by
-     * nl_channel_set_reassembly_budget before any fragment can be fed. */
+     * wn_channel_set_reassembly_budget before any fragment can be fed. */
     uint32_t      reassembly_byte_budget;
-} nl_lane_t;
+} wn_lane_t;
 
 typedef struct {
-    nl_lane_t lanes[NL_LANES_PER_CHANNEL];
-} nl_channel_t;
+    wn_lane_t lanes[WN_LANES_PER_CHANNEL];
+} wn_channel_t;
 
-void nl_channel_init(nl_channel_t *chan);
-void nl_channel_free(nl_channel_t *chan);
+void wn_channel_init(wn_channel_t *chan);
+void wn_channel_free(wn_channel_t *chan);
 
 /* Cap the total declared-size sum of in-flight reassembly messages
  * across this channel's lanes: a message that would exceed it is
  * rejected by the lane's reassembly tracker
- * (see nl_reassembly_tracker_init_budget). Must be called before any
+ * (see wn_reassembly_tracker_init_budget). Must be called before any
  * fragment is fed. */
-void nl_channel_set_reassembly_budget(nl_channel_t *chan, uint32_t byte_budget);
+void wn_channel_set_reassembly_budget(wn_channel_t *chan, uint32_t byte_budget);
 
 /* Called when an outgoing reliable packet on this channel might need
  * retransmitting. Scans all reliable lanes' send rings for unacked entries
  * older than rto_ms and, for each, invokes `retransmit` with the fully
  * reconstructed wire payload (fresh piggybacked ack/ack_bits). */
-typedef void (*nl_channel_retransmit_fn)(void *ctx, const uint8_t *wire_payload, uint16_t len);
-void nl_channel_tick(nl_channel_t *chan, uint8_t channel_id, uint64_t now_ms, uint32_t rto_ms,
+typedef void (*wn_channel_retransmit_fn)(void *ctx, const uint8_t *wire_payload, uint16_t len);
+void wn_channel_tick(wn_channel_t *chan, uint8_t channel_id, uint64_t now_ms, uint32_t rto_ms,
                       uint32_t max_retries, uint16_t local_rwnd,
-                      nl_channel_retransmit_fn retransmit, void *ctx,
+                      wn_channel_retransmit_fn retransmit, void *ctx,
                       bool *out_give_up);
 
 /* Encode and hand off (via `emit`) one or more wire DATA payloads carrying
@@ -98,10 +98,10 @@ void nl_channel_tick(nl_channel_t *chan, uint8_t channel_id, uint64_t now_ms, ui
  * called once per resulting wire packet, in order. `local_rwnd` is the
  * sender's currently advertised receive window (bytes), stamped into each
  * packet's DATA header for the peer's flow control. */
-typedef void (*nl_channel_emit_fn)(void *ctx, const uint8_t *wire_payload, uint16_t len);
-nl_result_t nl_channel_send(nl_channel_t *chan, uint64_t now_ms, uint8_t channel_id, nl_delivery_t delivery,
+typedef void (*wn_channel_emit_fn)(void *ctx, const uint8_t *wire_payload, uint16_t len);
+wn_result_t wn_channel_send(wn_channel_t *chan, uint64_t now_ms, uint8_t channel_id, wn_delivery_t delivery,
                              const uint8_t *data, size_t len, uint16_t local_rwnd,
-                             nl_channel_emit_fn emit, void *ctx);
+                             wn_channel_emit_fn emit, void *ctx);
 
 /* Send fragments [start_frag, start_frag+max_frags) of `data`/`len` on
  * this channel -- the partial-send primitive behind connection.c's
@@ -112,41 +112,41 @@ nl_result_t nl_channel_send(nl_channel_t *chan, uint64_t now_ms, uint8_t channel
  * fragments actually went out (may be < requested if the send ring ran
  * out of room mid-range), *out_message_id the message id used, and
  * *out_frag_count the message's total fragment count. */
-nl_result_t nl_channel_send_range(nl_channel_t *chan, uint64_t now_ms, uint8_t channel_id,
-                                  nl_delivery_t delivery, const uint8_t *data, size_t len,
+wn_result_t wn_channel_send_range(wn_channel_t *chan, uint64_t now_ms, uint8_t channel_id,
+                                  wn_delivery_t delivery, const uint8_t *data, size_t len,
                                   uint16_t local_rwnd, uint16_t start_frag, uint16_t max_frags,
-                                  uint16_t *io_message_id, nl_channel_emit_fn emit, void *ctx,
+                                  uint16_t *io_message_id, wn_channel_emit_fn emit, void *ctx,
                                   uint16_t *out_sent_frags, uint16_t *out_frag_count);
 
-/* Apply an (ack, ack_bits) pair from a standalone NL_PKT_ACK (or any
+/* Apply an (ack, ack_bits) pair from a standalone WN_PKT_ACK (or any
  * other non-DATA source) to this channel's send side: marks newly-acked
  * slots, feeds the RTT estimator, and fires fast retransmit -- the same
- * work nl_channel_on_receive does for the piggybacked copy on DATA.
+ * work wn_channel_on_receive does for the piggybacked copy on DATA.
  * `delivery` must be a reliable lane. Outputs match on_receive's.
  *
  * `ack_valid` must be false when the source packet had nothing to ack: the
  * all-zero (0, 0) pair is a legal encoding of "I have sequence 0", so
  * applying it unconditionally would mark a never-received sequence acked
  * and the sender would never retransmit it. */
-void nl_channel_apply_ack(nl_channel_t *chan, uint64_t now_ms, uint8_t channel_id,
-                          nl_delivery_t delivery, bool ack_valid, uint16_t ack,
-                          nl_ack_bits_t ack_bits,
+void wn_channel_apply_ack(wn_channel_t *chan, uint64_t now_ms, uint8_t channel_id,
+                          wn_delivery_t delivery, bool ack_valid, uint16_t ack,
+                          wn_ack_bits_t ack_bits,
                           uint16_t local_rwnd,
-                          nl_channel_retransmit_fn retransmit, void *retransmit_ctx,
+                          wn_channel_retransmit_fn retransmit, void *retransmit_ctx,
                           bool *out_has_rtt_sample, uint32_t *out_rtt_sample_ms,
                           uint32_t *out_newly_acked);
 
 /* Feed one received (already-decrypted) wire DATA payload in. Any
  * piggybacked ack/ack_bits are applied to this lane's send ring
  * immediately, and (for reliable lanes) checked for a fast-retransmit
- * condition -- an unacked sequence with NL_FAST_RETRANSMIT_THRESHOLD or
+ * condition -- an unacked sequence with WN_FAST_RETRANSMIT_THRESHOLD or
  * more strictly-newer sequences already confirmed acked is retransmitted
  * immediately via `retransmit`/`retransmit_ctx` rather than waiting for
  * the RTO timer, since the loss is already evident (the same signal
  * behind TCP's "three duplicate acks" fast retransmit). `retransmit` may
  * be NULL to skip this (e.g. from a test that doesn't care).
  *
- * If the ack corresponds to a clean RTT sample (see nl_send_ring_ack's
+ * If the ack corresponds to a clean RTT sample (see wn_send_ring_ack's
  * doc comment on Karn's algorithm), *out_has_rtt_sample is set true and
  * *out_rtt_sample_ms holds it; both may be NULL if the caller doesn't need this.
  *
@@ -161,15 +161,15 @@ void nl_channel_apply_ack(nl_channel_t *chan, uint64_t now_ms, uint8_t channel_i
  * Any fully-formed application message(s) that become deliverable as a
  * result (immediately, or released from the reorder buffer) are handed
  * to `deliver`, in delivery order. */
-typedef void (*nl_channel_deliver_fn)(void *ctx, uint8_t channel_id, nl_delivery_t delivery,
+typedef void (*wn_channel_deliver_fn)(void *ctx, uint8_t channel_id, wn_delivery_t delivery,
                                        const uint8_t *data, uint32_t len);
-#define NL_FAST_RETRANSMIT_THRESHOLD 3 /* matches TCP's conventional "3 duplicate acks" */
-void nl_channel_on_receive(nl_channel_t *chan, uint64_t now_ms,
+#define WN_FAST_RETRANSMIT_THRESHOLD 3 /* matches TCP's conventional "3 duplicate acks" */
+void wn_channel_on_receive(wn_channel_t *chan, uint64_t now_ms,
                             const uint8_t *wire_payload, uint16_t wire_len,
                             uint16_t local_rwnd,
-                            nl_channel_deliver_fn deliver, void *deliver_ctx,
-                            nl_channel_retransmit_fn retransmit, void *retransmit_ctx,
+                            wn_channel_deliver_fn deliver, void *deliver_ctx,
+                            wn_channel_retransmit_fn retransmit, void *retransmit_ctx,
                             bool *out_has_rtt_sample, uint32_t *out_rtt_sample_ms,
                             uint32_t *out_newly_acked, uint16_t *out_rwnd);
 
-#endif /* NETLINK_CHANNEL_H */
+#endif /* WEFT_NET_CHANNEL_H */

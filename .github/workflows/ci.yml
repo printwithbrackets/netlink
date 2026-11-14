@@ -72,7 +72,7 @@ jobs:
       - name: Run Python binding tests
         run: |
           cd bindings/python
-          NETLINK_LIBRARY_PATH=../../build/libnetlink.so pytest tests/ -v
+          WEFT_NET_LIBRARY_PATH=../../build/libweft_net.so pytest tests/ -v
 
   go-bindings:
     name: Go bindings

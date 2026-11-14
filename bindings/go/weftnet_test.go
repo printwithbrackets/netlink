@@ -2,10 +2,10 @@
 // Client over loopback UDP, speaking the same wire protocol as the C core.
 //
 // Requires the C library to be built first (make at the repository root
-// produces build/libnetlink.a). Run with:
+// produces build/libweft_net.a). Run with:
 //
 //	cd bindings/go && go test ./...
-package netlink
+package weftnet
 
 import (
 	"bytes"
@@ -313,12 +313,12 @@ func TestDuplicateConnectRejected(t *testing.T) {
 	if _, err := client.Connect("127.0.0.1", port); err == nil {
 		t.Fatal("second Connect: want error, got nil")
 	} else {
-		var nle *Error
-		if !errorsAs(err, &nle) {
+		var wne *Error
+		if !errorsAs(err, &wne) {
 			t.Fatalf("error type = %T, want *Error", err)
 		}
-		if nle.Code != -6 { // NL_ERR_ALREADY_CONNECTED
-			t.Errorf("Code = %d, want -6 (ALREADY_CONNECTED)", nle.Code)
+		if wne.Code != -6 { // WN_ERR_ALREADY_CONNECTED
+			t.Errorf("Code = %d, want -6 (ALREADY_CONNECTED)", wne.Code)
 		}
 	}
 }

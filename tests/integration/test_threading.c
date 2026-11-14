@@ -2,7 +2,7 @@
  *
  * The rest of the suite runs every test on one thread, which cannot reach
  * the races between the endpoint's I/O thread and user threads: the
- * per-thread payload borrow in nl_poll_event, ep->io_thread_started, the
+ * per-thread payload borrow in wn_poll_event, ep->io_thread_started, the
  * connection table, and the pending-handshake table. These tests are meant
  * to be run under ThreadSanitizer (`make test-tsan`); under ASan they still
  * catch outright memory errors.
@@ -12,7 +12,7 @@
  * model of it.
  */
 #include "../test_framework.h"
-#include "../../include/netlink.h"
+#include "../../include/weft_net.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -20,19 +20,19 @@
 #include <pthread.h>
 #include <stdatomic.h>
 
-static nl_address_t addr(uint16_t port) {
-    nl_address_t a;
+static wn_address_t addr(uint16_t port) {
+    wn_address_t a;
     memset(&a, 0, sizeof(a));
     strncpy(a.host, "127.0.0.1", sizeof(a.host) - 1);
     a.port = port;
-    a.family = NL_AF_UNSPEC;
+    a.family = WN_AF_UNSPEC;
     return a;
 }
 
-static bool wait_for_event(nl_endpoint_t *ep, nl_event_type_t type, nl_event_t *out, int timeout_ms) {
+static bool wait_for_event(wn_endpoint_t *ep, wn_event_type_t type, wn_event_t *out, int timeout_ms) {
     uint64_t iterations = (uint64_t)timeout_ms / 50 + 1;
     for (uint64_t i = 0; i < iterations; i++) {
-        if (nl_poll_event(ep, out, 50)) {
+        if (wn_poll_event(ep, out, 50)) {
             if (out->event_type == type) return true;
         }
     }
@@ -41,24 +41,24 @@ static bool wait_for_event(nl_endpoint_t *ep, nl_event_type_t type, nl_event_t *
 
 /* Connect a client to a server on `port`; returns both, with the client's
  * peer id for the server. */
-static void make_pair_ex(nl_endpoint_t **server, nl_endpoint_t **client, nl_peer_id_t *client_peer,
+static void make_pair_ex(wn_endpoint_t **server, wn_endpoint_t **client, wn_peer_id_t *client_peer,
                          uint16_t port, uint32_t recv_window_bytes, uint32_t client_timeout_ms) {
-    nl_config_t scfg, ccfg;
-    nl_config_default(&scfg);
-    nl_config_default(&ccfg);
+    wn_config_t scfg, ccfg;
+    wn_config_default(&scfg);
+    wn_config_default(&ccfg);
     scfg.recv_window_bytes = recv_window_bytes;
     if (client_timeout_ms) ccfg.connection_timeout_ms = client_timeout_ms;
-    nl_address_t bind_addr = addr(port);
-    ASSERT_EQ(nl_server_create(&bind_addr, &scfg, server), NL_OK);
-    ASSERT_EQ(nl_client_create(&ccfg, client), NL_OK);
-    ASSERT_EQ(nl_connect(*client, &bind_addr, client_peer), NL_OK);
+    wn_address_t bind_addr = addr(port);
+    ASSERT_EQ(wn_server_create(&bind_addr, &scfg, server), WN_OK);
+    ASSERT_EQ(wn_client_create(&ccfg, client), WN_OK);
+    ASSERT_EQ(wn_connect(*client, &bind_addr, client_peer), WN_OK);
 
-    nl_event_t ev;
-    ASSERT_TRUE(wait_for_event(*client, NL_EVENT_CONNECTED, &ev, 5000));
-    ASSERT_TRUE(wait_for_event(*server, NL_EVENT_CONNECTED, &ev, 5000));
+    wn_event_t ev;
+    ASSERT_TRUE(wait_for_event(*client, WN_EVENT_CONNECTED, &ev, 5000));
+    ASSERT_TRUE(wait_for_event(*server, WN_EVENT_CONNECTED, &ev, 5000));
 }
 
-static void make_pair(nl_endpoint_t **server, nl_endpoint_t **client, nl_peer_id_t *client_peer,
+static void make_pair(wn_endpoint_t **server, wn_endpoint_t **client, wn_peer_id_t *client_peer,
                       uint16_t port, uint32_t recv_window_bytes) {
     make_pair_ex(server, client, client_peer, port, recv_window_bytes, 0);
 }
@@ -71,7 +71,7 @@ static void make_pair(nl_endpoint_t **server, nl_endpoint_t **client, nl_peer_id
 #define POLL_PAYLOAD_BYTE 0xC3
 
 typedef struct {
-    nl_endpoint_t *ep;
+    wn_endpoint_t *ep;
     int delivered;
     int corrupted;
     int missing;
@@ -85,9 +85,9 @@ static void *poll_main(void *arg) {
     poll_ctx_t *c = (poll_ctx_t *)arg;
     if (c->timeout_ms == 0) c->timeout_ms = 10000;
     for (int i = 0; i < POLLS_PER_THREAD; i++) {
-        nl_event_t ev;
-        if (!nl_poll_event(c->ep, &ev, c->timeout_ms)) { c->missing++; continue; }
-        if (ev.event_type != NL_EVENT_DATA) continue;
+        wn_event_t ev;
+        if (!wn_poll_event(c->ep, &ev, c->timeout_ms)) { c->missing++; continue; }
+        if (ev.event_type != WN_EVENT_DATA) continue;
         /* The borrow belongs to THIS thread until its next poll; reading it
          * here is exactly the pattern the shared slot used to break. */
         if (ev.data_len != POLL_PAYLOAD_LEN) { c->corrupted++; continue; }
@@ -100,8 +100,8 @@ static void *poll_main(void *arg) {
 }
 
 TEST(test_threading_concurrent_pollers) {
-    nl_endpoint_t *server, *client;
-    nl_peer_id_t client_peer;
+    wn_endpoint_t *server, *client;
+    wn_peer_id_t client_peer;
     make_pair(&server, &client, &client_peer, 34901, 0);
 
     const int total = CONCURRENT_POLLERS * POLLS_PER_THREAD;
@@ -120,7 +120,7 @@ TEST(test_threading_concurrent_pollers) {
     memset(payload, POLL_PAYLOAD_BYTE, sizeof(payload));
     int sent = 0, idle = 0;
     while (sent < total && idle < 300) {
-        if (nl_send(client, client_peer, 0, NL_RELIABLE_ORDERED, payload, sizeof(payload)) == NL_OK) {
+        if (wn_send(client, client_peer, 0, WN_RELIABLE_ORDERED, payload, sizeof(payload)) == WN_OK) {
             sent++;
             idle = 0;
             continue;
@@ -145,8 +145,8 @@ TEST(test_threading_concurrent_pollers) {
     ASSERT_EQ(missing, 0);
     ASSERT_EQ(delivered, total);
 
-    nl_endpoint_destroy(client);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
 }
 
 /* ---- 2: many senders against one poller ---- */
@@ -155,8 +155,8 @@ TEST(test_threading_concurrent_pollers) {
 #define SENDS_PER_THREAD 60
 
 typedef struct {
-    nl_endpoint_t *ep;
-    nl_peer_id_t peer;
+    wn_endpoint_t *ep;
+    wn_peer_id_t peer;
     uint8_t tag;
     int accepted;
     int rejected;
@@ -167,16 +167,16 @@ static void *sender_main(void *arg) {
     uint8_t payload[32];
     memset(payload, c->tag, sizeof(payload));
     for (int i = 0; i < SENDS_PER_THREAD; i++) {
-        /* Retry on NL_ERR_QUEUE_FULL: the per-connection deferred queue is a
+        /* Retry on WN_ERR_QUEUE_FULL: the per-connection deferred queue is a
          * documented, finite bound (128 messages), and with 6 senders
          * hammering a closed window some sends legitimately hit it. This
          * test is about concurrent send/poll correctness, not about that
          * bound -- test_send_queue_full_returns_error covers the bound. */
         for (int attempt = 0; attempt < 200; attempt++) {
-            nl_result_t r = nl_send(c->ep, c->peer, 0, NL_RELIABLE_ORDERED,
+            wn_result_t r = wn_send(c->ep, c->peer, 0, WN_RELIABLE_ORDERED,
                                     payload, sizeof(payload));
-            if (r == NL_OK) { c->accepted++; break; }
-            if (r != NL_ERR_QUEUE_FULL) { c->rejected++; break; }
+            if (r == WN_OK) { c->accepted++; break; }
+            if (r != WN_ERR_QUEUE_FULL) { c->rejected++; break; }
             usleep(1000); /* let the drainer reopen the window */
         }
     }
@@ -185,10 +185,10 @@ static void *sender_main(void *arg) {
 
 /* Continuously drains the receiver so its window keeps reopening. Without
  * one, a small window closes, the senders fill the deferred queue, and
- * sends start legitimately returning NL_ERR_QUEUE_FULL -- this test is about
+ * sends start legitimately returning WN_ERR_QUEUE_FULL -- this test is about
  * send/poll concurrency, not backpressure. */
 typedef struct {
-    nl_endpoint_t *ep;
+    wn_endpoint_t *ep;
     atomic_bool stop; /* atomic, not volatile: a stop flag read across
                        * threads is synchronisation, not a hint */
     int counts[SENDERS]; /* per-sender messages verified intact */
@@ -198,9 +198,9 @@ typedef struct {
 static void *drain_main(void *arg) {
     drain_ctx_t *d = (drain_ctx_t *)arg;
     while (!atomic_load(&d->stop)) {
-        nl_event_t ev;
-        if (!nl_poll_event(d->ep, &ev, 100)) continue;
-        if (ev.event_type != NL_EVENT_DATA) continue;
+        wn_event_t ev;
+        if (!wn_poll_event(d->ep, &ev, 100)) continue;
+        if (ev.event_type != WN_EVENT_DATA) continue;
         if (ev.data_len != 32u) { d->bad++; continue; }
         uint8_t tag = ev.data[0];
         int t = (int)tag - 0x40;
@@ -214,8 +214,8 @@ static void *drain_main(void *arg) {
 }
 
 TEST(test_threading_many_senders_one_poller) {
-    nl_endpoint_t *server, *client;
-    nl_peer_id_t client_peer;
+    wn_endpoint_t *server, *client;
+    wn_peer_id_t client_peer;
     /* A small receive window forces the deferred queue and its priority
      * sorting to be exercised concurrently with polling. */
     make_pair(&server, &client, &client_peer, 34902, 8192);
@@ -259,9 +259,9 @@ TEST(test_threading_many_senders_one_poller) {
     int counts[SENDERS];
     memcpy(counts, drain.counts, sizeof(counts));
     for (int i = 0; i < total_accepted + 500; i++) {
-        nl_event_t ev;
-        if (!nl_poll_event(server, &ev, 1000)) break;
-        if (ev.event_type != NL_EVENT_DATA) continue;
+        wn_event_t ev;
+        if (!wn_poll_event(server, &ev, 1000)) break;
+        if (ev.event_type != WN_EVENT_DATA) continue;
         ASSERT_EQ(ev.data_len, 32u);
         uint8_t tag = ev.data[0];
         int t = (int)tag - 0x40;
@@ -278,15 +278,15 @@ TEST(test_threading_many_senders_one_poller) {
         CHECK_EQ(counts[t], ctxs[t].accepted);
     }
 
-    nl_endpoint_destroy(client);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
 }
 
 /* ---- 3: polling and sending on the same endpoint, concurrently ---- */
 
 TEST(test_threading_send_and_poll_concurrently) {
-    nl_endpoint_t *server, *client;
-    nl_peer_id_t client_peer;
+    wn_endpoint_t *server, *client;
+    wn_peer_id_t client_peer;
     make_pair(&server, &client, &client_peer, 34903, 0);
 
     pthread_t poller;
@@ -302,7 +302,7 @@ TEST(test_threading_send_and_poll_concurrently) {
     memset(payload, POLL_PAYLOAD_BYTE, sizeof(payload));
     int accepted = 0;
     for (int i = 0; i < 200; i++) {
-        if (nl_send(client, client_peer, 0, NL_RELIABLE_ORDERED, payload, sizeof(payload)) == NL_OK) {
+        if (wn_send(client, client_peer, 0, WN_RELIABLE_ORDERED, payload, sizeof(payload)) == WN_OK) {
             accepted++;
         }
     }
@@ -312,14 +312,14 @@ TEST(test_threading_send_and_poll_concurrently) {
     /* Drain the server side so nothing is left mid-flight at destroy. */
     int seen = 0;
     for (int i = 0; i < accepted + 200; i++) {
-        nl_event_t ev;
-        if (!nl_poll_event(server, &ev, 3000)) break;
-        if (ev.event_type == NL_EVENT_DATA) seen++;
+        wn_event_t ev;
+        if (!wn_poll_event(server, &ev, 3000)) break;
+        if (ev.event_type == WN_EVENT_DATA) seen++;
     }
     CHECK_EQ(seen, accepted);
 
-    nl_endpoint_destroy(client);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
 }
 
 /* ---- 4: non-blocking poll spinning against a concurrent producer ---- */
@@ -328,7 +328,7 @@ TEST(test_threading_send_and_poll_concurrently) {
  * iteration count: the producer below is window-gated, so a spinner that
  * stopped early would let the window close and the sends would park. */
 typedef struct {
-    nl_endpoint_t *ep;
+    wn_endpoint_t *ep;
     atomic_bool *go;
     int delivered;
     int corrupted;
@@ -338,9 +338,9 @@ typedef struct {
 static void *spinner_main(void *arg) {
     spinner_ctx_t *c = (spinner_ctx_t *)arg;
     while (atomic_load(c->go)) {
-        nl_event_t ev;
-        if (!nl_poll_event(c->ep, &ev, 0)) { c->empty_polls++; continue; } /* the racy path */
-        if (ev.event_type != NL_EVENT_DATA) continue;
+        wn_event_t ev;
+        if (!wn_poll_event(c->ep, &ev, 0)) { c->empty_polls++; continue; } /* the racy path */
+        if (ev.event_type != WN_EVENT_DATA) continue;
         if (ev.data_len != POLL_PAYLOAD_LEN) { c->corrupted++; continue; }
         for (uint32_t k = 0; k < ev.data_len; k++) {
             if (ev.data[k] != POLL_PAYLOAD_BYTE) { c->corrupted++; break; }
@@ -350,7 +350,7 @@ static void *spinner_main(void *arg) {
     return NULL;
 }
 
-/* Regression: nl_poll_event's empty-queue path used to drop queue_lock and
+/* Regression: wn_poll_event's empty-queue path used to drop queue_lock and
  * then re-read ep->queue_head to decide whether it had an event. That read
  * raced push_event's write of the same field under that same lock, so a
  * non-blocking poller spinning against a concurrent producer could miss an
@@ -363,8 +363,8 @@ static void *spinner_main(void *arg) {
  * actively pushing. Blocking polls mostly hide it because the condvar
  * handoff re-establishes the ordering. */
 TEST(test_threading_nonblocking_poll_against_producer) {
-    nl_endpoint_t *server, *client;
-    nl_peer_id_t client_peer;
+    wn_endpoint_t *server, *client;
+    wn_peer_id_t client_peer;
     make_pair(&server, &client, &client_peer, 34940, 0);
 
     const int total = 2000;
@@ -382,7 +382,7 @@ TEST(test_threading_nonblocking_poll_against_producer) {
 
     int sent = 0, idle = 0;
     while (sent < total && idle < 500) {
-        if (nl_send(client, client_peer, 0, NL_RELIABLE_ORDERED, payload, sizeof(payload)) == NL_OK) {
+        if (wn_send(client, client_peer, 0, WN_RELIABLE_ORDERED, payload, sizeof(payload)) == WN_OK) {
             sent++;
             idle = 0;
             continue;
@@ -406,25 +406,25 @@ TEST(test_threading_nonblocking_poll_against_producer) {
 
     /* Drain what the spinner left so teardown is clean. */
     for (int i = 0; i < total + 500; i++) {
-        nl_event_t ev;
-        if (!nl_poll_event(server, &ev, 1000)) break;
+        wn_event_t ev;
+        if (!wn_poll_event(server, &ev, 1000)) break;
     }
 
-    nl_endpoint_destroy(client);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
 }
 
 /* ---- 5: disconnect racing in-flight traffic ---- */
 
 typedef struct {
-    nl_endpoint_t *ep;
-    nl_peer_id_t peer;
+    wn_endpoint_t *ep;
+    wn_peer_id_t peer;
     uint8_t tag;
 } closer_ctx_t;
 
 static void *closer_main(void *arg) {
     closer_ctx_t *c = (closer_ctx_t *)arg;
-    nl_endpoint_destroy(c->ep);
+    wn_endpoint_destroy(c->ep);
     (void)c->peer; (void)c->tag;
     return NULL;
 }
@@ -434,8 +434,8 @@ TEST(test_threading_destroy_races_in_flight_traffic) {
      * is mid-cycle, on a background thread, so the destroy/teardown path
      * runs concurrently with packet processing. */
     for (int iter = 0; iter < 12; iter++) {
-        nl_endpoint_t *server, *client;
-        nl_peer_id_t client_peer;
+        wn_endpoint_t *server, *client;
+        wn_peer_id_t client_peer;
         /* A short client idle timeout: the server vanishing sends nothing
          * over UDP (no RST, no DISCONNECT), so the client can only discover
          * the peer is gone by timing out. Without a short timeout the
@@ -449,7 +449,7 @@ TEST(test_threading_destroy_races_in_flight_traffic) {
          * all torn down concurrently with inbound packets and with the
          * client's own I/O thread seeing the connection vanish.
          *
-         * Note what is deliberately NOT done here: calling nl_send on an
+         * Note what is deliberately NOT done here: calling wn_send on an
          * endpoint from another thread while that same endpoint is being
          * destroyed. The API makes peer handles invalid at destroy, so that
          * would be a use-after-free in the test rather than a real race. */
@@ -472,20 +472,20 @@ TEST(test_threading_destroy_races_in_flight_traffic) {
          * no crash, no hang, no silent success. */
         bool saw_disconnect = false;
         for (int i = 0; i < 200; i++) {
-            nl_event_t ev;
-            if (!nl_poll_event(client, &ev, 100)) continue;
-            if (ev.event_type == NL_EVENT_DISCONNECTED) { saw_disconnect = true; break; }
+            wn_event_t ev;
+            if (!wn_poll_event(client, &ev, 100)) continue;
+            if (ev.event_type == WN_EVENT_DISCONNECTED) { saw_disconnect = true; break; }
         }
         CHECK_TRUE(saw_disconnect);
-        nl_result_t r = nl_send(client, client_peer, 0, NL_UNRELIABLE,
+        wn_result_t r = wn_send(client, client_peer, 0, WN_UNRELIABLE,
                                 (const uint8_t *)"x", 1);
-        if (r == NL_OK) {
+        if (r == WN_OK) {
             printf("    post-disconnect send still accepted (peer %llu)\n",
                    (unsigned long long)client_peer);
         }
-        CHECK_EQ(r, NL_ERR_PEER_NOT_FOUND);
+        CHECK_EQ(r, WN_ERR_PEER_NOT_FOUND);
 
-        nl_endpoint_destroy(client);
+        wn_endpoint_destroy(client);
     }
 }
 
@@ -494,7 +494,7 @@ TEST(test_threading_destroy_races_in_flight_traffic) {
 #define RACERS 5
 
 typedef struct {
-    nl_endpoint_t *ep;
+    wn_endpoint_t *ep;
     uint16_t port;
     int connected;
     int errors;
@@ -502,29 +502,29 @@ typedef struct {
 
 static void *racer_main(void *arg) {
     racer_ctx_t *c = (racer_ctx_t *)arg;
-    nl_address_t bind_addr = addr(c->port);
-    nl_peer_id_t peer;
-    if (nl_connect(c->ep, &bind_addr, &peer) != NL_OK) { c->errors++; return NULL; }
-    nl_event_t ev;
-    if (wait_for_event(c->ep, NL_EVENT_CONNECTED, &ev, 5000)) c->connected++;
+    wn_address_t bind_addr = addr(c->port);
+    wn_peer_id_t peer;
+    if (wn_connect(c->ep, &bind_addr, &peer) != WN_OK) { c->errors++; return NULL; }
+    wn_event_t ev;
+    if (wait_for_event(c->ep, WN_EVENT_CONNECTED, &ev, 5000)) c->connected++;
     else c->errors++;
     return NULL;
 }
 
 TEST(test_threading_concurrent_connects) {
-    nl_config_t scfg;
-    nl_config_default(&scfg);
-    nl_address_t bind_addr = addr(34930);
-    nl_endpoint_t *server = NULL;
-    ASSERT_EQ(nl_server_create(&bind_addr, &scfg, &server), NL_OK);
+    wn_config_t scfg;
+    wn_config_default(&scfg);
+    wn_address_t bind_addr = addr(34930);
+    wn_endpoint_t *server = NULL;
+    ASSERT_EQ(wn_server_create(&bind_addr, &scfg, &server), WN_OK);
 
     pthread_t threads[RACERS];
     racer_ctx_t ctxs[RACERS];
     for (int t = 0; t < RACERS; t++) {
         memset(&ctxs[t], 0, sizeof(ctxs[t]));
-        nl_config_t ccfg;
-        nl_config_default(&ccfg);
-        ASSERT_EQ(nl_client_create(&ccfg, &ctxs[t].ep), NL_OK);
+        wn_config_t ccfg;
+        wn_config_default(&ccfg);
+        ASSERT_EQ(wn_client_create(&ccfg, &ctxs[t].ep), WN_OK);
         ctxs[t].port = bind_addr.port;
     }
     for (int t = 0; t < RACERS; t++) {
@@ -536,39 +536,39 @@ TEST(test_threading_concurrent_connects) {
     for (int t = 0; t < RACERS; t++) {
         connected += ctxs[t].connected;
         CHECK_EQ(ctxs[t].errors, 0);
-        nl_endpoint_destroy(ctxs[t].ep);
+        wn_endpoint_destroy(ctxs[t].ep);
     }
     CHECK_EQ(connected, RACERS);
-    CHECK_EQ(nl_peer_count(server), (int)RACERS);
+    CHECK_EQ(wn_peer_count(server), (int)RACERS);
 
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(server);
 }
 
 /* Regression (P0-1): destroying an endpoint while a thread is blocked in
- * nl_poll_event(timeout=-1) must wake the waiter instead of hanging forever
+ * wn_poll_event(timeout=-1) must wake the waiter instead of hanging forever
  * or destroying queue_cond underneath it (UB). Without the shutdown flag +
  * broadcast, the blocker never wakes and destroy frees the cond under it. */
 typedef struct {
-    nl_endpoint_t *ep;
+    wn_endpoint_t *ep;
     bool returned;
     bool got_event;
 } blocker_ctx_t;
 
 static void *blocker_main(void *arg) {
     blocker_ctx_t *c = (blocker_ctx_t *)arg;
-    nl_event_t ev;
-    bool r = nl_poll_event(c->ep, &ev, -1); /* infinite wait */
+    wn_event_t ev;
+    bool r = wn_poll_event(c->ep, &ev, -1); /* infinite wait */
     c->got_event = r;
     c->returned = true;
     return NULL;
 }
 
 TEST(test_threading_destroy_wakes_blocked_poll) {
-    nl_config_t cfg;
-    nl_config_default(&cfg);
-    nl_address_t bind_addr = addr(34950);
-    nl_endpoint_t *server = NULL;
-    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+    wn_config_t cfg;
+    wn_config_default(&cfg);
+    wn_address_t bind_addr = addr(34950);
+    wn_endpoint_t *server = NULL;
+    ASSERT_EQ(wn_server_create(&bind_addr, &cfg, &server), WN_OK);
 
     blocker_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -579,16 +579,16 @@ TEST(test_threading_destroy_wakes_blocked_poll) {
     usleep(200 * 1000); /* let the blocker enter its infinite poll */
     /* Must return (waking the blocker with shutdown) rather than hang,
      * and must not destroy queue_cond under the waiter (TSan). */
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(server);
     pthread_join(blocker, NULL);
     ASSERT_TRUE(ctx.returned);
     ASSERT_FALSE(ctx.got_event); /* no event was ever queued: shutdown wake */
 }
 
-/* Regression: nl_poll_event's exit path used to decrement active_pollers
+/* Regression: wn_poll_event's exit path used to decrement active_pollers
  * and unlock queue_lock BEFORE its final ep touches (the deferred
  * consume_window_for_borrows call and the borrow booking, which re-locks
- * queue_lock). nl_endpoint_destroy drains on active_pollers == 0 and then
+ * queue_lock). wn_endpoint_destroy drains on active_pollers == 0 and then
  * endpoint_free, so a poller preempted in that window could lock a
  * destroyed mutex or read freed memory. The decrement is now the poller's
  * last ep-touching operation, so destroy cannot free underneath it; this
@@ -598,8 +598,8 @@ TEST(test_threading_destroy_wakes_blocked_poll) {
 #define DESTROY_RACERS 3
 
 typedef struct {
-    nl_endpoint_t *ep;
-    nl_peer_id_t peer; /* used by the flood thread only */
+    wn_endpoint_t *ep;
+    wn_peer_id_t peer; /* used by the flood thread only */
     atomic_bool run;
     atomic_bool at_final; /* racer: about to make the one call that races destroy */
 } poll_destroy_ctx_t;
@@ -607,9 +607,9 @@ typedef struct {
 /* A racer polls in a tight non-blocking loop while the queue is being
  * flooded, then makes exactly ONE more call, a blocking one, and returns.
  *
- * That last call is the one that races nl_endpoint_destroy. The previous
+ * That last call is the one that races wn_endpoint_destroy. The previous
  * version kept looping on a `run` flag until destroy had started, which let
- * a racer pass the flag check, get preempted, and enter nl_poll_event after
+ * a racer pass the flag check, get preempted, and enter wn_poll_event after
  * destroy had freed the endpoint. That is a use after destroy by the harness,
  * not a library bug: no caller may begin an API call once destroy has
  * started. Here every racer has stopped looping and is (or is about to be)
@@ -617,12 +617,12 @@ typedef struct {
  * races calls that began earlier, which is exactly what it must tolerate. */
 static void *poll_destroy_racer_main(void *arg) {
     poll_destroy_ctx_t *c = (poll_destroy_ctx_t *)arg;
-    nl_event_t ev;
+    wn_event_t ev;
     /* Phase 1: poll until told to stop AND the backlog is drained, so the
      * final call below blocks instead of returning an old event at once. The
      * endpoint is alive throughout: the main thread waits for at_final. */
     for (;;) {
-        bool got = nl_poll_event(c->ep, &ev, 0);
+        bool got = wn_poll_event(c->ep, &ev, 0);
         if (!got && !atomic_load(&c->run)) break;
     }
     atomic_store(&c->at_final, true);
@@ -630,7 +630,7 @@ static void *poll_destroy_racer_main(void *arg) {
      * shutdown or by an event the second flood delivers mid-destroy (the
      * event-returning exit path with a window charge to release and a borrow
      * to book, the widest part of the original race). */
-    (void)nl_poll_event(c->ep, &ev, 5000);
+    (void)wn_poll_event(c->ep, &ev, 5000);
     return NULL;
 }
 
@@ -642,13 +642,13 @@ static void *event_flood_main(void *arg) {
     uint8_t payload[POLL_PAYLOAD_LEN];
     memset(payload, POLL_PAYLOAD_BYTE, sizeof(payload));
     while (atomic_load(&c->run)) {
-        if (nl_send(c->ep, c->peer, 0, NL_RELIABLE_ORDERED, payload, sizeof(payload)) == NL_OK) continue;
+        if (wn_send(c->ep, c->peer, 0, WN_RELIABLE_ORDERED, payload, sizeof(payload)) == WN_OK) continue;
         usleep(2000); /* window/queue gated once the server stops draining */
     }
     return NULL;
 }
 
-static pthread_t start_flood(poll_destroy_ctx_t *flood, nl_endpoint_t *client, nl_peer_id_t peer) {
+static pthread_t start_flood(poll_destroy_ctx_t *flood, wn_endpoint_t *client, wn_peer_id_t peer) {
     memset(flood, 0, sizeof(*flood));
     flood->ep = client;
     flood->peer = peer;
@@ -660,8 +660,8 @@ static pthread_t start_flood(poll_destroy_ctx_t *flood, nl_endpoint_t *client, n
 
 TEST(test_threading_destroy_wakes_poll_exit_racers) {
     for (int iter = 0; iter < 10; iter++) {
-        nl_endpoint_t *server, *client;
-        nl_peer_id_t client_peer;
+        wn_endpoint_t *server, *client;
+        wn_peer_id_t client_peer;
         make_pair_ex(&server, &client, &client_peer, (uint16_t)(34960 + iter), 0,
                      /*client_timeout_ms*/ 600);
 
@@ -699,13 +699,13 @@ TEST(test_threading_destroy_wakes_poll_exit_racers) {
         poll_destroy_ctx_t flood2;
         pthread_t flood2_thread = start_flood(&flood2, client, client_peer);
         usleep(1000);
-        nl_endpoint_destroy(server);
+        wn_endpoint_destroy(server);
 
         atomic_store(&flood2.run, false);
         for (int t = 0; t < DESTROY_RACERS; t++) pthread_join(racer_threads[t], NULL);
         pthread_join(flood2_thread, NULL);
 
-        nl_endpoint_destroy(client);
+        wn_endpoint_destroy(client);
     }
 }
 

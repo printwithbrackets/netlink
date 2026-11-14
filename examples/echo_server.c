@@ -1,7 +1,7 @@
 /* echo_server.c - minimal example: accepts connections and echoes back
  * whatever it receives on any channel, using the same delivery mode it
  * was sent with. Build: make examples (or see README for a manual gcc line). */
-#include <netlink.h>
+#include <weft_net.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,48 +28,48 @@ int main(int argc, char **argv) {
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
-    nl_config_t cfg;
-    nl_config_default(&cfg);
-    cfg.server_name = "NetLink Example Server";
+    wn_config_t cfg;
+    wn_config_default(&cfg);
+    cfg.server_name = "weft-net Example Server";
 
-    nl_address_t bind_addr;
+    wn_address_t bind_addr;
     memset(&bind_addr, 0, sizeof(bind_addr));
     snprintf(bind_addr.host, sizeof(bind_addr.host), "%s", "0.0.0.0");
     bind_addr.port = port;
-    bind_addr.family = NL_AF_INET;
+    bind_addr.family = WN_AF_INET;
 
-    nl_endpoint_t *server = NULL;
-    nl_result_t r = nl_server_create(&bind_addr, &cfg, &server);
-    if (r != NL_OK) {
-        fprintf(stderr, "failed to start server: %s\n", nl_error_string(r));
+    wn_endpoint_t *server = NULL;
+    wn_result_t r = wn_server_create(&bind_addr, &cfg, &server);
+    if (r != WN_OK) {
+        fprintf(stderr, "failed to start server: %s\n", wn_error_string(r));
         return 1;
     }
-    nl_discovery_enable(server, (uint16_t)(port + 1));
+    wn_discovery_enable(server, (uint16_t)(port + 1));
 
-    printf("NetLink echo server listening on UDP port %u (discovery on %u)\n", port, port + 1);
+    printf("weft-net echo server listening on UDP port %u (discovery on %u)\n", port, port + 1);
     printf("Press Ctrl+C to stop.\n");
 
     while (!g_stop) {
-        nl_event_t ev;
-        if (!nl_poll_event(server, &ev, 200)) continue;
+        wn_event_t ev;
+        if (!wn_poll_event(server, &ev, 200)) continue;
 
         switch (ev.event_type) {
-            case NL_EVENT_CONNECTED:
+            case WN_EVENT_CONNECTED:
                 printf("[+] peer %llu connected from %s:%u\n",
                        (unsigned long long)ev.peer, ev.from_address.host, ev.from_address.port);
                 break;
-            case NL_EVENT_DISCONNECTED:
+            case WN_EVENT_DISCONNECTED:
                 printf("[-] peer %llu disconnected (%s)\n",
-                       (unsigned long long)ev.peer, nl_error_string(ev.disconnect_reason));
+                       (unsigned long long)ev.peer, wn_error_string(ev.disconnect_reason));
                 break;
-            case NL_EVENT_DATA:
+            case WN_EVENT_DATA:
                 printf("[.] echoing %zu bytes from peer %llu on channel %u\n",
                        ev.data_len, (unsigned long long)ev.peer, ev.channel);
                 /* Echo back reliably-ordered regardless of how it arrived,
                  * for simplicity; a real app would usually mirror the
                  * original delivery mode. */
-                if (nl_send(server, ev.peer, ev.channel, NL_RELIABLE_ORDERED,
-                            ev.data, ev.data_len) != NL_OK) {
+                if (wn_send(server, ev.peer, ev.channel, WN_RELIABLE_ORDERED,
+                            ev.data, ev.data_len) != WN_OK) {
                     fprintf(stderr, "echo send to peer %llu failed\n",
                             (unsigned long long)ev.peer);
                 }
@@ -80,6 +80,6 @@ int main(int argc, char **argv) {
     }
 
     printf("\nShutting down.\n");
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(server);
     return 0;
 }

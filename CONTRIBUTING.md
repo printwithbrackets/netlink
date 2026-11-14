@@ -1,4 +1,4 @@
-# Contributing to NetLink
+# Contributing to weft-net
 
 Thanks for considering a contribution. This project prioritizes
 correctness and security over speed of development; please read the
@@ -63,7 +63,7 @@ these sanitizers and please don't disable them to get a PR green.
 
 The C core (`src/`) is the single source of truth for the wire protocol.
 Bindings (`bindings/python`, `bindings/go`, `bindings/rust`) should be
-thin wrappers over the stable C ABI in `include/netlink.h` and they must
+thin wrappers over the stable C ABI in `include/weft_net.h` and they must
 not reimplement any protocol logic. If a binding's struct layout doesn't
 match the C header, that's a bug in the binding, not a reason to add
 protocol logic on the binding side.
@@ -77,7 +77,7 @@ test command:
 # from the repository root, after `make`
 make test-bindings
 # or individually:
-cd bindings/python && NETLINK_LIBRARY_PATH=../../build/libnetlink.so python3 tests/test_python_bindings.py
+cd bindings/python && WEFT_NET_LIBRARY_PATH=../../build/libweft_net.so python3 tests/test_python_bindings.py
 cd bindings/go     && go test ./...
 cd bindings/rust   && cargo test
 ```
@@ -96,7 +96,7 @@ think it warrants care in how details are shared.
 
 - [ ] Builds warning-free (`make`)
 - [ ] `make test` passes, including any new tests
-- [ ] New/changed public API documented in `include/netlink.h`'s comments
-- [ ] If the wire format changed: `NL_PROTOCOL_VERSION` bumped and the
+- [ ] New/changed public API documented in `include/weft_net.h`'s comments
+- [ ] If the wire format changed: `WN_PROTOCOL_VERSION` bumped and the
       change noted in the PR description
 - [ ] If a security-relevant assumption changed: called out explicitly

@@ -1,6 +1,6 @@
-# netlink-rs (Rust bindings)
+# weft-net-rs (Rust bindings)
 
-Rust FFI bindings for [NetLink](../../README.md).
+Rust FFI bindings for [weft-net](../../README.md).
 
 **Testing status:** built and passing real-socket integration tests
 (`cargo test`) against the compiled C library. CI runs a `rustfmt` check,
@@ -14,9 +14,9 @@ Build the native library first (from the repository root):
 make CRYPTO_CFLAGS="..." CRYPTO_LIBS="..."   # see the top-level README for flags on your platform
 ```
 
-This produces `build/libnetlink.a`. `build.rs` links against it from
+This produces `build/libweft_net.a`. `build.rs` links against it from
 `../../build` relative to this crate by default; override with the
-`NETLINK_LIB_DIR` environment variable if you vendor this crate elsewhere.
+`WEFT_NET_LIB_DIR` environment variable if you vendor this crate elsewhere.
 
 ## Tests
 
@@ -27,7 +27,7 @@ cargo test
 ## Usage
 
 ```rust
-use netlink::{Client, Config, Delivery};
+use weft_net::{Client, Config, Delivery};
 use std::time::Duration;
 
 let mut client = Client::new(Config::default())?;

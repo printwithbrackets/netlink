@@ -1,16 +1,16 @@
-// Package netlink provides Go bindings for the NetLink C library via cgo.
+// Package weftnet provides Go bindings for the weft-net C library via cgo.
 //
-// Build requirements: the netlink C library must be built first (`make`
-// in the repository root produces build/libnetlink.a / .so), and its
+// Build requirements: the weft-net C library must be built first (`make`
+// in the repository root produces build/libweft_net.a / .so), and its
 // headers must be reachable from the cgo preamble below.
-package netlink
+package weftnet
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../../include
-#cgo LDFLAGS: -L${SRCDIR}/../../build -Wl,-rpath,${SRCDIR}/../../build -lnetlink -lcrypto -lpthread
+#cgo LDFLAGS: -L${SRCDIR}/../../build -Wl,-rpath,${SRCDIR}/../../build -lweft_net -lcrypto -lpthread
 #include <stdlib.h>
 #include <string.h>
-#include "netlink.h"
+#include "weft_net.h"
 */
 import "C"
 import (
@@ -21,7 +21,7 @@ import (
 	"unsafe"
 )
 
-// Delivery mirrors nl_delivery_t.
+// Delivery mirrors wn_delivery_t.
 type Delivery int
 
 const (
@@ -31,7 +31,7 @@ const (
 	ReliableOrdered     Delivery = 3
 )
 
-// EventType mirrors nl_event_type_t.
+// EventType mirrors wn_event_type_t.
 type EventType int
 
 const (
@@ -43,7 +43,7 @@ const (
 	EventDiscoveryReply EventType = 5
 )
 
-// AddressFamily mirrors nl_af_t.
+// AddressFamily mirrors wn_af_t.
 type AddressFamily int
 
 const (
@@ -52,7 +52,7 @@ const (
 	AFInet6  AddressFamily = 6
 )
 
-// Priority constants mirror NL_PRIORITY_* (nl_send_ex).
+// Priority constants mirror WN_PRIORITY_* (wn_send_ex).
 const (
 	PriorityLow      uint8 = 0
 	PriorityNormal   uint8 = 64
@@ -60,14 +60,14 @@ const (
 	PriorityCritical uint8 = 192
 )
 
-// Capability bits mirror NL_CAP_*.
+// Capability bits mirror WN_CAP_*.
 const (
 	CapFlowControl uint32 = 0x00000001
 	CapPriority    uint32 = 0x00000002
 	CapRateLimit   uint32 = 0x00000004
 )
 
-// PeerStats mirrors nl_peer_stats_t.
+// PeerStats mirrors wn_peer_stats_t.
 type PeerStats struct {
 	PacketsSent        uint64
 	PacketsReceived    uint64
@@ -80,26 +80,26 @@ type PeerStats struct {
 	RtoMs              uint32
 }
 
-// PeerID mirrors nl_peer_id_t (a uint64 connection identifier).
+// PeerID mirrors wn_peer_id_t (a uint64 connection identifier).
 type PeerID uint64
 
-// Error wraps an nl_result_t.
+// Error wraps an wn_result_t.
 type Error struct {
 	Code    int
 	Message string
 }
 
-func (e *Error) Error() string { return fmt.Sprintf("netlink: %s (code %d)", e.Message, e.Code) }
+func (e *Error) Error() string { return fmt.Sprintf("weft-net: %s (code %d)", e.Message, e.Code) }
 
-func newError(code C.nl_result_t) error {
-	if code == C.NL_OK {
+func newError(code C.wn_result_t) error {
+	if code == C.WN_OK {
 		return nil
 	}
-	msg := C.GoString(C.nl_error_string(code))
+	msg := C.GoString(C.wn_error_string(code))
 	return &Error{Code: int(code), Message: msg}
 }
 
-// Transport mirrors nl_transport_t.
+// Transport mirrors wn_transport_t.
 type Transport int
 
 const (
@@ -107,8 +107,8 @@ const (
 	TransportWebSocket Transport = 1
 )
 
-// Config mirrors nl_config_t, with Go-friendly defaults via NewConfig
-// (populated from nl_config_default so it tracks the C defaults).
+// Config mirrors wn_config_t, with Go-friendly defaults via NewConfig
+// (populated from wn_config_default so it tracks the C defaults).
 type Config struct {
 	ChannelCount        uint8
 	MaxConnections      uint32
@@ -121,18 +121,18 @@ type Config struct {
 	MaxSendBytesPerSec  uint32
 	RecvWindowBytes     uint32
 	// EventQueueMaxBytes is the global byte cap on queued event payloads;
-	// 0 = library default (NL_EVENT_QUEUE_MAX_BYTES_DEFAULT),
+	// 0 = library default (WN_EVENT_QUEUE_MAX_BYTES_DEFAULT),
 	// 0xFFFFFFFF = unlimited.
 	EventQueueMaxBytes uint32
 	Capabilities       uint32
 }
 
 // NewConfig returns a Config populated with the library's defaults
-// (via nl_config_default: 4 channels, 64 max connections, 10s timeout,
+// (via wn_config_default: 4 channels, 64 max connections, 10s timeout,
 // 1s keepalive, encryption on, plus transport/window/capabilities).
 func NewConfig() Config {
-	var raw C.nl_config_t
-	C.nl_config_default(&raw)
+	var raw C.wn_config_t
+	C.wn_config_default(&raw)
 	return Config{
 		ChannelCount:        uint8(raw.channel_count),
 		MaxConnections:      uint32(raw.max_connections),
@@ -148,40 +148,40 @@ func NewConfig() Config {
 	}
 }
 
-func (c Config) toC() (C.nl_config_t, *C.char) {
-	var raw C.nl_config_t
-	C.nl_config_default(&raw)
+func (c Config) toC() (C.wn_config_t, *C.char) {
+	var raw C.wn_config_t
+	C.wn_config_default(&raw)
 	raw.channel_count = C.uint8_t(c.ChannelCount)
 	raw.max_connections = C.uint32_t(c.MaxConnections)
 	raw.connection_timeout_ms = C.uint32_t(c.ConnectionTimeoutMs)
 	raw.keepalive_interval_ms = C.uint32_t(c.KeepaliveIntervalMs)
 	raw.encryption_enabled = C.bool(c.EncryptionEnabled)
-	raw.family = C.nl_af_t(c.Family)
-	raw.transport = C.nl_transport_t(c.Transport)
+	raw.family = C.wn_af_t(c.Family)
+	raw.transport = C.wn_transport_t(c.Transport)
 	raw.max_send_bytes_per_sec = C.uint32_t(c.MaxSendBytesPerSec)
 	raw.recv_window_bytes = C.uint32_t(c.RecvWindowBytes)
 	raw.event_queue_max_bytes = C.uint32_t(c.EventQueueMaxBytes)
 	raw.capabilities = C.uint32_t(c.Capabilities)
 	var nameCStr *C.char
 	if c.ServerName != "" {
-		nameCStr = C.CString(c.ServerName) // caller must free after nl_server_create returns
+		nameCStr = C.CString(c.ServerName) // caller must free after wn_server_create returns
 		raw.server_name = nameCStr
 	}
 	return raw, nameCStr
 }
 
-func addressToC(host string, port uint16, family AddressFamily) (C.nl_address_t, error) {
-	var addr C.nl_address_t
+func addressToC(host string, port uint16, family AddressFamily) (C.wn_address_t, error) {
+	var addr C.wn_address_t
 	if len(host) >= len(addr.host) {
 		return addr, &Error{Code: -1, Message: "invalid argument"}
 	}
 	cHost := C.CString(host)
 	defer C.free(unsafe.Pointer(cHost))
-	// nl_address_t.host is a fixed-size char[64] array, not a pointer --
+	// wn_address_t.host is a fixed-size char[64] array, not a pointer --
 	// copy into it directly rather than assigning a pointer.
 	C.strncpy((*C.char)(unsafe.Pointer(&addr.host[0])), cHost, C.size_t(len(addr.host)-1))
 	addr.port = C.uint16_t(port)
-	addr.family = C.nl_af_t(family)
+	addr.family = C.wn_af_t(family)
 	return addr, nil
 }
 
@@ -196,7 +196,7 @@ func clampTimeoutMs(d time.Duration) C.int {
 	return C.int(ms)
 }
 
-// Event mirrors nl_event_t, with `Data` copied into a Go-owned []byte
+// Event mirrors wn_event_t, with `Data` copied into a Go-owned []byte
 // (the underlying C buffer is only valid until the next PollEvent call,
 // so we copy it here rather than expose the raw pointer).
 type Event struct {
@@ -212,7 +212,7 @@ type Event struct {
 	ServerMaxPlayers  uint32
 }
 
-func eventFromC(raw *C.nl_event_t) Event {
+func eventFromC(raw *C.wn_event_t) Event {
 	ev := Event{
 		Type:              EventType(raw.event_type),
 		Peer:              PeerID(raw.peer),
@@ -223,7 +223,7 @@ func eventFromC(raw *C.nl_event_t) Event {
 		ServerPlayerCount: uint32(raw.server_player_count),
 		ServerMaxPlayers:  uint32(raw.server_max_players),
 	}
-	if raw.disconnect_reason != C.NL_OK {
+	if raw.disconnect_reason != C.WN_OK {
 		ev.DisconnectReason = newError(raw.disconnect_reason)
 	}
 	if raw.data != nil && raw.data_len > 0 {
@@ -232,9 +232,9 @@ func eventFromC(raw *C.nl_event_t) Event {
 	return ev
 }
 
-// Endpoint wraps a *C.nl_endpoint_t; embedded in Server and Client.
+// Endpoint wraps a *C.wn_endpoint_t; embedded in Server and Client.
 type Endpoint struct {
-	handle *C.nl_endpoint_t
+	handle *C.wn_endpoint_t
 }
 
 // Send encodes and enqueues data for delivery to peer on the given
@@ -245,7 +245,7 @@ func (e *Endpoint) Send(peer PeerID, channel uint8, delivery Delivery, data []by
 	if len(data) > 0 {
 		ptr = (*C.uint8_t)(unsafe.Pointer(&data[0]))
 	}
-	res := C.nl_send(e.handle, C.nl_peer_id_t(peer), C.uint8_t(channel), C.nl_delivery_t(delivery), ptr, C.size_t(len(data)))
+	res := C.wn_send(e.handle, C.wn_peer_id_t(peer), C.uint8_t(channel), C.wn_delivery_t(delivery), ptr, C.size_t(len(data)))
 	return newError(res)
 }
 
@@ -257,16 +257,16 @@ func (e *Endpoint) SendEx(peer PeerID, channel uint8, delivery Delivery, data []
 	if len(data) > 0 {
 		ptr = (*C.uint8_t)(unsafe.Pointer(&data[0]))
 	}
-	res := C.nl_send_ex(e.handle, C.nl_peer_id_t(peer), C.uint8_t(channel), C.nl_delivery_t(delivery), ptr, C.size_t(len(data)), C.uint8_t(priority))
+	res := C.wn_send_ex(e.handle, C.wn_peer_id_t(peer), C.uint8_t(channel), C.wn_delivery_t(delivery), ptr, C.size_t(len(data)), C.uint8_t(priority))
 	return newError(res)
 }
 
 // PollEvent waits up to timeout for the next event. A negative timeout
 // blocks forever; zero returns immediately if nothing is queued.
 func (e *Endpoint) PollEvent(timeout time.Duration) (Event, bool) {
-	var raw C.nl_event_t
+	var raw C.wn_event_t
 	ms := clampTimeoutMs(timeout)
-	ok := C.nl_poll_event(e.handle, &raw, ms)
+	ok := C.wn_poll_event(e.handle, &raw, ms)
 	if !bool(ok) {
 		return Event{}, false
 	}
@@ -275,24 +275,24 @@ func (e *Endpoint) PollEvent(timeout time.Duration) (Event, bool) {
 
 // Disconnect gracefully closes a connection.
 func (e *Endpoint) Disconnect(peer PeerID) error {
-	return newError(C.nl_disconnect(e.handle, C.nl_peer_id_t(peer)))
+	return newError(C.wn_disconnect(e.handle, C.wn_peer_id_t(peer)))
 }
 
 // PeerRTTMillis returns the current smoothed round-trip-time estimate.
 func (e *Endpoint) PeerRTTMillis(peer PeerID) uint32 {
-	return uint32(C.nl_peer_rtt_ms(e.handle, C.nl_peer_id_t(peer)))
+	return uint32(C.wn_peer_rtt_ms(e.handle, C.wn_peer_id_t(peer)))
 }
 
 // PeerCount returns the number of currently-established connections.
 func (e *Endpoint) PeerCount() uint32 {
-	return uint32(C.nl_peer_count(e.handle))
+	return uint32(C.wn_peer_count(e.handle))
 }
 
 // PeerStats returns a snapshot of per-peer counters and RTT estimates.
 // The second result is false if peer is not a known connection.
 func (e *Endpoint) PeerStats(peer PeerID) (PeerStats, bool) {
-	var raw C.nl_peer_stats_t
-	ok := C.nl_peer_stats(e.handle, C.nl_peer_id_t(peer), &raw)
+	var raw C.wn_peer_stats_t
+	ok := C.wn_peer_stats(e.handle, C.wn_peer_id_t(peer), &raw)
 	if !bool(ok) {
 		return PeerStats{}, false
 	}
@@ -309,11 +309,11 @@ func (e *Endpoint) PeerStats(peer PeerID) (PeerStats, bool) {
 	}, true
 }
 
-// PeerCapabilities returns the NL_CAP_* bits negotiated with peer during
+// PeerCapabilities returns the WN_CAP_* bits negotiated with peer during
 // the handshake. The second result is false if peer is unknown.
 func (e *Endpoint) PeerCapabilities(peer PeerID) (uint32, bool) {
 	var caps C.uint32_t
-	ok := C.nl_peer_capabilities(e.handle, C.nl_peer_id_t(peer), &caps)
+	ok := C.wn_peer_capabilities(e.handle, C.wn_peer_id_t(peer), &caps)
 	return uint32(caps), bool(ok)
 }
 
@@ -321,7 +321,7 @@ func (e *Endpoint) PeerCapabilities(peer PeerID) (uint32, bool) {
 // associated resources. The Endpoint must not be used afterwards.
 func (e *Endpoint) Close() {
 	if e.handle != nil {
-		C.nl_endpoint_destroy(e.handle)
+		C.wn_endpoint_destroy(e.handle)
 		e.handle = nil
 	}
 }
@@ -343,8 +343,8 @@ func NewServer(host string, port uint16, cfg Config) (*Server, error) {
 		defer C.free(unsafe.Pointer(nameCStr))
 	}
 
-	var handle *C.nl_endpoint_t
-	res := C.nl_server_create(&addr, &cCfg, &handle)
+	var handle *C.wn_endpoint_t
+	res := C.wn_server_create(&addr, &cCfg, &handle)
 	if err := newError(res); err != nil {
 		return nil, err
 	}
@@ -354,7 +354,7 @@ func NewServer(host string, port uint16, cfg Config) (*Server, error) {
 // EnableDiscovery starts responding to LAN discovery broadcasts on the
 // given port.
 func (s *Server) EnableDiscovery(discoveryPort uint16) error {
-	return newError(C.nl_discovery_enable(s.handle, C.uint16_t(discoveryPort)))
+	return newError(C.wn_discovery_enable(s.handle, C.uint16_t(discoveryPort)))
 }
 
 // Client initiates outbound connections.
@@ -368,8 +368,8 @@ func NewClient(cfg Config) (*Client, error) {
 	if nameCStr != nil {
 		defer C.free(unsafe.Pointer(nameCStr))
 	}
-	var handle *C.nl_endpoint_t
-	res := C.nl_client_create(&cCfg, &handle)
+	var handle *C.wn_endpoint_t
+	res := C.wn_client_create(&cCfg, &handle)
 	if err := newError(res); err != nil {
 		return nil, err
 	}
@@ -384,8 +384,8 @@ func (c *Client) Connect(host string, port uint16) (PeerID, error) {
 	if err != nil {
 		return 0, err
 	}
-	var peer C.nl_peer_id_t
-	res := C.nl_connect(c.handle, &addr, &peer)
+	var peer C.wn_peer_id_t
+	res := C.wn_connect(c.handle, &addr, &peer)
 	if err := newError(res); err != nil {
 		return 0, err
 	}
@@ -395,7 +395,7 @@ func (c *Client) Connect(host string, port uint16) (PeerID, error) {
 // ProbeLAN broadcasts a discovery probe; replies arrive as
 // EventDiscoveryReply events over subsequent PollEvent calls.
 func (c *Client) ProbeLAN(discoveryPort uint16, timeout time.Duration) error {
-	return newError(C.nl_discovery_probe(c.handle, C.uint16_t(discoveryPort), clampTimeoutMs(timeout)))
+	return newError(C.wn_discovery_probe(c.handle, C.uint16_t(discoveryPort), clampTimeoutMs(timeout)))
 }
 
 // WaitConnected blocks (polling internally) until the connection succeeds
@@ -408,5 +408,5 @@ func (c *Client) WaitConnected(timeout time.Duration) (Event, error) {
 			return ev, nil
 		}
 	}
-	return Event{}, errors.New("netlink: timed out waiting to connect")
+	return Event{}, errors.New("weft-net: timed out waiting to connect")
 }

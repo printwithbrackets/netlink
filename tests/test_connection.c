@@ -9,15 +9,15 @@
  * internal ordering directly (it is internal state, not observable through
  * the public API without driving window pressure and racing the flush).
  * Hidden-visibility, so they are not part of the shared library's ABI. */
-nl_connection_t *nl_connection_new_for_test(void);
-bool deferred_push_for_test(nl_connection_t *conn, uint8_t channel, nl_delivery_t delivery,
+wn_connection_t *wn_connection_new_for_test(void);
+bool deferred_push_for_test(wn_connection_t *conn, uint8_t channel, wn_delivery_t delivery,
                             uint8_t priority, const uint8_t *data, size_t len,
                             bool continuation, uint16_t frag_start, uint16_t message_id);
 
 /* ---- test harness: two connections wired together, no real socket.
  *
  * Packets are delivered by calling straight into the peer's
- * nl_connection_on_packet -- a same-process stand-in for "the packet
+ * wn_connection_on_packet -- a same-process stand-in for "the packet
  * crossed the network". Crucially, this must NOT be done naively
  * synchronously and unconditionally: a real network is an asynchronous
  * boundary (nothing calls back into the sender's own stack frame while
@@ -38,15 +38,15 @@ bool deferred_push_for_test(nl_connection_t *conn, uint8_t channel, nl_delivery_
  * afterward exactly as before. ---- */
 
 typedef struct harness {
-    nl_connection_t *self_conn;
-    nl_connection_t *peer_conn;
+    wn_connection_t *self_conn;
+    wn_connection_t *peer_conn;
     struct harness   *peer_harness;
     uint64_t          now_ms;
 
-    uint8_t      last_data[NL_MAX_MESSAGE_SIZE];
+    uint8_t      last_data[WN_MAX_MESSAGE_SIZE];
     uint32_t     last_data_len;
     uint8_t      last_channel;
-    nl_delivery_t last_delivery;
+    wn_delivery_t last_delivery;
     int          data_count;
     /* First few payloads, so tests can assert flush order not just the
      * most recent delivery (priority reordering). */
@@ -55,16 +55,16 @@ typedef struct harness {
     int          order_count;
 
     int          disconnect_count;
-    nl_result_t  last_disconnect_reason;
+    wn_result_t  last_disconnect_reason;
 
     bool drop_next_send;
     int  drop_remaining;  /* drop this many upcoming sends in transit (burst loss) */
     int  packets_sent;
 
-    nl_conn_callbacks_t cb;
+    wn_conn_callbacks_t cb;
 } harness_t;
 
-static bool h_on_data(void *ctx, nl_peer_id_t peer, uint8_t channel, nl_delivery_t delivery,
+static bool h_on_data(void *ctx, wn_peer_id_t peer, uint8_t channel, wn_delivery_t delivery,
                        const uint8_t *data, uint32_t len) {
     (void)peer;
     harness_t *h = (harness_t *)ctx;
@@ -85,7 +85,7 @@ static bool h_on_data(void *ctx, nl_peer_id_t peer, uint8_t channel, nl_delivery
     return true; /* harness always accepts the event */
 }
 
-static void h_on_disconnected(void *ctx, nl_peer_id_t peer, nl_result_t reason) {
+static void h_on_disconnected(void *ctx, wn_peer_id_t peer, wn_result_t reason) {
     (void)peer;
     harness_t *h = (harness_t *)ctx;
     h->disconnect_count++;
@@ -95,23 +95,23 @@ static void h_on_disconnected(void *ctx, nl_peer_id_t peer, nl_result_t reason) 
 /* ---- in-flight tracking + delivery queue (see comment above) ---- */
 
 #define MAX_IN_FLIGHT 8
-#define MAX_QUEUED 512 /* a single flush can emit up to NL_MAX_FRAGMENTS (256) */
+#define MAX_QUEUED 512 /* a single flush can emit up to WN_MAX_FRAGMENTS (256) */
 #define MAX_QUEUED_PACKET_SIZE 2048
 
 typedef struct {
-    nl_connection_t *dest_conn;
-    const nl_conn_callbacks_t *dest_cb;
+    wn_connection_t *dest_conn;
+    const wn_conn_callbacks_t *dest_cb;
     uint64_t now_ms;
     uint8_t packet[MAX_QUEUED_PACKET_SIZE];
     size_t len;
 } queued_packet_t;
 
-static nl_connection_t *g_in_flight[MAX_IN_FLIGHT];
+static wn_connection_t *g_in_flight[MAX_IN_FLIGHT];
 static int g_in_flight_count = 0;
 static queued_packet_t g_queue[MAX_QUEUED];
 static int g_queue_count = 0;
 
-static bool is_in_flight(nl_connection_t *conn) {
+static bool is_in_flight(wn_connection_t *conn) {
     for (int i = 0; i < g_in_flight_count; i++) {
         if (g_in_flight[i] == conn) return true;
     }
@@ -120,9 +120,9 @@ static bool is_in_flight(nl_connection_t *conn) {
 
 /* Returns false if the table is full (recorded, not fatal): callers may
  * be nested under a held connection lock, where longjmp would deadlock. */
-static bool enter_in_flight(nl_connection_t *conn) {
+static bool enter_in_flight(wn_connection_t *conn) {
     if (g_in_flight_count >= MAX_IN_FLIGHT) {
-        NL_FAIL("in-flight table full (MAX_IN_FLIGHT=%d)", MAX_IN_FLIGHT);
+        WN_FAIL("in-flight table full (MAX_IN_FLIGHT=%d)", MAX_IN_FLIGHT);
         return false;
     }
     g_in_flight[g_in_flight_count++] = conn;
@@ -133,11 +133,11 @@ static void exit_in_flight(void) {
     if (g_in_flight_count > 0) g_in_flight_count--;
 }
 
-static void deliver_one(nl_connection_t *conn, const uint8_t *packet, size_t len, uint64_t now_ms,
-                         const nl_conn_callbacks_t *cb) {
+static void deliver_one(wn_connection_t *conn, const uint8_t *packet, size_t len, uint64_t now_ms,
+                         const wn_conn_callbacks_t *cb) {
     if (!enter_in_flight(conn)) return;
     uint8_t type = packet[0];
-    nl_connection_on_packet(conn, type, packet + 1, len - 1, now_ms, cb);
+    wn_connection_on_packet(conn, type, packet + 1, len - 1, now_ms, cb);
     exit_in_flight();
 }
 
@@ -160,7 +160,7 @@ static void drain_queue(void) {
     }
 }
 
-static void h_send_wire(void *ctx, nl_peer_id_t peer, const uint8_t *packet, size_t len) {
+static void h_send_wire(void *ctx, wn_peer_id_t peer, const uint8_t *packet, size_t len) {
     (void)peer;
     harness_t *h = (harness_t *)ctx;
     h->packets_sent++;
@@ -182,11 +182,11 @@ static void h_send_wire(void *ctx, nl_peer_id_t peer, const uint8_t *packet, siz
          * Overflow/oversize here means a test bug: record and drop the
          * packet rather than longjmp (locks are held) or write OOB. */
         if (g_queue_count >= MAX_QUEUED) {
-            NL_FAIL("delivery queue full (MAX_QUEUED=%d)", MAX_QUEUED);
+            WN_FAIL("delivery queue full (MAX_QUEUED=%d)", MAX_QUEUED);
             return;
         }
         if (len > MAX_QUEUED_PACKET_SIZE) {
-            NL_FAIL("packet too large for queue (%zu > %d)", len, MAX_QUEUED_PACKET_SIZE);
+            WN_FAIL("packet too large for queue (%zu > %d)", len, MAX_QUEUED_PACKET_SIZE);
             return;
         }
         queued_packet_t *q = &g_queue[g_queue_count++];
@@ -213,36 +213,36 @@ static void harness_init(harness_t *h) {
 /* Thin wrappers around the connection.c entry points that can trigger
  * send_wire, applying the same in-flight tracking so tests never have to
  * think about the reentrancy issue directly -- just call these instead
- * of the raw nl_connection_* functions and everything chained
+ * of the raw wn_connection_* functions and everything chained
  * synchronously from them (acks, fast retransmits, replies) will have
  * been fully delivered by the time the call returns. */
 
-static nl_result_t harness_send(harness_t *h, nl_connection_t *conn, uint8_t channel, nl_delivery_t delivery,
+static wn_result_t harness_send(harness_t *h, wn_connection_t *conn, uint8_t channel, wn_delivery_t delivery,
                                  const uint8_t *data, size_t len, uint64_t now_ms) {
-    if (!enter_in_flight(conn)) return NL_ERR_INTERNAL;
-    nl_result_t r = nl_connection_send(conn, channel, delivery, data, len, NL_PRIORITY_NORMAL, now_ms, &h->cb);
+    if (!enter_in_flight(conn)) return WN_ERR_INTERNAL;
+    wn_result_t r = wn_connection_send(conn, channel, delivery, data, len, WN_PRIORITY_NORMAL, now_ms, &h->cb);
     exit_in_flight();
     drain_queue();
     return r;
 }
 
-static void harness_tick(harness_t *h, nl_connection_t *conn, uint64_t now_ms) {
+static void harness_tick(harness_t *h, wn_connection_t *conn, uint64_t now_ms) {
     if (!enter_in_flight(conn)) return;
-    nl_connection_tick(conn, now_ms, &h->cb);
+    wn_connection_tick(conn, now_ms, &h->cb);
     exit_in_flight();
     drain_queue();
 }
 
-static void harness_send_disconnect(harness_t *h, nl_connection_t *conn, uint64_t now_ms) {
+static void harness_send_disconnect(harness_t *h, wn_connection_t *conn, uint64_t now_ms) {
     if (!enter_in_flight(conn)) return;
-    nl_connection_send_disconnect(conn, now_ms, &h->cb);
+    wn_connection_send_disconnect(conn, now_ms, &h->cb);
     exit_in_flight();
     drain_queue();
 }
 
-static void harness_send_handshake_complete(harness_t *h, nl_connection_t *conn, uint64_t now_ms, bool is_retry) {
+static void harness_send_handshake_complete(harness_t *h, wn_connection_t *conn, uint64_t now_ms, bool is_retry) {
     if (!enter_in_flight(conn)) return;
-    nl_connection_send_handshake_complete(conn, now_ms, is_retry, &h->cb);
+    wn_connection_send_handshake_complete(conn, now_ms, is_retry, &h->cb);
     exit_in_flight();
     drain_queue();
 }
@@ -253,30 +253,30 @@ static void harness_send_handshake_complete(harness_t *h, nl_connection_t *conn,
  * needing the full handshake state machine (tested separately at the
  * endpoint/integration level). */
 static void derive_test_keys(uint8_t c2s_key[32], uint8_t s2c_key[32]) {
-    nl_keypair_t *a = nl_keypair_generate();
-    nl_keypair_t *b = nl_keypair_generate();
+    wn_keypair_t *a = wn_keypair_generate();
+    wn_keypair_t *b = wn_keypair_generate();
     uint8_t a_pub[32], b_pub[32], shared[32];
-    nl_keypair_public(a, a_pub);
-    nl_keypair_public(b, b_pub);
-    nl_crypto_x25519(a, b_pub, shared);
+    wn_keypair_public(a, a_pub);
+    wn_keypair_public(b, b_pub);
+    wn_crypto_x25519(a, b_pub, shared);
     uint8_t salt[32] = {0};
-    nl_crypto_hkdf_sha256(shared, 32, salt, sizeof(salt), (const uint8_t *)"c2s", 3, c2s_key, 32);
-    nl_crypto_hkdf_sha256(shared, 32, salt, sizeof(salt), (const uint8_t *)"s2c", 3, s2c_key, 32);
-    nl_keypair_free(a);
-    nl_keypair_free(b);
+    wn_crypto_hkdf_sha256(shared, 32, salt, sizeof(salt), (const uint8_t *)"c2s", 3, c2s_key, 32);
+    wn_crypto_hkdf_sha256(shared, 32, salt, sizeof(salt), (const uint8_t *)"s2c", 3, s2c_key, 32);
+    wn_keypair_free(a);
+    wn_keypair_free(b);
 }
 
-static void make_pair(harness_t *client_h, harness_t *server_h, nl_connection_t **client_conn,
-                       nl_connection_t **server_conn, uint32_t timeout_ms, uint32_t keepalive_ms) {
+static void make_pair(harness_t *client_h, harness_t *server_h, wn_connection_t **client_conn,
+                       wn_connection_t **server_conn, uint32_t timeout_ms, uint32_t keepalive_ms) {
     uint8_t c2s_key[32], s2c_key[32], c2s_salt[12] = {1}, s2c_salt[12] = {2};
     derive_test_keys(c2s_key, s2c_key);
 
     struct sockaddr_storage dummy_addr;
     memset(&dummy_addr, 0, sizeof(dummy_addr));
 
-    *client_conn = nl_connection_create(1001, &dummy_addr, sizeof(dummy_addr), true, 4,
+    *client_conn = wn_connection_create(1001, &dummy_addr, sizeof(dummy_addr), true, 4,
                                          c2s_key, s2c_key, c2s_salt, s2c_salt, timeout_ms, keepalive_ms, 0);
-    *server_conn = nl_connection_create(1001, &dummy_addr, sizeof(dummy_addr), false, 4,
+    *server_conn = wn_connection_create(1001, &dummy_addr, sizeof(dummy_addr), false, 4,
                                          s2c_key, c2s_key, s2c_salt, c2s_salt, timeout_ms, keepalive_ms, 0);
     ASSERT_TRUE(*client_conn != NULL);
     ASSERT_TRUE(*server_conn != NULL);
@@ -296,21 +296,21 @@ static void make_pair(harness_t *client_h, harness_t *server_h, nl_connection_t 
 
 TEST(test_connection_send_and_receive_roundtrip) {
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 10000, 1000);
 
     const char *msg = "hello over encrypted udp";
-    nl_result_t r = harness_send(&ch, cc, 2, NL_RELIABLE_ORDERED, (const uint8_t *)msg, strlen(msg), 0);
-    ASSERT_EQ(r, NL_OK);
+    wn_result_t r = harness_send(&ch, cc, 2, WN_RELIABLE_ORDERED, (const uint8_t *)msg, strlen(msg), 0);
+    ASSERT_EQ(r, WN_OK);
 
     ASSERT_EQ(sh.data_count, 1);
     ASSERT_EQ(sh.last_channel, 2);
-    ASSERT_EQ(sh.last_delivery, NL_RELIABLE_ORDERED);
+    ASSERT_EQ(sh.last_delivery, WN_RELIABLE_ORDERED);
     ASSERT_EQ(sh.last_data_len, strlen(msg));
     ASSERT_MEM_EQ(sh.last_data, msg, strlen(msg));
 
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 TEST(test_connection_rejects_wrong_key) {
@@ -318,7 +318,7 @@ TEST(test_connection_rejects_wrong_key) {
      * keys pretending to be the server -- the client's packets must fail
      * to decrypt against it. */
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 10000, 1000);
 
     uint8_t wrong_c2s[32], wrong_s2c[32];
@@ -326,7 +326,7 @@ TEST(test_connection_rejects_wrong_key) {
     struct sockaddr_storage dummy;
     memset(&dummy, 0, sizeof(dummy));
     uint8_t salt_a[12] = {1}, salt_b[12] = {2};
-    nl_connection_t *impostor = nl_connection_create(1001, &dummy, sizeof(dummy), false, 4,
+    wn_connection_t *impostor = wn_connection_create(1001, &dummy, sizeof(dummy), false, 4,
                                                        wrong_s2c, wrong_c2s, salt_b, salt_a, 10000, 1000, 0);
 
     harness_t impostor_h;
@@ -335,21 +335,21 @@ TEST(test_connection_rejects_wrong_key) {
     ch.peer_harness = &impostor_h;
 
     const char *msg = "should not decrypt";
-    harness_send(&ch, cc, 0, NL_UNRELIABLE, (const uint8_t *)msg, strlen(msg), 0);
+    harness_send(&ch, cc, 0, WN_UNRELIABLE, (const uint8_t *)msg, strlen(msg), 0);
     ASSERT_EQ(impostor_h.data_count, 0); /* authentication must fail, nothing delivered */
 
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
-    nl_connection_destroy(impostor);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
+    wn_connection_destroy(impostor);
 }
 
 TEST(test_connection_retransmit_on_tick_and_stops_after_ack) {
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 10000, 100000 /* keepalive way beyond test duration */);
 
     const char *msg = "reliable payload";
-    harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED, (const uint8_t *)msg, strlen(msg), 0);
+    harness_send(&ch, cc, 0, WN_RELIABLE_ORDERED, (const uint8_t *)msg, strlen(msg), 0);
     ASSERT_EQ(sh.data_count, 1);
     ASSERT_EQ(ch.packets_sent, 1);
 
@@ -365,39 +365,39 @@ TEST(test_connection_retransmit_on_tick_and_stops_after_ack) {
      * application a second time. */
     ASSERT_EQ(sh.data_count, 1);
 
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 TEST(test_connection_idle_timeout_disconnects) {
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, /*timeout*/ 500, /*keepalive*/ 100000);
 
     ASSERT_EQ(ch.disconnect_count, 0);
     harness_tick(&ch, cc, 1000 /* well past the 500ms timeout, no traffic ever received */);
     ASSERT_EQ(ch.disconnect_count, 1);
-    ASSERT_EQ(ch.last_disconnect_reason, NL_ERR_TIMEOUT);
+    ASSERT_EQ(ch.last_disconnect_reason, WN_ERR_TIMEOUT);
 
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 TEST(test_connection_graceful_disconnect_notifies_peer) {
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 10000, 1000);
 
     harness_send_disconnect(&ch, cc, 0);
     ASSERT_EQ(sh.disconnect_count, 1);
-    ASSERT_EQ(sh.disconnect_count == 1 && sh.last_disconnect_reason == NL_OK, 1); /* graceful, not a timeout/error */
+    ASSERT_EQ(sh.disconnect_count == 1 && sh.last_disconnect_reason == WN_OK, 1); /* graceful, not a timeout/error */
 
     /* Further sends on the now-disconnected client connection must fail cleanly. */
-    nl_result_t r = harness_send(&ch, cc, 0, NL_UNRELIABLE, (const uint8_t *)"x", 1, 0);
-    ASSERT_EQ(r, NL_ERR_NOT_CONNECTED);
+    wn_result_t r = harness_send(&ch, cc, 0, WN_UNRELIABLE, (const uint8_t *)"x", 1, 0);
+    ASSERT_EQ(r, WN_ERR_NOT_CONNECTED);
 
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 /* Regression: server-side CONNECT_ACCEPTED must be retransmitted until the
@@ -405,7 +405,7 @@ TEST(test_connection_graceful_disconnect_notifies_peer) {
  * previously stalled the client handshake until idle timeout. */
 TEST(test_connection_accept_retransmits_until_budget_exhausted) {
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     /* keepalive far beyond the test so only ACCEPTED retries tick. */
     make_pair(&ch, &sh, &cc, &sc, /*timeout*/ 100000, /*keepalive*/ 100000);
 
@@ -414,7 +414,7 @@ TEST(test_connection_accept_retransmits_until_budget_exhausted) {
     harness_send_handshake_complete(&sh, sc, /*now_ms*/ 0, /*is_retry*/ false);
     ASSERT_EQ(sh.packets_sent, 1); /* initial ACCEPTED (then dropped via drop_next_send) */
 
-    /* After NL_HANDSHAKE_RETRY_MS (250ms) with no inbound from the client,
+    /* After WN_HANDSHAKE_RETRY_MS (250ms) with no inbound from the client,
      * the server must put another ACCEPTED on the wire. */
     sh.drop_next_send = false;
     int before = sh.packets_sent;
@@ -428,20 +428,20 @@ TEST(test_connection_accept_retransmits_until_budget_exhausted) {
      * now_ms argument), so set it to the intended receive time first --
      * otherwise the server sees last_recv=0 and keeps retransmitting. */
     sh.now_ms = 400;
-    harness_send(&ch, cc, 0, NL_UNRELIABLE, (const uint8_t *)"confirm", 7, 400);
+    harness_send(&ch, cc, 0, WN_UNRELIABLE, (const uint8_t *)"confirm", 7, 400);
     ASSERT_EQ(sh.data_count, 1);
 
     int before2 = sh.packets_sent;
     harness_tick(&sh, sc, 700); /* past another retry window */
     ASSERT_EQ(sh.packets_sent, before2); /* no more ACCEPTED once client proved reachability */
 
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 TEST(test_connection_keepalive_sent_when_idle) {
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 10000, /*keepalive*/ 200);
 
     ASSERT_EQ(ch.packets_sent, 0);
@@ -449,61 +449,61 @@ TEST(test_connection_keepalive_sent_when_idle) {
     ASSERT_EQ(ch.packets_sent, 1);
     ASSERT_EQ(sh.disconnect_count, 0); /* server stays connected, just received a keepalive */
 
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 TEST(test_connection_stats_track_sent_and_received) {
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 10000, 1000);
 
-    harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED, (const uint8_t *)"hello", 5, 0);
+    harness_send(&ch, cc, 0, WN_RELIABLE_ORDERED, (const uint8_t *)"hello", 5, 0);
 
-    nl_connection_stats_t cstats, sstats;
-    nl_connection_get_stats(cc, &cstats);
-    nl_connection_get_stats(sc, &sstats);
+    wn_connection_stats_t cstats, sstats;
+    wn_connection_get_stats(cc, &cstats);
+    wn_connection_get_stats(sc, &sstats);
 
     ASSERT_EQ(cstats.packets_sent, 1u);
     ASSERT_TRUE(cstats.bytes_sent > 5); /* includes header/encryption overhead */
     ASSERT_EQ(sstats.packets_received, 1u);
     ASSERT_TRUE(sstats.bytes_received > 5);
 
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 TEST(test_connection_rtt_measured_from_real_roundtrip) {
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 10000, 1000);
 
     /* Client sends at (explicit) time 1000; this is stored as the send
      * ring slot's send_time_ms and is what the eventual RTT sample is
      * measured against. */
-    harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED, (const uint8_t *)"ping", 4, 1000);
+    harness_send(&ch, cc, 0, WN_RELIABLE_ORDERED, (const uint8_t *)"ping", 4, 1000);
     ASSERT_EQ(sh.data_count, 1);
 
     /* The server's reply piggybacks the ack. Set the CLIENT's clock
      * (ch.now_ms) to 1042 first: delivery to the client uses ch.now_ms as
-     * the receive-time "now", which is exactly when nl_channel_on_receive
+     * the receive-time "now", which is exactly when wn_channel_on_receive
      * computes the RTT sample as (now - send_time_ms). */
     ch.now_ms = 1042;
-    harness_send(&sh, sc, 0, NL_RELIABLE_ORDERED, (const uint8_t *)"pong", 4, 1005);
+    harness_send(&sh, sc, 0, WN_RELIABLE_ORDERED, (const uint8_t *)"pong", 4, 1005);
 
-    nl_connection_stats_t stats;
-    nl_connection_get_stats(cc, &stats);
+    wn_connection_stats_t stats;
+    wn_connection_get_stats(cc, &stats);
     ASSERT_EQ(stats.rtt_ms, 42u);     /* first-ever sample: srtt is set directly to it */
     ASSERT_EQ(stats.rtt_var_ms, 21u); /* first-ever sample: rttvar = sample / 2 */
     ASSERT_EQ(stats.rto_ms, 126u);    /* srtt(42) + 4*rttvar(21) = 126, above the 100ms floor */
 
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 TEST(test_connection_fast_retransmit_faster_than_rto) {
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 10000, 100000);
 
     /* Send 5 messages reliably-ordered; drop the FIRST one in transit
@@ -512,11 +512,11 @@ TEST(test_connection_fast_retransmit_faster_than_rto) {
      * filled -- so at this point nothing has been delivered yet, even
      * though 4 of the 5 physically arrived. */
     ch.drop_next_send = true;
-    harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED, (const uint8_t *)"lost", 4, 0);
+    harness_send(&ch, cc, 0, WN_RELIABLE_ORDERED, (const uint8_t *)"lost", 4, 0);
     for (int i = 0; i < 4; i++) {
         char msg[8];
         snprintf(msg, sizeof(msg), "m%d", i);
-        harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED, (const uint8_t *)msg, (size_t)strlen(msg), 0);
+        harness_send(&ch, cc, 0, WN_RELIABLE_ORDERED, (const uint8_t *)msg, (size_t)strlen(msg), 0);
     }
     ASSERT_EQ(sh.data_count, 0); /* all 5 withheld, waiting on the missing first packet */
 
@@ -526,26 +526,26 @@ TEST(test_connection_fast_retransmit_faster_than_rto) {
      * the test that originally exposed the reentrancy issue the harness
      * above now handles: this single call chains client-receives-ack ->
      * client fast-retransmits back to the server, synchronously). */
-    harness_send(&sh, sc, 0, NL_RELIABLE_ORDERED, (const uint8_t *)"ack", 3, 5);
+    harness_send(&sh, sc, 0, WN_RELIABLE_ORDERED, (const uint8_t *)"ack", 3, 5);
 
     ASSERT_EQ(sh.data_count, 5); /* the resend filled the gap; all 5 release in order */
     ASSERT_MEM_EQ(sh.last_data, "m3", 2); /* last delivered was the final message */
 
-    nl_connection_stats_t stats;
-    nl_connection_get_stats(cc, &stats);
+    wn_connection_stats_t stats;
+    wn_connection_get_stats(cc, &stats);
     ASSERT_TRUE(stats.retransmits >= 1); /* fast retransmit fired without waiting for RTO */
 
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 TEST(test_connection_replay_attack_rejected) {
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 10000, 1000);
 
     const char *msg = "state update";
-    harness_send(&ch, cc, 0, NL_UNRELIABLE, (const uint8_t *)msg, strlen(msg), 0);
+    harness_send(&ch, cc, 0, WN_UNRELIABLE, (const uint8_t *)msg, strlen(msg), 0);
     ASSERT_EQ(sh.data_count, 1);
 
     /* We don't have the raw wire bytes here (the harness delivers
@@ -556,55 +556,55 @@ TEST(test_connection_replay_attack_rejected) {
      * legitimate packet. Genuine ciphertext replay is covered directly at
      * the crypto layer in test_crypto.c's replay window tests, which
      * connection.c relies on. */
-    harness_send(&ch, cc, 0, NL_UNRELIABLE, (const uint8_t *)msg, strlen(msg), 0);
+    harness_send(&ch, cc, 0, WN_UNRELIABLE, (const uint8_t *)msg, strlen(msg), 0);
     ASSERT_EQ(sh.data_count, 2);
 
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 /* ---- congestion control ---- */
 
 TEST(test_congestion_window_gates_reliable_sends) {
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 10000, 100000);
 
-    /* Initial cwnd is NL_CWND_INITIAL_PACKETS (10). Fill it with
-     * unacked reliable sends; the next must park (still NL_OK), and the
+    /* Initial cwnd is WN_CWND_INITIAL_PACKETS (10). Fill it with
+     * unacked reliable sends; the next must park (still WN_OK), and the
      * peer must not see an 11th packet until acks open the window. */
     const char *msg = "x";
-    for (int i = 0; i < NL_CWND_INITIAL_PACKETS; i++) {
-        ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED, (const uint8_t *)msg, 1, 0), NL_OK);
+    for (int i = 0; i < WN_CWND_INITIAL_PACKETS; i++) {
+        ASSERT_EQ(harness_send(&ch, cc, 0, WN_RELIABLE_ORDERED, (const uint8_t *)msg, 1, 0), WN_OK);
     }
-    ASSERT_EQ(sh.data_count, NL_CWND_INITIAL_PACKETS);
+    ASSERT_EQ(sh.data_count, WN_CWND_INITIAL_PACKETS);
     int sent_at_cap = ch.packets_sent;
 
     /* 11th: window full -> deferred, not emitted yet. */
-    ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED, (const uint8_t *)msg, 1, 0), NL_OK);
+    ASSERT_EQ(harness_send(&ch, cc, 0, WN_RELIABLE_ORDERED, (const uint8_t *)msg, 1, 0), WN_OK);
     ASSERT_EQ(ch.packets_sent, sent_at_cap); /* nothing new on the wire */
-    ASSERT_EQ(sh.data_count, NL_CWND_INITIAL_PACKETS);
+    ASSERT_EQ(sh.data_count, WN_CWND_INITIAL_PACKETS);
 
     /* Peer replies: its DATA carries an ack covering everything received,
      * which opens the window and flushes the deferred message. */
-    ASSERT_EQ(harness_send(&sh, sc, 0, NL_RELIABLE_ORDERED, (const uint8_t *)"a", 1, 10), NL_OK);
-    ASSERT_TRUE(sh.data_count >= NL_CWND_INITIAL_PACKETS + 1);
+    ASSERT_EQ(harness_send(&sh, sc, 0, WN_RELIABLE_ORDERED, (const uint8_t *)"a", 1, 10), WN_OK);
+    ASSERT_TRUE(sh.data_count >= WN_CWND_INITIAL_PACKETS + 1);
     ASSERT_TRUE(ch.packets_sent > sent_at_cap);
 
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 TEST(test_congestion_loss_shrinks_window) {
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 10000, 100000);
 
     /* Drive a few reliable sends so cwnd has data, then force an RTO
      * retransmit (loss signal) and confirm cwnd collapsed to 1. */
     const char *msg = "y";
     for (int i = 0; i < 5; i++) {
-        ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED, (const uint8_t *)msg, 1, 0), NL_OK);
+        ASSERT_EQ(harness_send(&ch, cc, 0, WN_RELIABLE_ORDERED, (const uint8_t *)msg, 1, 0), WN_OK);
     }
     /* Drop the peer's reply so the client's packets stay unacked. */
     sh.drop_next_send = true;
@@ -617,13 +617,13 @@ TEST(test_congestion_loss_shrinks_window) {
      * the gate: send a burst of 5; at most a small number emit. */
     int before = ch.packets_sent;
     for (int i = 0; i < 5; i++) {
-        harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED, (const uint8_t *)msg, 1, 6000);
+        harness_send(&ch, cc, 0, WN_RELIABLE_ORDERED, (const uint8_t *)msg, 1, 6000);
     }
     /* cwnd was reset to 1 on RTO; retransmits of old slots don't count as
      * new in-flight for the gate beyond what's still unacked. The key
      * observable: we cannot blast 5 brand-new packets past a collapsed
      * window without acks. At least one of the 5 must have deferred. */
-    ASSERT_TRUE(sh.data_count < 5 + NL_CWND_INITIAL_PACKETS + 1 ||
+    ASSERT_TRUE(sh.data_count < 5 + WN_CWND_INITIAL_PACKETS + 1 ||
                 ch.packets_sent - before <= 5);
     /* Stronger check: after RTO, ssthresh/cwnd are small, so total NEW
      * emissions in this burst are strictly fewer than 5 without peer acks
@@ -631,40 +631,40 @@ TEST(test_congestion_loss_shrinks_window) {
      * the earlier tick), so at most a tiny number leave. */
     ASSERT_TRUE(ch.packets_sent - before < 5);
 
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 /* ---- flow control (peer receive window) ---- */
 
 TEST(test_flow_control_parks_when_peer_window_zero) {
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 10000, 100000);
 
     /* Force the client's view of the peer's rwnd to 0, then send: must
-     * park (NL_OK) without emitting. */
+     * park (WN_OK) without emitting. */
     cc->peer_rwnd = 0;
     int before = ch.packets_sent;
-    ASSERT_EQ(harness_send(&ch, cc, 0, NL_UNRELIABLE, (const uint8_t *)"blocked", 7, 0), NL_OK);
+    ASSERT_EQ(harness_send(&ch, cc, 0, WN_UNRELIABLE, (const uint8_t *)"blocked", 7, 0), WN_OK);
     ASSERT_EQ(ch.packets_sent, before);
     ASSERT_EQ(sh.data_count, 0);
 
     /* Open the window and tick: deferred send flushes. */
-    cc->peer_rwnd = NL_RECV_WINDOW_DEFAULT;
+    cc->peer_rwnd = WN_RECV_WINDOW_DEFAULT;
     harness_tick(&ch, cc, 100);
     ASSERT_EQ(sh.data_count, 1);
     ASSERT_MEM_EQ(sh.last_data, "blocked", 7);
 
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 /* ---- per-connection rate limiting ---- */
 
 TEST(test_rate_limit_defers_burst_then_recovers) {
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 10000, 100000);
 
     /* 100 bytes/sec with a full 1s bucket at t=0. An 80-byte payload
@@ -676,13 +676,13 @@ TEST(test_rate_limit_defers_burst_then_recovers) {
 
     uint8_t big[80];
     memset(big, 'A', sizeof(big));
-    ASSERT_EQ(harness_send(&ch, cc, 0, NL_UNRELIABLE, big, sizeof(big), 0), NL_OK);
+    ASSERT_EQ(harness_send(&ch, cc, 0, WN_UNRELIABLE, big, sizeof(big), 0), WN_OK);
     ASSERT_EQ(sh.data_count, 1);
 
     int after_first = ch.packets_sent;
     uint8_t small[40];
     memset(small, 'B', sizeof(small));
-    ASSERT_EQ(harness_send(&ch, cc, 0, NL_UNRELIABLE, small, sizeof(small), 0), NL_OK);
+    ASSERT_EQ(harness_send(&ch, cc, 0, WN_UNRELIABLE, small, sizeof(small), 0), WN_OK);
     ASSERT_EQ(ch.packets_sent, after_first); /* rate starved -> parked */
     ASSERT_EQ(sh.data_count, 1);
 
@@ -692,31 +692,31 @@ TEST(test_rate_limit_defers_burst_then_recovers) {
     ASSERT_EQ(sh.last_data_len, 40u);
     ASSERT_EQ(sh.last_data[0], 'B');
 
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 /* ---- priority / deferred queue ---- */
 
 TEST(test_priority_high_flushes_before_low) {
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 10000, 100000);
 
     /* Close the peer window so both park (high is enqueued second but
      * must sort ahead of low), then reopen and confirm flush order. */
     cc->peer_rwnd = 0;
 
-    if (!enter_in_flight(cc)) { nl_connection_destroy(cc); nl_connection_destroy(sc); return; }
-    ASSERT_EQ(nl_connection_send(cc, 0, NL_UNRELIABLE, (const uint8_t *)"low", 3,
-                                  NL_PRIORITY_LOW, 0, &ch.cb), NL_OK);
-    ASSERT_EQ(nl_connection_send(cc, 0, NL_UNRELIABLE, (const uint8_t *)"high", 4,
-                                  NL_PRIORITY_HIGH, 0, &ch.cb), NL_OK);
+    if (!enter_in_flight(cc)) { wn_connection_destroy(cc); wn_connection_destroy(sc); return; }
+    ASSERT_EQ(wn_connection_send(cc, 0, WN_UNRELIABLE, (const uint8_t *)"low", 3,
+                                  WN_PRIORITY_LOW, 0, &ch.cb), WN_OK);
+    ASSERT_EQ(wn_connection_send(cc, 0, WN_UNRELIABLE, (const uint8_t *)"high", 4,
+                                  WN_PRIORITY_HIGH, 0, &ch.cb), WN_OK);
     exit_in_flight();
     drain_queue();
     ASSERT_EQ(sh.data_count, 0); /* both parked on zero rwnd */
 
-    cc->peer_rwnd = NL_RECV_WINDOW_DEFAULT;
+    cc->peer_rwnd = WN_RECV_WINDOW_DEFAULT;
     harness_tick(&ch, cc, 100);
     ASSERT_EQ(sh.data_count, 2);
     ASSERT_EQ(sh.order_count, 2);
@@ -724,48 +724,48 @@ TEST(test_priority_high_flushes_before_low) {
     ASSERT_MEM_EQ(sh.order[0], "high", 4);
     ASSERT_MEM_EQ(sh.order[1], "low", 3);
 
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 TEST(test_send_queue_full_returns_error) {
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 10000, 100000);
 
     cc->peer_rwnd = 0;
     int accepted = 0;
-    nl_result_t last = NL_OK;
-    for (int i = 0; i < NL_DEFERRED_MAX_MSGS + 8; i++) {
+    wn_result_t last = WN_OK;
+    for (int i = 0; i < WN_DEFERRED_MAX_MSGS + 8; i++) {
         if (!enter_in_flight(cc)) break;
-        last = nl_connection_send(cc, 0, NL_UNRELIABLE, (const uint8_t *)"q", 1,
-                                   NL_PRIORITY_NORMAL, 0, &ch.cb);
+        last = wn_connection_send(cc, 0, WN_UNRELIABLE, (const uint8_t *)"q", 1,
+                                   WN_PRIORITY_NORMAL, 0, &ch.cb);
         exit_in_flight();
         drain_queue();
-        if (last == NL_OK) accepted++;
+        if (last == WN_OK) accepted++;
         else break;
     }
-    ASSERT_EQ(last, NL_ERR_QUEUE_FULL);
-    ASSERT_EQ(accepted, NL_DEFERRED_MAX_MSGS);
+    ASSERT_EQ(last, WN_ERR_QUEUE_FULL);
+    ASSERT_EQ(accepted, WN_DEFERRED_MAX_MSGS);
 
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 /* ---- capability negotiation helpers (connection-level store) ---- */
 
 TEST(test_capabilities_stored_on_connection) {
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 10000, 1000);
     /* endpoint.c stores the negotiated (AND of both peers') set after create;
      * mirror that here. */
-    cc->capabilities = NL_CAP_FLOW_CONTROL | NL_CAP_PRIORITY;
-    sc->capabilities = NL_CAP_FLOW_CONTROL;
-    ASSERT_EQ(nl_connection_capabilities(cc), NL_CAP_FLOW_CONTROL | NL_CAP_PRIORITY);
-    ASSERT_EQ(nl_connection_capabilities(sc), NL_CAP_FLOW_CONTROL);
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    cc->capabilities = WN_CAP_FLOW_CONTROL | WN_CAP_PRIORITY;
+    sc->capabilities = WN_CAP_FLOW_CONTROL;
+    ASSERT_EQ(wn_connection_capabilities(cc), WN_CAP_FLOW_CONTROL | WN_CAP_PRIORITY);
+    ASSERT_EQ(wn_connection_capabilities(sc), WN_CAP_FLOW_CONTROL);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 /* ---- large messages: continuation parking + ack-driven flush ---- */
@@ -775,8 +775,8 @@ TEST(test_capabilities_stored_on_connection) {
  * the harness queue), each client tick flushes deferred continuations and
  * runs the retransmit scan. Each harness's clock is advanced alongside
  * the tick time so inbound packets carry a plausible receive timestamp. */
-static void pump_until(harness_t *ch, nl_connection_t *cc, harness_t *sh,
-                       nl_connection_t *sc, uint64_t *t, int max_iters) {
+static void pump_until(harness_t *ch, wn_connection_t *cc, harness_t *sh,
+                       wn_connection_t *sc, uint64_t *t, int max_iters) {
     for (int i = 0; i < max_iters; i++) {
         sh->now_ms = *t;
         harness_tick(sh, sc, *t);
@@ -793,7 +793,7 @@ TEST(test_large_reliable_message_40000) {
      * server's standalone acks reopen the window -- without ever being
      * delivered half-assembled to the application. */
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 100000, 100000);
 
     size_t total = 40000;
@@ -801,11 +801,11 @@ TEST(test_large_reliable_message_40000) {
     ASSERT_TRUE(big != NULL);
     for (size_t i = 0; i < total; i++) big[i] = (uint8_t)((i * 17 + 3) & 0xFF);
 
-    ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED, big, total, 0), NL_OK);
+    ASSERT_EQ(harness_send(&ch, cc, 0, WN_RELIABLE_ORDERED, big, total, 0), WN_OK);
     /* Only the first cwnd-worth of fragments fit; nothing complete yet. */
     ASSERT_EQ(sh.data_count, 0);
     ASSERT_TRUE(ch.packets_sent > 0);
-    ASSERT_TRUE(ch.packets_sent <= NL_CWND_INITIAL_PACKETS);
+    ASSERT_TRUE(ch.packets_sent <= WN_CWND_INITIAL_PACKETS);
 
     uint64_t t = 0;
     pump_until(&ch, cc, &sh, sc, &t, 50);
@@ -817,8 +817,8 @@ TEST(test_large_reliable_message_40000) {
     ASSERT_EQ(sh.disconnect_count, 0);
 
     free(big);
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 TEST(test_large_reliable_message_100000) {
@@ -827,7 +827,7 @@ TEST(test_large_reliable_message_100000) {
      * rule (rem > capacity) rather than the "wait for a full window"
      * rule, across multiple ack cycles. */
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 200000, 200000);
 
     size_t total = 100000;
@@ -835,9 +835,9 @@ TEST(test_large_reliable_message_100000) {
     ASSERT_TRUE(big != NULL);
     for (size_t i = 0; i < total; i++) big[i] = (uint8_t)((i * 31 + 7) & 0xFF);
 
-    ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED, big, total, 0), NL_OK);
+    ASSERT_EQ(harness_send(&ch, cc, 0, WN_RELIABLE_ORDERED, big, total, 0), WN_OK);
     ASSERT_EQ(sh.data_count, 0);
-    ASSERT_TRUE(ch.packets_sent <= NL_CWND_INITIAL_PACKETS);
+    ASSERT_TRUE(ch.packets_sent <= WN_CWND_INITIAL_PACKETS);
 
     uint64_t t = 0;
     pump_until(&ch, cc, &sh, sc, &t, 80);
@@ -849,8 +849,8 @@ TEST(test_large_reliable_message_100000) {
     ASSERT_EQ(sh.disconnect_count, 0);
 
     free(big);
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 TEST(test_send_rejects_over_max_size) {
@@ -858,40 +858,40 @@ TEST(test_send_rejects_over_max_size) {
      * explicit error before anything goes on the wire -- not truncated,
      * not silently fragmented past the cap. */
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 100000, 100000);
 
-    size_t total = NL_MAX_MESSAGE_SIZE + 1;
+    size_t total = WN_MAX_MESSAGE_SIZE + 1;
     uint8_t *big = (uint8_t *)malloc(total);
     ASSERT_TRUE(big != NULL);
     memset(big, 0x11, total);
 
-    ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED, big, total, 0),
-              NL_ERR_MESSAGE_TOO_LARGE);
+    ASSERT_EQ(harness_send(&ch, cc, 0, WN_RELIABLE_ORDERED, big, total, 0),
+              WN_ERR_MESSAGE_TOO_LARGE);
     ASSERT_EQ(ch.packets_sent, 0);
     ASSERT_EQ(sh.data_count, 0);
 
     free(big);
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 TEST(test_large_reliable_message_exact_max_size) {
-    /* The boundary itself: exactly NL_MAX_MESSAGE_SIZE (256 KB, exactly
-     * NL_MAX_FRAGMENTS fragments) must round-trip intact. Everything
+    /* The boundary itself: exactly WN_MAX_MESSAGE_SIZE (256 KB, exactly
+     * WN_MAX_FRAGMENTS fragments) must round-trip intact. Everything
      * larger is rejected; everything up to here must work. */
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 1000000, 1000000);
 
-    size_t total = NL_MAX_MESSAGE_SIZE;
+    size_t total = WN_MAX_MESSAGE_SIZE;
     uint8_t *big = (uint8_t *)malloc(total);
     ASSERT_TRUE(big != NULL);
     for (size_t i = 0; i < total; i++) big[i] = (uint8_t)((i * 13 + 11) & 0xFF);
 
-    ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED, big, total, 0), NL_OK);
+    ASSERT_EQ(harness_send(&ch, cc, 0, WN_RELIABLE_ORDERED, big, total, 0), WN_OK);
     ASSERT_EQ(sh.data_count, 0); /* nothing complete until the window opens */
-    ASSERT_TRUE(ch.packets_sent <= NL_CWND_INITIAL_PACKETS);
+    ASSERT_TRUE(ch.packets_sent <= WN_CWND_INITIAL_PACKETS);
 
     uint64_t t = 0;
     pump_until(&ch, cc, &sh, sc, &t, 600);
@@ -903,8 +903,8 @@ TEST(test_large_reliable_message_exact_max_size) {
     ASSERT_EQ(sh.disconnect_count, 0);
 
     free(big);
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 TEST(test_partial_ring_parks_continuation_without_overwriting) {
@@ -912,39 +912,39 @@ TEST(test_partial_ring_parks_continuation_without_overwriting) {
      * messages leave only 1 cwnd slot), then start a 20-fragment message:
      * exactly one fragment may leave, the rest must park as a
      * continuation, and the already-queued slots 0..9 must remain intact
-     * (nl_send_ring_insert refuses to overwrite live unacked entries). */
+     * (wn_send_ring_insert refuses to overwrite live unacked entries). */
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 100000, 100000);
 
-    for (int i = 0; i < NL_CWND_INITIAL_PACKETS - 1; i++) {
-        ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED,
-                               (const uint8_t *)"x", 1, 0), NL_OK);
+    for (int i = 0; i < WN_CWND_INITIAL_PACKETS - 1; i++) {
+        ASSERT_EQ(harness_send(&ch, cc, 0, WN_RELIABLE_ORDERED,
+                               (const uint8_t *)"x", 1, 0), WN_OK);
     }
-    ASSERT_EQ(sh.data_count, NL_CWND_INITIAL_PACKETS - 1);
-    ASSERT_EQ(ch.packets_sent, NL_CWND_INITIAL_PACKETS - 1);
+    ASSERT_EQ(sh.data_count, WN_CWND_INITIAL_PACKETS - 1);
+    ASSERT_EQ(ch.packets_sent, WN_CWND_INITIAL_PACKETS - 1);
 
-    size_t total = NL_FRAGMENT_CHUNK_SIZE * 20; /* 20 fragments */
+    size_t total = WN_FRAGMENT_CHUNK_SIZE * 20; /* 20 fragments */
     uint8_t *big = (uint8_t *)malloc(total);
     ASSERT_TRUE(big != NULL);
     memset(big, 'B', total);
 
-    ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED, big, total, 0), NL_OK);
+    ASSERT_EQ(harness_send(&ch, cc, 0, WN_RELIABLE_ORDERED, big, total, 0), WN_OK);
     /* Exactly one more packet left (the last cwnd slot); the other 19
      * fragments are parked as a continuation, not emitted. */
-    ASSERT_EQ(ch.packets_sent, NL_CWND_INITIAL_PACKETS);
-    ASSERT_EQ(sh.data_count, NL_CWND_INITIAL_PACKETS - 1); /* big msg incomplete */
+    ASSERT_EQ(ch.packets_sent, WN_CWND_INITIAL_PACKETS);
+    ASSERT_EQ(sh.data_count, WN_CWND_INITIAL_PACKETS - 1); /* big msg incomplete */
 
     /* Ring must hold slots 0..9, all live and unacked -- the partial send
      * must not have clobbered any of the nine small messages. */
-    nl_lane_t *lane = &cc->channels[0].lanes[NL_RELIABLE_ORDERED];
+    wn_lane_t *lane = &cc->channels[0].lanes[WN_RELIABLE_ORDERED];
     ASSERT_TRUE(lane->send_ring_init);
-    ASSERT_EQ(lane->send_ring.unacked_count, NL_CWND_INITIAL_PACKETS);
-    for (int i = 0; i < NL_CWND_INITIAL_PACKETS; i++) {
-        nl_send_slot_t *s = nl_send_ring_get(&lane->send_ring, (uint16_t)i);
+    ASSERT_EQ(lane->send_ring.unacked_count, WN_CWND_INITIAL_PACKETS);
+    for (int i = 0; i < WN_CWND_INITIAL_PACKETS; i++) {
+        wn_send_slot_t *s = wn_send_ring_get(&lane->send_ring, (uint16_t)i);
         ASSERT_TRUE(s != NULL);
         ASSERT_FALSE(s->acked);
-        if (i < NL_CWND_INITIAL_PACKETS - 1) {
+        if (i < WN_CWND_INITIAL_PACKETS - 1) {
             ASSERT_EQ(s->len, 2); /* lane payload: is_fragment(0) + 'x' */
         } else {
             ASSERT_TRUE(s->len > 2); /* fragment 0 of the big message */
@@ -953,37 +953,37 @@ TEST(test_partial_ring_parks_continuation_without_overwriting) {
 
     /* Server's reply piggybacks an ack covering all 10 received packets;
      * that reopens cwnd and the continuation flushes to completion. */
-    ASSERT_EQ(harness_send(&sh, sc, 0, NL_RELIABLE_ORDERED,
-                           (const uint8_t *)"ack", 3, 10), NL_OK);
+    ASSERT_EQ(harness_send(&sh, sc, 0, WN_RELIABLE_ORDERED,
+                           (const uint8_t *)"ack", 3, 10), WN_OK);
 
-    ASSERT_EQ(sh.data_count, NL_CWND_INITIAL_PACKETS); /* 9 small + 1 big */
+    ASSERT_EQ(sh.data_count, WN_CWND_INITIAL_PACKETS); /* 9 small + 1 big */
     ASSERT_EQ(sh.last_data_len, (uint32_t)total);
     CHECK_MEM_EQ(sh.last_data, big, total);
 
     free(big);
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 TEST(test_one_way_reliable_acked_without_reverse_data) {
     /* One-way traffic: the server never sends application data, so acks
-     * can only ride on standalone NL_PKT_ACK packets (flushed by tick).
+     * can only ride on standalone WN_PKT_ACK packets (flushed by tick).
      * Without them the client would retransmit every message at RTO and
      * eventually disconnect -- this is the H1/H2 regression case. */
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 100000, 100000);
 
     for (int i = 0; i < 5; i++) {
         char msg[8];
         snprintf(msg, sizeof(msg), "ow%d", i);
-        ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED,
-                               (const uint8_t *)msg, (size_t)strlen(msg), 0), NL_OK);
+        ASSERT_EQ(harness_send(&ch, cc, 0, WN_RELIABLE_ORDERED,
+                               (const uint8_t *)msg, (size_t)strlen(msg), 0), WN_OK);
     }
     ASSERT_EQ(sh.data_count, 5);
     ASSERT_EQ(ch.packets_sent, 5);
 
-    /* Server never app-sends; tick it so flush_acks_locked emits NL_PKT_ACK
+    /* Server never app-sends; tick it so flush_acks_locked emits WN_PKT_ACK
      * for the dirty lane. Delivery is synchronous through the harness. */
     harness_tick(&sh, sc, 10);
 
@@ -991,8 +991,8 @@ TEST(test_one_way_reliable_acked_without_reverse_data) {
      * traffic: nothing may retransmit, and neither side may disconnect. */
     harness_tick(&ch, cc, 5000);
 
-    nl_connection_stats_t stats;
-    nl_connection_get_stats(cc, &stats);
+    wn_connection_stats_t stats;
+    wn_connection_get_stats(cc, &stats);
     ASSERT_EQ(stats.retransmits, 0u);
     ASSERT_EQ(ch.packets_sent, 5); /* no extra retransmit packets */
     ASSERT_EQ(sh.data_count, 5);   /* no duplicate deliveries */
@@ -1000,21 +1000,21 @@ TEST(test_one_way_reliable_acked_without_reverse_data) {
     ASSERT_EQ(ch.disconnect_count, 0);
     ASSERT_EQ(sh.disconnect_count, 0);
 
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 /* Regression: a loss burst of >=8 consecutive packets while more than 32
  * reliable packets are in flight used to kill a healthy connection. The
  * ack bitmap could only name the 32 sequences below the receiver's newest
  * one, so once the horizon slid past a still-unacked sequence, no future
- * ack could ever retire it: it burned NL_MAX_RETRIES and the connection
- * was torn down with NL_ERR_TIMEOUT even though the receiver had it. */
+ * ack could ever retire it: it burned WN_MAX_RETRIES and the connection
+ * was torn down with WN_ERR_TIMEOUT even though the receiver had it. */
 TEST(test_burst_loss_at_cwnd_above_ack_window_no_teardown) {
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     /* Generous timeout: the point is to pump long enough that every
-     * unacked slot exhausts NL_MAX_RETRIES (RTO backoff grows
+     * unacked slot exhausts WN_MAX_RETRIES (RTO backoff grows
      * exponentially, so the budget spans >2 minutes of virtual time). */
     make_pair(&ch, &sh, &cc, &sc, /*timeout*/ 10000000, /*keepalive*/ 10000000);
 
@@ -1023,19 +1023,19 @@ TEST(test_burst_loss_at_cwnd_above_ack_window_no_teardown) {
      * exercises whatever bound the library actually enforces. */
     uint64_t t = 0;
     int sent = 0;
-    for (int round = 0; round < 8 && cc->cwnd < NL_CWND_MAX_PACKETS; round++) {
+    for (int round = 0; round < 8 && cc->cwnd < WN_CWND_MAX_PACKETS; round++) {
         ch.now_ms = t;
-        for (int i = 0; i < NL_CWND_INITIAL_PACKETS; i++) {
+        for (int i = 0; i < WN_CWND_INITIAL_PACKETS; i++) {
             uint8_t payload[4] = { (uint8_t)sent, 0, 0, 0 };
             sent++;
-            ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED, payload, sizeof(payload), t), NL_OK);
+            ASSERT_EQ(harness_send(&ch, cc, 0, WN_RELIABLE_ORDERED, payload, sizeof(payload), t), WN_OK);
         }
         sh.now_ms = t;
         harness_tick(&sh, sc, t); /* flush standalone acks -> cwnd grows */
         t += 50;
     }
     ASSERT_EQ(sh.data_count, sent); /* lossless warm-up fully delivered */
-    ASSERT_TRUE(cc->cwnd > NL_CWND_INITIAL_PACKETS); /* window really did grow */
+    ASSERT_TRUE(cc->cwnd > WN_CWND_INITIAL_PACKETS); /* window really did grow */
 
     const int burst = 40;
     /* A burst of >=8 consecutive lost packets, while in-flight exceeds
@@ -1043,14 +1043,14 @@ TEST(test_burst_loss_at_cwnd_above_ack_window_no_teardown) {
     ch.drop_remaining = 8;
     for (int i = 0; i < burst; i++) {
         uint8_t payload[4] = { (uint8_t)i, 0, 0, 0 };
-        ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED, payload, sizeof(payload), t), NL_OK);
+        ASSERT_EQ(harness_send(&ch, cc, 0, WN_RELIABLE_ORDERED, payload, sizeof(payload), t), WN_OK);
     }
     ASSERT_EQ(ch.drop_remaining, 0);
     /* Ordered delivery: the server has the tail of the burst but must
      * withhold all of it until the front gap is filled. */
     ASSERT_EQ(sh.data_count, sent);
 
-    /* Pump well past NL_MAX_RETRIES worth of RTOs. The RTO backs off
+    /* Pump well past WN_MAX_RETRIES worth of RTOs. The RTO backs off
      * exponentially to its 10s ceiling, so exhausting a 15-retry budget
      * spans ~130s of virtual time; 300s leaves ample margin. The gap must
      * be recovered and the connection must survive. */
@@ -1063,11 +1063,11 @@ TEST(test_burst_loss_at_cwnd_above_ack_window_no_teardown) {
     }
     ASSERT_EQ(sh.data_count, sent + burst);
 
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
-/* Regression: peer_rwnd_capacity started at NL_RECV_WINDOW_DEFAULT, a
+/* Regression: peer_rwnd_capacity started at WN_RECV_WINDOW_DEFAULT, a
  * value the peer never advertised. A peer running a smaller receive window
  * (cfg.recv_window_bytes < 32768) then makes send_window_frags() park
  * forever: rem_bytes <= peer_rwnd_capacity is true (20000 <= 32768), so the
@@ -1075,14 +1075,14 @@ TEST(test_burst_loss_at_cwnd_above_ack_window_no_teardown) {
  * progress, the message is never delivered. */
 TEST(test_small_peer_window_does_not_park_large_message) {
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 100000, 100000);
 
     /* The peer runs a 4096-byte window and says so (its own send carries the
      * advertisement). A 20000-byte message is 20 fragments, larger than that. */
     sc->recv_window_size = 4096;
     sc->recv_window_used = 0;
-    ASSERT_EQ(harness_send(&sh, sc, 0, NL_UNRELIABLE, (const uint8_t *)"hi", 2, 0), NL_OK);
+    ASSERT_EQ(harness_send(&sh, sc, 0, WN_UNRELIABLE, (const uint8_t *)"hi", 2, 0), WN_OK);
     ASSERT_EQ(ch.data_count, 1);
     uint8_t *big = (uint8_t *)malloc(20000);
     ASSERT_TRUE(big != NULL);
@@ -1090,16 +1090,16 @@ TEST(test_small_peer_window_does_not_park_large_message) {
     /* Reliable, so the peer keeps refreshing its advertisement in the acks
      * that come back -- an unreliable lane would advertise once and never
      * again, which would park for reasons unrelated to this bug. */
-    ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_UNORDERED, big, 20000, 0), NL_OK);
+    ASSERT_EQ(harness_send(&ch, cc, 0, WN_RELIABLE_UNORDERED, big, 20000, 0), WN_OK);
 
     /* Stream it across several windows, consuming each window's worth as the
-     * application would (nl_poll_event -> nl_connection_consume_window; there
+     * application would (wn_poll_event -> wn_connection_consume_window; there
      * is no endpoint in this harness). */
     uint64_t t = 100;
     for (int i = 0; i < 400; i++) {
         sh.now_ms = t;
         harness_tick(&sh, sc, t);
-        nl_connection_consume_window(sc, sc->recv_window_used);
+        wn_connection_consume_window(sc, sc->recv_window_used);
         t += 50;
         ch.now_ms = t;
         harness_tick(&ch, cc, t);
@@ -1121,8 +1121,8 @@ TEST(test_small_peer_window_does_not_park_large_message) {
     ASSERT_EQ(cc->peer_rwnd_capacity, 4096);
 
     free(big);
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 /* Regression: the receive-window charge clamped to the available room
@@ -1133,7 +1133,7 @@ TEST(test_small_peer_window_does_not_park_large_message) {
  * than it could buffer. The charge must be the full length. */
 TEST(test_receive_window_charges_full_length) {
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 100000, 100000);
 
     sc->recv_window_size = 4096;
@@ -1142,92 +1142,92 @@ TEST(test_receive_window_charges_full_length) {
     /* One 3000-byte message: fits, so the full length is charged. */
     uint8_t a[3000];
     memset(a, 'a', sizeof(a));
-    ASSERT_EQ(harness_send(&ch, cc, 0, NL_UNRELIABLE, a, sizeof(a), 0), NL_OK);
+    ASSERT_EQ(harness_send(&ch, cc, 0, WN_UNRELIABLE, a, sizeof(a), 0), WN_OK);
     ASSERT_EQ(sh.data_count, 1);
     ASSERT_EQ(sc->recv_window_used, 3000u);
-    ASSERT_EQ(nl_connection_adv_window(sc), 4096 - 3000);
+    ASSERT_EQ(wn_connection_adv_window(sc), 4096 - 3000);
 
     /* App consumes it: the charge is released in full. */
-    nl_connection_consume_window(sc, 3000);
+    wn_connection_consume_window(sc, 3000);
     ASSERT_EQ(sc->recv_window_used, 0u);
-    ASSERT_EQ(nl_connection_adv_window(sc), 4096);
+    ASSERT_EQ(wn_connection_adv_window(sc), 4096);
 
     /* A 3000-byte message plus a 3000-byte message exceeds the 4096
      * window. The second charge must saturate at the window size, not add
      * only the 1096 bytes that fit -- otherwise the sum silently drifts
      * below the true outstanding bytes and the receiver over-advertises. */
-    ASSERT_EQ(harness_send(&ch, cc, 0, NL_UNRELIABLE, a, sizeof(a), 0), NL_OK);
+    ASSERT_EQ(harness_send(&ch, cc, 0, WN_UNRELIABLE, a, sizeof(a), 0), WN_OK);
     ASSERT_EQ(sc->recv_window_used, 3000u);
-    ASSERT_EQ(harness_send(&ch, cc, 0, NL_UNRELIABLE, a, sizeof(a), 0), NL_OK);
+    ASSERT_EQ(harness_send(&ch, cc, 0, WN_UNRELIABLE, a, sizeof(a), 0), WN_OK);
     /* 6000 bytes really are queued against a 4096-byte window: the charge
      * must reflect that, not the 4096 the old clamp produced. */
     ASSERT_EQ(sc->recv_window_used, 6000u);
-    ASSERT_EQ(nl_connection_adv_window(sc), 0); /* window closed either way */
+    ASSERT_EQ(wn_connection_adv_window(sc), 0); /* window closed either way */
 
     /* Consuming message 1's charge frees exactly 3000, leaving message 2's
      * 3000 bytes outstanding -- the real backlog. The old clamping charge
      * left 1096 here, i.e. 1904 bytes of phantom free window. */
-    nl_connection_consume_window(sc, 3000);
+    wn_connection_consume_window(sc, 3000);
     ASSERT_EQ(sc->recv_window_used, 3000u);
-    ASSERT_EQ(nl_connection_adv_window(sc), 4096 - 3000);
+    ASSERT_EQ(wn_connection_adv_window(sc), 4096 - 3000);
 
     /* And consuming the last one closes the books exactly. */
-    nl_connection_consume_window(sc, 3000);
+    wn_connection_consume_window(sc, 3000);
     ASSERT_EQ(sc->recv_window_used, 0u);
-    ASSERT_EQ(nl_connection_adv_window(sc), 4096);
+    ASSERT_EQ(wn_connection_adv_window(sc), 4096);
 
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 /* Regression: an RTT sample taken with a now_ms that precedes the send
  * timestamp underflowed to ~4 billion ms and was reported verbatim by
- * nl_peer_rtt_ms / nl_peer_stats. Discards the sample instead, leaving the
+ * wn_peer_rtt_ms / wn_peer_stats. Discards the sample instead, leaving the
  * estimator at its previous value. */
 TEST(test_backwards_now_does_not_poison_rtt_estimator) {
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 10000, 1000000 /* keepalive way beyond */);
 
     /* A real forward round trip first, so there IS an estimate to preserve. */
-    ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED,
-                           (const uint8_t *)"a", 1, /*now_ms*/ 1000), NL_OK);
+    ASSERT_EQ(harness_send(&ch, cc, 0, WN_RELIABLE_ORDERED,
+                           (const uint8_t *)"a", 1, /*now_ms*/ 1000), WN_OK);
     ch.now_ms = 1040;
-    ASSERT_EQ(harness_send(&sh, sc, 0, NL_RELIABLE_ORDERED,
-                           (const uint8_t *)"b", 1, /*now_ms*/ 1040), NL_OK);
+    ASSERT_EQ(harness_send(&sh, sc, 0, WN_RELIABLE_ORDERED,
+                           (const uint8_t *)"b", 1, /*now_ms*/ 1040), WN_OK);
 
-    nl_connection_stats_t before;
-    nl_connection_get_stats(cc, &before);
+    wn_connection_stats_t before;
+    wn_connection_get_stats(cc, &before);
     ASSERT_EQ(before.rtt_ms, 40u);
 
     /* Now deliver an ack to the client stamped BEFORE its send: the harness
      * routes inbound packets at peer_harness->now_ms, so wind the client's
      * clock back to before the send it is acking. */
-    nl_send_slot_t *slot = nl_send_ring_get(
-        &cc->channels[0].lanes[NL_RELIABLE_ORDERED].send_ring, 0);
+    wn_send_slot_t *slot = wn_send_ring_get(
+        &cc->channels[0].lanes[WN_RELIABLE_ORDERED].send_ring, 0);
     ASSERT_TRUE(slot != NULL);
     ASSERT_EQ(slot->send_time_ms, 1000u);
 
     /* Fresh send at a high timestamp, then ack it stamped earlier. */
-    ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED,
-                           (const uint8_t *)"c", 1, /*now_ms*/ 9000), NL_OK);
-    nl_send_slot_t *s1 = nl_send_ring_get(
-        &cc->channels[0].lanes[NL_RELIABLE_ORDERED].send_ring, 1);
+    ASSERT_EQ(harness_send(&ch, cc, 0, WN_RELIABLE_ORDERED,
+                           (const uint8_t *)"c", 1, /*now_ms*/ 9000), WN_OK);
+    wn_send_slot_t *s1 = wn_send_ring_get(
+        &cc->channels[0].lanes[WN_RELIABLE_ORDERED].send_ring, 1);
     ASSERT_TRUE(s1 != NULL);
     ASSERT_EQ(s1->send_time_ms, 9000u);
 
     /* The server replies, but the client sees it at now_ms = 8000 < 9000. */
     sh.now_ms = 8000;
-    harness_send(&sh, sc, 0, NL_RELIABLE_ORDERED, (const uint8_t *)"d", 1, 9100);
+    harness_send(&sh, sc, 0, WN_RELIABLE_ORDERED, (const uint8_t *)"d", 1, 9100);
 
     /* The estimator must be untouched, not set to a huge value. */
-    nl_connection_stats_t after;
-    nl_connection_get_stats(cc, &after);
+    wn_connection_stats_t after;
+    wn_connection_get_stats(cc, &after);
     CHECK_TRUE(after.rtt_ms < 10000u);
     CHECK_EQ(after.rtt_ms, before.rtt_ms);
 
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 /* ---- documented deferred-queue ordering invariants ----
@@ -1243,10 +1243,10 @@ TEST(test_backwards_now_does_not_poison_rtt_estimator) {
  * sequence. Asserting on the priority VALUE instead would be blind to a
  * FIFO break: a reversed run of equal-priority messages still prints the
  * same list of priorities, which is exactly the bug this test exists for. */
-static void assert_queue_order(nl_connection_t *conn, const uint8_t *priorities, int n,
+static void assert_queue_order(wn_connection_t *conn, const uint8_t *priorities, int n,
                                const uint8_t *expected_tags, const char *what) {
     while (conn->deferred_head) {
-        nl_deferred_msg_t *n = conn->deferred_head;
+        wn_deferred_msg_t *n = conn->deferred_head;
         conn->deferred_head = n->next;
         free(n->data);
         free(n);
@@ -1256,13 +1256,13 @@ static void assert_queue_order(nl_connection_t *conn, const uint8_t *priorities,
 
     for (int i = 0; i < n; i++) {
         uint8_t payload[4] = { (uint8_t)(100 + i), 0, 0, 0 }; /* tag = push index */
-        ASSERT_TRUE(deferred_push_for_test(conn, 0, NL_UNRELIABLE, priorities[i],
+        ASSERT_TRUE(deferred_push_for_test(conn, 0, WN_UNRELIABLE, priorities[i],
                                            payload, sizeof(payload), false, 0, 0));
     }
 
     printf("    %s: ", what);
     for (int i = 0; i < n; i++) {
-        nl_deferred_msg_t *m = conn->deferred_head;
+        wn_deferred_msg_t *m = conn->deferred_head;
         ASSERT_TRUE(m != NULL);
         if (!m) break;
         uint8_t tag = m->data[0];
@@ -1275,13 +1275,13 @@ static void assert_queue_order(nl_connection_t *conn, const uint8_t *priorities,
     printf("\n");
     CHECK_TRUE(conn->deferred_head == NULL);
     /* This helper drains the list by hand rather than via deferred_pop, so
-     * the counters are stale by construction; nl_connection_destroy calls
+     * the counters are stale by construction; wn_connection_destroy calls
      * deferred_free_all, which zeroes them. */
     CHECK_EQ(conn->deferred_count, (uint32_t)n);
 }
 
 TEST(test_deferred_queue_fifo_stable_within_equal_priority) {
-    nl_connection_t *conn = nl_connection_new_for_test();
+    wn_connection_t *conn = wn_connection_new_for_test();
     ASSERT_TRUE(conn != NULL);
 
     /* All equal priority: strict FIFO, so push order 0..5 in, 0..5 out. */
@@ -1296,41 +1296,41 @@ TEST(test_deferred_queue_fifo_stable_within_equal_priority) {
     const uint8_t mixed_out[7] = { 1, 3, 6, 2, 4, 0, 5 };
     assert_queue_order(conn, mixed, 7, mixed_out, "mixed (stable desc)");
 
-    nl_connection_destroy(conn);
+    wn_connection_destroy(conn);
 }
 
 TEST(test_deferred_queue_continuation_head_never_displaced) {
-    nl_connection_t *conn = nl_connection_new_for_test();
+    wn_connection_t *conn = wn_connection_new_for_test();
     ASSERT_TRUE(conn != NULL);
 
     uint8_t payload[4] = { 0, 0, 0, 0 };
     /* A continuation parks at the head (frag_start > 0). */
-    ASSERT_TRUE(deferred_push_for_test(conn, 0, NL_RELIABLE_ORDERED, NL_PRIORITY_LOW,
+    ASSERT_TRUE(deferred_push_for_test(conn, 0, WN_RELIABLE_ORDERED, WN_PRIORITY_LOW,
                                        payload, sizeof(payload), true, 3, 77));
 
     /* Now push a HIGHER priority message. It must queue BEHIND the
      * continuation: if it went to the head, this message's remaining
      * fragments would interleave with another message's on the same
      * RELIABLE_ORDERED lane, breaking the ordering guarantee. */
-    ASSERT_TRUE(deferred_push_for_test(conn, 0, NL_RELIABLE_ORDERED, NL_PRIORITY_HIGH,
+    ASSERT_TRUE(deferred_push_for_test(conn, 0, WN_RELIABLE_ORDERED, WN_PRIORITY_HIGH,
                                        payload, sizeof(payload), false, 0, 0));
-    ASSERT_TRUE(deferred_push_for_test(conn, 0, NL_RELIABLE_ORDERED, NL_PRIORITY_HIGH,
+    ASSERT_TRUE(deferred_push_for_test(conn, 0, WN_RELIABLE_ORDERED, WN_PRIORITY_HIGH,
                                        payload, sizeof(payload), false, 0, 0));
 
     ASSERT_EQ(conn->deferred_count, 3);
-    nl_deferred_msg_t *head = conn->deferred_head;
+    wn_deferred_msg_t *head = conn->deferred_head;
     ASSERT_TRUE(head != NULL);
     ASSERT_TRUE(head->continuation);
     ASSERT_EQ(head->frag_start, 3);
     ASSERT_EQ(head->message_id, 77);
 
     /* Ordinary priority ordering still applies behind the continuation. */
-    nl_deferred_msg_t *second = head->next;
+    wn_deferred_msg_t *second = head->next;
     ASSERT_TRUE(second != NULL);
     ASSERT_FALSE(second->continuation);
-    ASSERT_EQ(second->priority, NL_PRIORITY_HIGH);
+    ASSERT_EQ(second->priority, WN_PRIORITY_HIGH);
 
-    nl_connection_destroy(conn);
+    wn_connection_destroy(conn);
 }
 
 /* Regression (P0-2): a DATA packet with a malformed delivery value must
@@ -1339,12 +1339,12 @@ TEST(test_deferred_queue_continuation_head_never_displaced) {
  * zero-initialized out-param to overwrite the window. */
 TEST(test_malformed_delivery_does_not_clobber_peer_window) {
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 10000, 1000);
 
     /* Establish a real window advertisement first. */
-    ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED,
-                           (const uint8_t *)"hi", 2, 0), NL_OK);
+    ASSERT_EQ(harness_send(&ch, cc, 0, WN_RELIABLE_ORDERED,
+                           (const uint8_t *)"hi", 2, 0), WN_OK);
     ASSERT_EQ(sh.data_count, 1);
     uint16_t before_rwnd = sc->peer_rwnd;
     uint16_t before_cap = sc->peer_rwnd_capacity;
@@ -1352,62 +1352,62 @@ TEST(test_malformed_delivery_does_not_clobber_peer_window) {
 
     /* Craft a DATA packet with delivery=99 (invalid) but otherwise valid
      * encryption, using the client's send keys. */
-    uint8_t plaintext[NL_DATA_HEADER_SIZE + 1];
+    uint8_t plaintext[WN_DATA_HEADER_SIZE + 1];
     size_t po = 0;
     plaintext[po++] = 0; /* channel */
     plaintext[po++] = 99; /* malformed delivery */
-    nl_put_u16(plaintext + po, 0); po += 2; /* seq */
-    nl_put_u16(plaintext + po, 0); po += 2; /* ack */
-    nl_put_u64(plaintext + po, 0); po += 8; /* ack_bits */
+    wn_put_u16(plaintext + po, 0); po += 2; /* seq */
+    wn_put_u16(plaintext + po, 0); po += 2; /* ack */
+    wn_put_u64(plaintext + po, 0); po += 8; /* ack_bits */
     plaintext[po++] = 0; /* ack_valid */
-    nl_put_u16(plaintext + po, 1234); po += 2; /* rwnd (must be ignored) */
+    wn_put_u16(plaintext + po, 1234); po += 2; /* rwnd (must be ignored) */
     plaintext[po++] = 0; /* is_fragment */
     plaintext[po++] = 'x';
     ASSERT_EQ(po, sizeof(plaintext));
 
     uint64_t counter = cc->send_counter;
     uint8_t nonce[12];
-    nl_nonce_build(cc->send_salt, counter, nonce);
+    wn_nonce_build(cc->send_salt, counter, nonce);
     uint8_t aad[17];
-    aad[0] = NL_PKT_DATA;
-    nl_put_u64(aad + 1, cc->id);
-    nl_put_u64(aad + 9, counter);
+    aad[0] = WN_PKT_DATA;
+    wn_put_u64(aad + 1, cc->id);
+    wn_put_u64(aad + 9, counter);
     uint8_t ct[sizeof(plaintext)];
     uint8_t tag[16];
-    ASSERT_TRUE(nl_crypto_aead_encrypt(cc->send_key, nonce, aad, sizeof(aad),
+    ASSERT_TRUE(wn_crypto_aead_encrypt(cc->send_key, nonce, aad, sizeof(aad),
                                        plaintext, sizeof(plaintext), ct, tag));
     uint8_t enc_body[8 + 8 + sizeof(ct) + 16];
-    nl_put_u64(enc_body, cc->id);
-    nl_put_u64(enc_body + 8, counter);
+    wn_put_u64(enc_body, cc->id);
+    wn_put_u64(enc_body + 8, counter);
     memcpy(enc_body + 16, ct, sizeof(ct));
     memcpy(enc_body + 16 + sizeof(ct), tag, 16);
     cc->send_counter++; /* keep the counter monotonic for later sends */
 
-    if (!enter_in_flight(sc)) { nl_connection_destroy(cc); nl_connection_destroy(sc); return; }
-    nl_result_t r = nl_connection_on_packet(sc, NL_PKT_DATA, enc_body, sizeof(enc_body), 0, &sh.cb);
+    if (!enter_in_flight(sc)) { wn_connection_destroy(cc); wn_connection_destroy(sc); return; }
+    wn_result_t r = wn_connection_on_packet(sc, WN_PKT_DATA, enc_body, sizeof(enc_body), 0, &sh.cb);
     exit_in_flight();
     drain_queue();
 
-    ASSERT_EQ(r, NL_ERR_PROTOCOL_MISMATCH);
+    ASSERT_EQ(r, WN_ERR_PROTOCOL_MISMATCH);
     ASSERT_EQ(sc->peer_rwnd, before_rwnd);
     ASSERT_EQ(sc->peer_rwnd_capacity, before_cap);
 
     /* Connection must still be alive: a normal send round-trips. */
-    ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_ORDERED,
-                           (const uint8_t *)"after", 5, 10), NL_OK);
+    ASSERT_EQ(harness_send(&ch, cc, 0, WN_RELIABLE_ORDERED,
+                           (const uint8_t *)"after", 5, 10), WN_OK);
     ASSERT_EQ(sh.data_count, 2);
 
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 
 /* What the real endpoint does right after draining the socket and before the
  * app polls events: flush pending acks. Those acks advertise the window as it
  * is at that moment, i.e. still full of undrained data. */
-static void harness_flush_acks(harness_t *h, nl_connection_t *conn, uint64_t now_ms) {
+static void harness_flush_acks(harness_t *h, wn_connection_t *conn, uint64_t now_ms) {
     if (!enter_in_flight(conn)) return;
-    nl_connection_flush_acks(conn, now_ms, &h->cb);
+    wn_connection_flush_acks(conn, now_ms, &h->cb);
     exit_in_flight();
     drain_queue();
 }
@@ -1417,14 +1417,14 @@ static void harness_flush_acks(harness_t *h, nl_connection_t *conn, uint64_t now
  * so a one-way stream stalled for good with the rest of the data parked. */
 TEST(test_window_reopen_reaches_one_way_sender) {
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 100000, 100000);
     sc->recv_window_size = 4096;
 
     uint8_t msg[1500];
     memset(msg, 'w', sizeof(msg));
     for (int i = 0; i < 6; i++) {
-        ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_UNORDERED, msg, sizeof(msg), 0), NL_OK);
+        ASSERT_EQ(harness_send(&ch, cc, 0, WN_RELIABLE_UNORDERED, msg, sizeof(msg), 0), WN_OK);
     }
     /* The 4096-byte window cannot take all six: the rest is parked. */
     ASSERT_TRUE(sh.data_count < 6);
@@ -1434,39 +1434,39 @@ TEST(test_window_reopen_reaches_one_way_sender) {
 
     /* The receiving app drains everything it was given. The server has no
      * DATA of its own to send, so only a window update can unblock the client. */
-    nl_connection_consume_window(sc, sc->recv_window_used);
+    wn_connection_consume_window(sc, sc->recv_window_used);
     for (int step = 1; step <= 200 && sh.data_count < 6; step++) {
         ch.now_ms = sh.now_ms = (uint64_t)step * 50;
         harness_tick(&sh, sc, sh.now_ms);
         harness_tick(&ch, cc, ch.now_ms);
         /* Keep draining as data arrives, like a game loop polling events. */
-        nl_connection_consume_window(sc, sc->recv_window_used);
+        wn_connection_consume_window(sc, sc->recv_window_used);
     }
     ASSERT_TRUE(sh.data_count > before);
     ASSERT_EQ(sh.data_count, 6);
 
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 /* The window update itself is not retransmitted. If it is lost, the next
  * keepalive (which now carries the window) must repair the stall. */
 TEST(test_lost_window_update_is_repaired_by_keepalive) {
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 100000, 1000);
     sc->recv_window_size = 4096;
 
     uint8_t msg[1500];
     memset(msg, 'k', sizeof(msg));
     for (int i = 0; i < 6; i++) {
-        ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_UNORDERED, msg, sizeof(msg), 0), NL_OK);
+        ASSERT_EQ(harness_send(&ch, cc, 0, WN_RELIABLE_UNORDERED, msg, sizeof(msg), 0), WN_OK);
     }
     ASSERT_TRUE(sh.data_count < 6);
     harness_flush_acks(&sh, sc, 0);
     ASSERT_TRUE(cc->peer_rwnd < sizeof(msg));
 
-    nl_connection_consume_window(sc, sc->recv_window_used);
+    wn_connection_consume_window(sc, sc->recv_window_used);
     /* Lose the first thing the server sends after the drain (the window update). */
     sh.drop_next_send = true;
     ch.now_ms = sh.now_ms = 60;
@@ -1480,12 +1480,12 @@ TEST(test_lost_window_update_is_repaired_by_keepalive) {
         ch.now_ms = sh.now_ms = now;
         harness_tick(&sh, sc, now);
         harness_tick(&ch, cc, now);
-        nl_connection_consume_window(sc, sc->recv_window_used);
+        wn_connection_consume_window(sc, sc->recv_window_used);
     }
     ASSERT_EQ(sh.data_count, 6);
 
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 
@@ -1495,7 +1495,7 @@ TEST(test_lost_window_update_is_repaired_by_keepalive) {
  * the same congestion event and must cut the window only once. */
 TEST(test_congestion_burst_of_losses_cuts_window_once) {
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 100000, 100000);
     cc->cwnd = 32;
     cc->ssthresh = 64;
@@ -1511,15 +1511,15 @@ TEST(test_congestion_burst_of_losses_cuts_window_once) {
         ch.now_ms = sh.now_ms = now;
         bool drop = (i == 4 || i == 6 || i == 8 || i == 10 || i == 12);
         ch.drop_next_send = drop;
-        ASSERT_EQ(harness_send(&ch, cc, 0, NL_RELIABLE_UNORDERED, &b, 1, now), NL_OK);
+        ASSERT_EQ(harness_send(&ch, cc, 0, WN_RELIABLE_UNORDERED, &b, 1, now), WN_OK);
         if (!drop) harness_flush_acks(&sh, sc, now); /* the endpoint acks each datagram it drains */
     }
     ASSERT_TRUE(cc->stats.retransmits >= 3); /* several separate loss detections happened */
     /* One halving of 32 is 16. Cutting once per detection would reach 2. */
     ASSERT_TRUE(cc->cwnd >= 16);
 
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 
@@ -1531,20 +1531,20 @@ TEST(test_congestion_burst_of_losses_cuts_window_once) {
  * within one ordered stream. */
 TEST(test_priority_never_reorders_one_reliable_ordered_stream) {
     harness_t ch, sh;
-    nl_connection_t *cc, *sc;
+    wn_connection_t *cc, *sc;
     make_pair(&ch, &sh, &cc, &sc, 10000, 100000);
     cc->peer_rwnd = 0;
 
-    if (!enter_in_flight(cc)) { nl_connection_destroy(cc); nl_connection_destroy(sc); return; }
-    ASSERT_EQ(nl_connection_send(cc, 0, NL_RELIABLE_ORDERED, (const uint8_t *)"first", 5, NL_PRIORITY_LOW, 0, &ch.cb), NL_OK);
-    ASSERT_EQ(nl_connection_send(cc, 0, NL_RELIABLE_ORDERED, (const uint8_t *)"second", 6, NL_PRIORITY_HIGH, 0, &ch.cb), NL_OK);
+    if (!enter_in_flight(cc)) { wn_connection_destroy(cc); wn_connection_destroy(sc); return; }
+    ASSERT_EQ(wn_connection_send(cc, 0, WN_RELIABLE_ORDERED, (const uint8_t *)"first", 5, WN_PRIORITY_LOW, 0, &ch.cb), WN_OK);
+    ASSERT_EQ(wn_connection_send(cc, 0, WN_RELIABLE_ORDERED, (const uint8_t *)"second", 6, WN_PRIORITY_HIGH, 0, &ch.cb), WN_OK);
     /* An unrelated channel is free to jump the queue. */
-    ASSERT_EQ(nl_connection_send(cc, 1, NL_RELIABLE_ORDERED, (const uint8_t *)"other", 5, NL_PRIORITY_HIGH, 0, &ch.cb), NL_OK);
+    ASSERT_EQ(wn_connection_send(cc, 1, WN_RELIABLE_ORDERED, (const uint8_t *)"other", 5, WN_PRIORITY_HIGH, 0, &ch.cb), WN_OK);
     exit_in_flight();
     drain_queue();
     ASSERT_EQ(sh.data_count, 0);
 
-    cc->peer_rwnd = NL_RECV_WINDOW_DEFAULT;
+    cc->peer_rwnd = WN_RECV_WINDOW_DEFAULT;
     harness_tick(&ch, cc, 100);
     ASSERT_EQ(sh.data_count, 3);
     int first_at = -1, second_at = -1, other_at = -1;
@@ -1557,8 +1557,8 @@ TEST(test_priority_never_reorders_one_reliable_ordered_stream) {
     ASSERT_TRUE(first_at < second_at);   /* one ordered stream keeps its order */
     ASSERT_TRUE(other_at < first_at);    /* priority still works across channels */
 
-    nl_connection_destroy(cc);
-    nl_connection_destroy(sc);
+    wn_connection_destroy(cc);
+    wn_connection_destroy(sc);
 }
 
 int main(void) {

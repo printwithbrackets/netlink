@@ -2,7 +2,7 @@
  * protocol.h - internal wire format definitions.
  *
  * All multi-byte integer fields on the wire are big-endian ("network byte
- * order"). Use the nl_put_u16/nl_get_u16/etc helpers in byteorder.h to read
+ * order"). Use the wn_put_u16/wn_get_u16/etc helpers in byteorder.h to read
  * and write them -- never cast a buffer pointer to a struct pointer, to
  * stay safe on platforms with alignment requirements and to keep the
  * layout independent of struct padding.
@@ -11,7 +11,7 @@
  * so the receiver can route/decrypt; everything after it is the AEAD
  * ciphertext + 16-byte GCM tag for encrypted packet types):
  *
- *   byte 0       : packet_type (nl_packet_type_t)
+ *   byte 0       : packet_type (wn_packet_type_t)
  *   ...          : type-specific fields, see structs below
  *
  * For encrypted types (DATA, ACK, KEEPALIVE, DISCONNECT, CONNECT_ACCEPTED):
@@ -21,26 +21,26 @@
  *   bytes 17..N-17: AES-256-GCM ciphertext
  *   last 16 bytes : GCM authentication tag
  */
-#ifndef NETLINK_PROTOCOL_H
-#define NETLINK_PROTOCOL_H
+#ifndef WEFT_NET_PROTOCOL_H
+#define WEFT_NET_PROTOCOL_H
 
 #include <stdint.h>
 
-#define NL_MAGIC 0x4E4C4B31u /* "NLK1" */
+#define WN_MAGIC 0x574E4B31u /* "WNK1" */
 
 typedef enum {
-    NL_PKT_CONNECT_REQUEST   = 0x01,
-    NL_PKT_CONNECT_CHALLENGE = 0x02,
-    NL_PKT_CONNECT_RESPONSE  = 0x03,
-    NL_PKT_CONNECT_ACCEPTED  = 0x04, /* encrypted */
-    NL_PKT_CONNECT_DENIED    = 0x05,
-    NL_PKT_DATA              = 0x06, /* encrypted */
-    NL_PKT_DISCONNECT        = 0x07, /* encrypted */
-    NL_PKT_KEEPALIVE         = 0x08, /* encrypted */
-    NL_PKT_ACK               = 0x09, /* encrypted */
-    NL_PKT_DISCOVERY_REQUEST = 0x0A,
-    NL_PKT_DISCOVERY_RESPONSE= 0x0B,
-} nl_packet_type_t;
+    WN_PKT_CONNECT_REQUEST   = 0x01,
+    WN_PKT_CONNECT_CHALLENGE = 0x02,
+    WN_PKT_CONNECT_RESPONSE  = 0x03,
+    WN_PKT_CONNECT_ACCEPTED  = 0x04, /* encrypted */
+    WN_PKT_CONNECT_DENIED    = 0x05,
+    WN_PKT_DATA              = 0x06, /* encrypted */
+    WN_PKT_DISCONNECT        = 0x07, /* encrypted */
+    WN_PKT_KEEPALIVE         = 0x08, /* encrypted */
+    WN_PKT_ACK               = 0x09, /* encrypted */
+    WN_PKT_DISCOVERY_REQUEST = 0x0A,
+    WN_PKT_DISCOVERY_RESPONSE= 0x0B,
+} wn_packet_type_t;
 
 /* ---- Handshake packets (cleartext; authenticity comes from the cookie
  * HMAC and from the AEAD key-confirmation on the first encrypted packet,
@@ -55,13 +55,13 @@ typedef enum {
  *                              note below)
  *   u8  client_pubkey[32]
  *   u8  client_nonce[16]
- *   u32 capabilities          (NL_CAP_* bitmask the client supports;
+ *   u32 capabilities          (WN_CAP_* bitmask the client supports;
  *                              server stores it and replies with its own
  *                              set in CONNECT_CHALLENGE; negotiated = AND)
  *
  * The connection_id is chosen by the client (a random 64-bit value, via
  * the same CSPRNG used for keys) rather than assigned by the server. This
- * is what lets nl_connect() hand the caller a usable nl_peer_id_t
+ * is what lets wn_connect() hand the caller a usable wn_peer_id_t
  * synchronously, before the handshake completes, instead of forcing an
  * awkward "wait for an event to learn your own peer id" API. It has no
  * bearing on security: the id is just a demultiplexing key, never an
@@ -70,18 +70,18 @@ typedef enum {
  * check) if it happens to match an existing connection, which a random
  * 64-bit value practically never does.
  */
-#define NL_CONNECT_REQUEST_SIZE (1 + 4 + 2 + 1 + 8 + 32 + 16 + 4)
+#define WN_CONNECT_REQUEST_SIZE (1 + 4 + 2 + 1 + 8 + 32 + 16 + 4)
 
 /* CONNECT_CHALLENGE:
  *   u8  type
  *   u8  server_pubkey[32]
  *   u8  server_nonce[16]
  *   u8  cookie[16]
- *   u32 capabilities          (server's advertised NL_CAP_* set; the
+ *   u32 capabilities          (server's advertised WN_CAP_* set; the
  *                              client ANDs this with its own to get the
  *                              negotiated set for the connection)
  */
-#define NL_CONNECT_CHALLENGE_SIZE (1 + 32 + 16 + 16 + 4)
+#define WN_CONNECT_CHALLENGE_SIZE (1 + 32 + 16 + 16 + 4)
 
 /* CONNECT_RESPONSE:
  *   u8  type
@@ -91,13 +91,13 @@ typedef enum {
  *                             that created the cookie)
  *   u8  client_nonce[16]
  */
-#define NL_CONNECT_RESPONSE_SIZE (1 + 16 + 32 + 16)
+#define WN_CONNECT_RESPONSE_SIZE (1 + 16 + 32 + 16)
 
 /* CONNECT_DENIED:
  *   u8  type
  *   u8  reason
  */
-#define NL_CONNECT_DENIED_SIZE (1 + 1)
+#define WN_CONNECT_DENIED_SIZE (1 + 1)
 
 /* Largest of every cleartext handshake packet. Any buffer that holds one of
  * them for retransmission (pending_t.retry_packet, the retry_pending_handshakes
@@ -106,26 +106,26 @@ typedef enum {
  * is stored server-side, while a REQUEST/RESPONSE-sized buffer silently
  * overflows on the CHALLENGE retransmit path. The _Static_asserts below make
  * that failure a compile error instead. */
-#define NL_CONNECT_MAX_PACKET_SIZE (NL_CONNECT_REQUEST_SIZE > NL_CONNECT_CHALLENGE_SIZE \
-                                     ? NL_CONNECT_REQUEST_SIZE : NL_CONNECT_CHALLENGE_SIZE)
-_Static_assert(NL_CONNECT_MAX_PACKET_SIZE >= NL_CONNECT_REQUEST_SIZE, "");
-_Static_assert(NL_CONNECT_MAX_PACKET_SIZE >= NL_CONNECT_CHALLENGE_SIZE, "");
-_Static_assert(NL_CONNECT_MAX_PACKET_SIZE >= NL_CONNECT_RESPONSE_SIZE, "");
-_Static_assert(NL_CONNECT_MAX_PACKET_SIZE >= NL_CONNECT_DENIED_SIZE, "");
+#define WN_CONNECT_MAX_PACKET_SIZE (WN_CONNECT_REQUEST_SIZE > WN_CONNECT_CHALLENGE_SIZE \
+                                     ? WN_CONNECT_REQUEST_SIZE : WN_CONNECT_CHALLENGE_SIZE)
+_Static_assert(WN_CONNECT_MAX_PACKET_SIZE >= WN_CONNECT_REQUEST_SIZE, "");
+_Static_assert(WN_CONNECT_MAX_PACKET_SIZE >= WN_CONNECT_CHALLENGE_SIZE, "");
+_Static_assert(WN_CONNECT_MAX_PACKET_SIZE >= WN_CONNECT_RESPONSE_SIZE, "");
+_Static_assert(WN_CONNECT_MAX_PACKET_SIZE >= WN_CONNECT_DENIED_SIZE, "");
 
 typedef enum {
-    NL_DENY_SERVER_FULL         = 1,
-    NL_DENY_PROTOCOL_MISMATCH   = 2,
-} nl_deny_reason_t;
+    WN_DENY_SERVER_FULL         = 1,
+    WN_DENY_PROTOCOL_MISMATCH   = 2,
+} wn_deny_reason_t;
 
 /* ---- Encrypted packet cleartext header (the "AAD" portion) ---- */
-#define NL_ENC_HEADER_SIZE (1 + 8 + 8) /* type + connection_id + nonce_counter */
-#define NL_GCM_TAG_SIZE 16
-#define NL_GCM_NONCE_SIZE 12
+#define WN_ENC_HEADER_SIZE (1 + 8 + 8) /* type + connection_id + nonce_counter */
+#define WN_GCM_TAG_SIZE 16
+#define WN_GCM_NONCE_SIZE 12
 
 /* ---- DATA payload (this is what's inside the AEAD plaintext) ----
  *   u8  channel
- *   u8  delivery              (nl_delivery_t)
+ *   u8  delivery              (wn_delivery_t)
  *   u16 sequence
  *   u16 ack
  *   u64 ack_bits
@@ -147,10 +147,10 @@ typedef enum {
  *     u16 fragment_count
  *   -- payload bytes follow to end of plaintext --
  */
-#define NL_DATA_HEADER_SIZE (1 + 1 + 2 + 2 + 8 + 1 + 2 + 1)
-#define NL_FRAGMENT_HEADER_SIZE (2 + 2 + 2)
+#define WN_DATA_HEADER_SIZE (1 + 1 + 2 + 2 + 8 + 1 + 2 + 1)
+#define WN_FRAGMENT_HEADER_SIZE (2 + 2 + 2)
 
-/* ---- ACK payload (AEAD plaintext of NL_PKT_ACK) ----
+/* ---- ACK payload (AEAD plaintext of WN_PKT_ACK) ----
  * Sent when a reliable receive has no outgoing DATA to piggyback the
  * ack on (the "one-way traffic" case: acks would otherwise only ride
  * on DATA in the reverse direction, so a receiver that never sends app
@@ -158,19 +158,19 @@ typedef enum {
  * same (ack, ack_bits, rwnd) triple a DATA header does, plus which
  * channel/lane it covers.
  *   u8  channel
- *   u8  delivery              (must be a reliable nl_delivery_t)
+ *   u8  delivery              (must be a reliable wn_delivery_t)
  *   u16 ack
  *   u64 ack_bits
  *   u8  ack_valid             (0/1: same meaning as in the DATA header)
  *   u16 rwnd                  (our advertised receive window)
  */
-#define NL_ACK_PAYLOAD_SIZE (1 + 1 + 2 + 8 + 1 + 2)
+#define WN_ACK_PAYLOAD_SIZE (1 + 1 + 2 + 8 + 1 + 2)
 
 /* Default receive window (bytes) advertised when nothing better is known.
  * Lives here so channel-level tests can stamp it without pulling in
  * connection.h; connection.c uses the same value as its initial capacity. */
-#ifndef NL_RECV_WINDOW_DEFAULT
-#define NL_RECV_WINDOW_DEFAULT 32768u
+#ifndef WN_RECV_WINDOW_DEFAULT
+#define WN_RECV_WINDOW_DEFAULT 32768u
 #endif
 
 /* ---- DISCOVERY_REQUEST:
@@ -178,7 +178,7 @@ typedef enum {
  *   u32 magic
  *   u32 nonce (echoed back, lets client match replies to probes)
  */
-#define NL_DISCOVERY_REQUEST_SIZE (1 + 4 + 4)
+#define WN_DISCOVERY_REQUEST_SIZE (1 + 4 + 4)
 
 /* ---- DISCOVERY_RESPONSE:
  *   u8  type
@@ -189,6 +189,6 @@ typedef enum {
  *   u8  name_len
  *   u8  name[name_len]
  */
-#define NL_DISCOVERY_RESPONSE_MIN_SIZE (1 + 4 + 2 + 4 + 4 + 1)
+#define WN_DISCOVERY_RESPONSE_MIN_SIZE (1 + 4 + 2 + 4 + 4 + 1)
 
-#endif /* NETLINK_PROTOCOL_H */
+#endif /* WEFT_NET_PROTOCOL_H */

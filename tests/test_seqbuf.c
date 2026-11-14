@@ -3,7 +3,7 @@
 #include <string.h>
 
 /* Small file-scope capture helper for tests that need to observe which
- * sequences nl_send_ring_fast_retransmit() fires for. */
+ * sequences wn_send_ring_fast_retransmit() fires for. */
 static uint16_t g_fast_retransmit_fired[16];
 static int g_fast_retransmit_count;
 
@@ -22,49 +22,49 @@ static void fast_retransmit_capture(void *ctx, uint16_t sequence) {
 }
 
 TEST(test_seq_greater_than_basic) {
-    ASSERT_TRUE(nl_seq_greater_than(1, 0));
-    ASSERT_TRUE(nl_seq_greater_than(100, 99));
-    ASSERT_FALSE(nl_seq_greater_than(0, 1));
-    ASSERT_FALSE(nl_seq_greater_than(5, 5));
+    ASSERT_TRUE(wn_seq_greater_than(1, 0));
+    ASSERT_TRUE(wn_seq_greater_than(100, 99));
+    ASSERT_FALSE(wn_seq_greater_than(0, 1));
+    ASSERT_FALSE(wn_seq_greater_than(5, 5));
 }
 
 TEST(test_seq_greater_than_wraparound) {
     /* 0 comes "after" 65535 */
-    ASSERT_TRUE(nl_seq_greater_than(0, 65535));
-    ASSERT_FALSE(nl_seq_greater_than(65535, 0));
-    ASSERT_TRUE(nl_seq_greater_than(10, 65530));
+    ASSERT_TRUE(wn_seq_greater_than(0, 65535));
+    ASSERT_FALSE(wn_seq_greater_than(65535, 0));
+    ASSERT_TRUE(wn_seq_greater_than(10, 65530));
 }
 
 TEST(test_send_ring_insert_and_get) {
-    nl_send_ring_t ring;
-    ASSERT_EQ(nl_send_ring_init(&ring), 0);
+    wn_send_ring_t ring;
+    ASSERT_EQ(wn_send_ring_init(&ring), 0);
 
     uint8_t payload[] = {1, 2, 3, 4};
     uint16_t seq;
-    ASSERT_TRUE(nl_send_ring_insert(&ring, payload, sizeof(payload), 1000, &seq));
+    ASSERT_TRUE(wn_send_ring_insert(&ring, payload, sizeof(payload), 1000, &seq));
     ASSERT_EQ(seq, 0);
 
-    nl_send_slot_t *slot = nl_send_ring_get(&ring, 0);
+    wn_send_slot_t *slot = wn_send_ring_get(&ring, 0);
     ASSERT_TRUE(slot != NULL);
     ASSERT_EQ(slot->len, 4);
     ASSERT_FALSE(slot->acked);
     ASSERT_MEM_EQ(slot->data, payload, 4);
 
-    ASSERT_TRUE(nl_send_ring_get(&ring, 1) == NULL);
+    ASSERT_TRUE(wn_send_ring_get(&ring, 1) == NULL);
 
-    nl_send_ring_free(&ring);
+    wn_send_ring_free(&ring);
 }
 
 TEST(test_send_ring_sequence_increments) {
-    nl_send_ring_t ring;
-    nl_send_ring_init(&ring);
+    wn_send_ring_t ring;
+    wn_send_ring_init(&ring);
     uint8_t payload[] = {0xAA};
     uint16_t seq;
     for (int i = 0; i < 10; i++) {
-        nl_send_ring_insert(&ring, payload, 1, 0, &seq);
+        wn_send_ring_insert(&ring, payload, 1, 0, &seq);
         ASSERT_EQ(seq, i);
     }
-    nl_send_ring_free(&ring);
+    wn_send_ring_free(&ring);
 }
 
 TEST(test_send_ring_insert_refuses_unacked_overwrite) {
@@ -73,113 +73,113 @@ TEST(test_send_ring_insert_refuses_unacked_overwrite) {
      * -- that original would never be retransmitted, leaving the receiver
      * with an unfillable gap. After acking seq 0, a wrap-around insert at
      * the same index must succeed (recycling acked slots is fine). */
-    nl_send_ring_t ring;
-    nl_send_ring_init(&ring);
+    wn_send_ring_t ring;
+    wn_send_ring_init(&ring);
     uint16_t seq;
 
-    for (int i = 0; i < NL_SEQ_RING_SIZE; i++) {
+    for (int i = 0; i < WN_SEQ_RING_SIZE; i++) {
         uint8_t b = (uint8_t)i;
-        ASSERT_TRUE(nl_send_ring_insert(&ring, &b, 1, 0, &seq));
+        ASSERT_TRUE(wn_send_ring_insert(&ring, &b, 1, 0, &seq));
         ASSERT_EQ(seq, (uint16_t)i);
     }
-    ASSERT_EQ(ring.unacked_count, NL_SEQ_RING_SIZE);
+    ASSERT_EQ(ring.unacked_count, WN_SEQ_RING_SIZE);
 
     uint8_t overflow = 0xFF;
-    ASSERT_FALSE(nl_send_ring_insert(&ring, &overflow, 1, 0, &seq));
-    ASSERT_EQ(ring.next_sequence, NL_SEQ_RING_SIZE); /* not advanced */
-    ASSERT_EQ(ring.unacked_count, NL_SEQ_RING_SIZE);
+    ASSERT_FALSE(wn_send_ring_insert(&ring, &overflow, 1, 0, &seq));
+    ASSERT_EQ(ring.next_sequence, WN_SEQ_RING_SIZE); /* not advanced */
+    ASSERT_EQ(ring.unacked_count, WN_SEQ_RING_SIZE);
 
     /* Slot 0's original payload must be untouched. */
-    nl_send_slot_t *s0 = nl_send_ring_get(&ring, 0);
+    wn_send_slot_t *s0 = wn_send_ring_get(&ring, 0);
     ASSERT_TRUE(s0 != NULL);
     ASSERT_EQ(s0->data[0], 0);
     ASSERT_FALSE(s0->acked);
 
     /* Ack seq 0 so its index becomes recyclable, then insert succeeds. */
     bool has_sample; uint32_t sample_ms;
-    nl_send_ring_ack(&ring, 0, 0, 0, &has_sample, &sample_ms, NULL);
-    ASSERT_TRUE(nl_send_ring_insert(&ring, &overflow, 1, 0, &seq));
-    ASSERT_EQ(seq, NL_SEQ_RING_SIZE);
-    ASSERT_EQ(ring.unacked_count, NL_SEQ_RING_SIZE); /* 255 old + 1 new */
+    wn_send_ring_ack(&ring, 0, 0, 0, &has_sample, &sample_ms, NULL);
+    ASSERT_TRUE(wn_send_ring_insert(&ring, &overflow, 1, 0, &seq));
+    ASSERT_EQ(seq, WN_SEQ_RING_SIZE);
+    ASSERT_EQ(ring.unacked_count, WN_SEQ_RING_SIZE); /* 255 old + 1 new */
 
-    nl_send_ring_free(&ring);
+    wn_send_ring_free(&ring);
 }
 
 TEST(test_send_ring_ack_marks_slot) {
-    nl_send_ring_t ring;
-    nl_send_ring_init(&ring);
+    wn_send_ring_t ring;
+    wn_send_ring_init(&ring);
     uint8_t payload[] = {0xAA};
     uint16_t seq;
-    nl_send_ring_insert(&ring, payload, 1, 0, &seq);
-    ASSERT_FALSE(nl_send_ring_get(&ring, seq)->acked);
+    wn_send_ring_insert(&ring, payload, 1, 0, &seq);
+    ASSERT_FALSE(wn_send_ring_get(&ring, seq)->acked);
     bool has_sample; uint32_t sample_ms;
-    nl_send_ring_ack(&ring, seq, 0, 0, &has_sample, &sample_ms, NULL);
-    ASSERT_TRUE(nl_send_ring_get(&ring, seq)->acked);
-    nl_send_ring_free(&ring);
+    wn_send_ring_ack(&ring, seq, 0, 0, &has_sample, &sample_ms, NULL);
+    ASSERT_TRUE(wn_send_ring_get(&ring, seq)->acked);
+    wn_send_ring_free(&ring);
 }
 
 TEST(test_send_ring_ack_bitfield_marks_older) {
-    nl_send_ring_t ring;
-    nl_send_ring_init(&ring);
+    wn_send_ring_t ring;
+    wn_send_ring_init(&ring);
     uint8_t payload[] = {0xAA};
     uint16_t seqs[5];
-    for (int i = 0; i < 5; i++) nl_send_ring_insert(&ring, payload, 1, 0, &seqs[i]);
+    for (int i = 0; i < 5; i++) wn_send_ring_insert(&ring, payload, 1, 0, &seqs[i]);
     /* seqs = 0,1,2,3,4. Ack seq=4 with bit0 set (=seq 3) and bit2 set (=seq 1). */
-    nl_ack_bits_t ack_bits = (1u << 0) | (1u << 2);
+    wn_ack_bits_t ack_bits = (1u << 0) | (1u << 2);
     bool has_sample; uint32_t sample_ms;
-    nl_send_ring_ack(&ring, 4, ack_bits, 0, &has_sample, &sample_ms, NULL);
-    ASSERT_TRUE(nl_send_ring_get(&ring, 4)->acked);
-    ASSERT_TRUE(nl_send_ring_get(&ring, 3)->acked);  /* bit 0 */
-    ASSERT_FALSE(nl_send_ring_get(&ring, 2)->acked); /* not set */
-    ASSERT_TRUE(nl_send_ring_get(&ring, 1)->acked);  /* bit 2 */
-    ASSERT_FALSE(nl_send_ring_get(&ring, 0)->acked); /* not set */
-    nl_send_ring_free(&ring);
+    wn_send_ring_ack(&ring, 4, ack_bits, 0, &has_sample, &sample_ms, NULL);
+    ASSERT_TRUE(wn_send_ring_get(&ring, 4)->acked);
+    ASSERT_TRUE(wn_send_ring_get(&ring, 3)->acked);  /* bit 0 */
+    ASSERT_FALSE(wn_send_ring_get(&ring, 2)->acked); /* not set */
+    ASSERT_TRUE(wn_send_ring_get(&ring, 1)->acked);  /* bit 2 */
+    ASSERT_FALSE(wn_send_ring_get(&ring, 0)->acked); /* not set */
+    wn_send_ring_free(&ring);
 }
 
 TEST(test_send_ring_ack_rtt_sample_clean) {
-    nl_send_ring_t ring;
-    nl_send_ring_init(&ring);
+    wn_send_ring_t ring;
+    wn_send_ring_init(&ring);
     uint8_t payload[] = {0xAA};
     uint16_t seq;
-    nl_send_ring_insert(&ring, payload, 1, /*send_time_ms*/ 1000, &seq);
+    wn_send_ring_insert(&ring, payload, 1, /*send_time_ms*/ 1000, &seq);
 
     bool has_sample; uint32_t sample_ms;
-    nl_send_ring_ack(&ring, seq, 0, /*now_ms*/ 1075, &has_sample, &sample_ms, NULL);
+    wn_send_ring_ack(&ring, seq, 0, /*now_ms*/ 1075, &has_sample, &sample_ms, NULL);
     ASSERT_TRUE(has_sample);
     ASSERT_EQ(sample_ms, 75);
-    nl_send_ring_free(&ring);
+    wn_send_ring_free(&ring);
 }
 
 TEST(test_send_ring_ack_no_rtt_sample_if_already_acked) {
     /* A duplicate/stale ack for something already acked must not produce
      * a second (meaningless) RTT sample. */
-    nl_send_ring_t ring;
-    nl_send_ring_init(&ring);
+    wn_send_ring_t ring;
+    wn_send_ring_init(&ring);
     uint8_t payload[] = {0xAA};
     uint16_t seq;
-    nl_send_ring_insert(&ring, payload, 1, 1000, &seq);
+    wn_send_ring_insert(&ring, payload, 1, 1000, &seq);
 
     bool has_sample; uint32_t sample_ms;
-    nl_send_ring_ack(&ring, seq, 0, 1050, &has_sample, &sample_ms, NULL);
+    wn_send_ring_ack(&ring, seq, 0, 1050, &has_sample, &sample_ms, NULL);
     ASSERT_TRUE(has_sample);
 
-    nl_send_ring_ack(&ring, seq, 0, 1200, &has_sample, &sample_ms, NULL); /* duplicate ack */
+    wn_send_ring_ack(&ring, seq, 0, 1200, &has_sample, &sample_ms, NULL); /* duplicate ack */
     ASSERT_FALSE(has_sample);
-    nl_send_ring_free(&ring);
+    wn_send_ring_free(&ring);
 }
 
 TEST(test_send_ring_ack_no_rtt_sample_for_retransmitted) {
-    nl_send_ring_t ring;
-    nl_send_ring_init(&ring);
+    wn_send_ring_t ring;
+    wn_send_ring_init(&ring);
     uint8_t payload[] = {0xAA};
     uint16_t seq;
-    nl_send_ring_insert(&ring, payload, 1, 1000, &seq);
-    nl_send_ring_get(&ring, seq)->retry_count = 1; /* simulate: this slot was retransmitted */
+    wn_send_ring_insert(&ring, payload, 1, 1000, &seq);
+    wn_send_ring_get(&ring, seq)->retry_count = 1; /* simulate: this slot was retransmitted */
 
     bool has_sample; uint32_t sample_ms;
-    nl_send_ring_ack(&ring, seq, 0, 1050, &has_sample, &sample_ms, NULL);
+    wn_send_ring_ack(&ring, seq, 0, 1050, &has_sample, &sample_ms, NULL);
     ASSERT_FALSE(has_sample);
-    nl_send_ring_free(&ring);
+    wn_send_ring_free(&ring);
 }
 
 TEST(test_send_ring_ack_no_rtt_sample_from_bitfield_entries) {
@@ -187,41 +187,41 @@ TEST(test_send_ring_ack_no_rtt_sample_from_bitfield_entries) {
      * newly-acked purely via the bitfield never produce one, even if
      * they were never retransmitted, since their delivery timing relative
      * to `now_ms` doesn't isolate path RTT the way the newest ack does. */
-    nl_send_ring_t ring;
-    nl_send_ring_init(&ring);
+    wn_send_ring_t ring;
+    wn_send_ring_init(&ring);
     uint8_t payload[] = {0xAA};
     uint16_t seq0, seq1;
-    nl_send_ring_insert(&ring, payload, 1, 1000, &seq0);
-    nl_send_ring_insert(&ring, payload, 1, 1010, &seq1);
+    wn_send_ring_insert(&ring, payload, 1, 1000, &seq0);
+    wn_send_ring_insert(&ring, payload, 1, 1010, &seq1);
 
     bool has_sample; uint32_t sample_ms;
     /* Ack seq1 directly (produces a sample) and seq0 via bit 0. */
-    nl_send_ring_ack(&ring, seq1, 1u << 0, 1100, &has_sample, &sample_ms, NULL);
+    wn_send_ring_ack(&ring, seq1, 1u << 0, 1100, &has_sample, &sample_ms, NULL);
     ASSERT_TRUE(has_sample);       /* from seq1, the `ack` field itself */
     ASSERT_EQ(sample_ms, 90);      /* 1100 - 1010 */
-    ASSERT_TRUE(nl_send_ring_get(&ring, seq0)->acked); /* seq0 acked too, via bitfield */
-    nl_send_ring_free(&ring);
+    ASSERT_TRUE(wn_send_ring_get(&ring, seq0)->acked); /* seq0 acked too, via bitfield */
+    wn_send_ring_free(&ring);
 }
 
 TEST(test_fast_retransmit_triggers_past_threshold) {
-    nl_send_ring_t ring;
-    nl_send_ring_init(&ring);
+    wn_send_ring_t ring;
+    wn_send_ring_init(&ring);
     uint8_t payload[] = {0xAA};
     uint16_t seqs[5];
-    for (int i = 0; i < 5; i++) nl_send_ring_insert(&ring, payload, 1, 0, &seqs[i]);
+    for (int i = 0; i < 5; i++) wn_send_ring_insert(&ring, payload, 1, 0, &seqs[i]);
 
     /* ack=4, with seqs 1,2,3 acked via bitfield (bits 0,1,2 relative to 4),
      * seq 0 (age 4) still unacked -- 4 strictly-newer acked (1,2,3,4)
      * exceeds threshold 3. As in real usage (channel.c always calls
-     * nl_send_ring_ack() before nl_send_ring_fast_retransmit() with the
+     * wn_send_ring_ack() before wn_send_ring_fast_retransmit() with the
      * same ack/ack_bits), apply the ack first so already-acked slots are
      * correctly excluded from the scan. */
-    nl_ack_bits_t ack_bits = (1u << 0) | (1u << 1) | (1u << 2);
+    wn_ack_bits_t ack_bits = (1u << 0) | (1u << 1) | (1u << 2);
     bool has_sample; uint32_t sample_ms;
-    nl_send_ring_ack(&ring, 4, ack_bits, 0, &has_sample, &sample_ms, NULL);
+    wn_send_ring_ack(&ring, 4, ack_bits, 0, &has_sample, &sample_ms, NULL);
 
     fast_retransmit_capture_reset();
-    nl_send_ring_fast_retransmit(&ring, 4, ack_bits, 3, 100, fast_retransmit_capture, NULL);
+    wn_send_ring_fast_retransmit(&ring, 4, ack_bits, 3, 100, fast_retransmit_capture, NULL);
 
     ASSERT_EQ(fast_retransmit_capture_count(), 1);
     ASSERT_EQ(fast_retransmit_capture_get(0), seqs[0]);
@@ -229,51 +229,51 @@ TEST(test_fast_retransmit_triggers_past_threshold) {
      * also fire for this slot on the next tick) and marks the slot as
      * done. It deliberately does NOT touch retry_count: that counter is
      * the give-up budget, and charging fast retransmit to it let ~18 acks
-     * within a second exhaust NL_MAX_RETRIES and kill a healthy
+     * within a second exhaust WN_MAX_RETRIES and kill a healthy
      * connection. */
-    ASSERT_EQ(nl_send_ring_get(&ring, seqs[0])->send_time_ms, 100u);
-    ASSERT_EQ(nl_send_ring_get(&ring, seqs[0])->retry_count, 0u);
-    ASSERT_TRUE(nl_send_ring_get(&ring, seqs[0])->fast_retx_done);
+    ASSERT_EQ(wn_send_ring_get(&ring, seqs[0])->send_time_ms, 100u);
+    ASSERT_EQ(wn_send_ring_get(&ring, seqs[0])->retry_count, 0u);
+    ASSERT_TRUE(wn_send_ring_get(&ring, seqs[0])->fast_retx_done);
 
-    nl_send_ring_free(&ring);
+    wn_send_ring_free(&ring);
 }
 
 TEST(test_fast_retransmit_correct_without_prior_ack_call) {
     /* Regression test for the ordering-independence fix: this must give
      * the same correct result as test_fast_retransmit_triggers_past_threshold
-     * even when nl_send_ring_ack was never called with these values first. */
-    nl_send_ring_t ring;
-    nl_send_ring_init(&ring);
+     * even when wn_send_ring_ack was never called with these values first. */
+    wn_send_ring_t ring;
+    wn_send_ring_init(&ring);
     uint8_t payload[] = {0xAA};
     uint16_t seqs[5];
-    for (int i = 0; i < 5; i++) nl_send_ring_insert(&ring, payload, 1, 0, &seqs[i]);
+    for (int i = 0; i < 5; i++) wn_send_ring_insert(&ring, payload, 1, 0, &seqs[i]);
 
-    nl_ack_bits_t ack_bits = (1u << 0) | (1u << 1) | (1u << 2); /* seqs 1,2,3 acked; seq 0's own bit not covered */
+    wn_ack_bits_t ack_bits = (1u << 0) | (1u << 1) | (1u << 2); /* seqs 1,2,3 acked; seq 0's own bit not covered */
 
     fast_retransmit_capture_reset();
-    nl_send_ring_fast_retransmit(&ring, 4, ack_bits, 3, 100, fast_retransmit_capture, NULL);
+    wn_send_ring_fast_retransmit(&ring, 4, ack_bits, 3, 100, fast_retransmit_capture, NULL);
 
     ASSERT_EQ(fast_retransmit_capture_count(), 1);
     ASSERT_EQ(fast_retransmit_capture_get(0), seqs[0]);
 
-    nl_send_ring_free(&ring);
+    wn_send_ring_free(&ring);
 }
 
 TEST(test_fast_retransmit_skips_already_acked) {
-    nl_send_ring_t ring;
-    nl_send_ring_init(&ring);
+    wn_send_ring_t ring;
+    wn_send_ring_init(&ring);
     uint8_t payload[] = {0xAA};
     uint16_t seqs[5];
-    for (int i = 0; i < 5; i++) nl_send_ring_insert(&ring, payload, 1, 0, &seqs[i]);
+    for (int i = 0; i < 5; i++) wn_send_ring_insert(&ring, payload, 1, 0, &seqs[i]);
     bool has_sample; uint32_t sample_ms;
-    nl_send_ring_ack(&ring, 4, (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3), 0, &has_sample, &sample_ms, NULL);
+    wn_send_ring_ack(&ring, 4, (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3), 0, &has_sample, &sample_ms, NULL);
 
     /* everything acked now -- nothing should fast-retransmit */
     fast_retransmit_capture_reset();
-    nl_send_ring_fast_retransmit(&ring, 4, (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3), 3, 100,
+    wn_send_ring_fast_retransmit(&ring, 4, (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3), 3, 100,
                                   fast_retransmit_capture, NULL);
     ASSERT_EQ(fast_retransmit_capture_count(), 0);
-    nl_send_ring_free(&ring);
+    wn_send_ring_free(&ring);
 }
 
 /* Regression: what congestion control has to gate on is the span from the
@@ -282,34 +282,34 @@ TEST(test_fast_retransmit_skips_already_acked) {
  * (early packets lost, later ones acked), letting the span grow past what
  * any ack's bitmap can reach and stranding the oldest packet forever. */
 TEST(test_oldest_unacked_tracks_span_not_count) {
-    nl_send_ring_t ring;
-    nl_send_ring_init(&ring);
+    wn_send_ring_t ring;
+    wn_send_ring_init(&ring);
     uint8_t payload[] = {0xAA};
     for (int i = 0; i < 40; i++) {
         uint16_t seq;
-        ASSERT_TRUE(nl_send_ring_insert(&ring, payload, 1, 0, &seq));
+        ASSERT_TRUE(wn_send_ring_insert(&ring, payload, 1, 0, &seq));
     }
-    ASSERT_EQ(nl_send_ring_oldest_unacked(&ring), 0); /* span is the whole 40 */
+    ASSERT_EQ(wn_send_ring_oldest_unacked(&ring), 0); /* span is the whole 40 */
 
     bool has_sample; uint32_t sample_ms;
     /* Ack 8..39 directly: 32 slots retired, but seq 0 still gates the span. */
     for (int i = 8; i < 40; i++) {
-        nl_send_ring_ack(&ring, (uint16_t)i, 0, 0, &has_sample, &sample_ms, NULL);
+        wn_send_ring_ack(&ring, (uint16_t)i, 0, 0, &has_sample, &sample_ms, NULL);
     }
     ASSERT_EQ(ring.unacked_count, 8);
-    ASSERT_EQ(nl_send_ring_oldest_unacked(&ring), 0);
+    ASSERT_EQ(wn_send_ring_oldest_unacked(&ring), 0);
 
     /* Retire the front of the ring one at a time: the span only shrinks as
      * the oldest gap fills. */
     for (int i = 0; i < 7; i++) {
-        nl_send_ring_ack(&ring, (uint16_t)i, 0, 0, &has_sample, &sample_ms, NULL);
-        ASSERT_EQ(nl_send_ring_oldest_unacked(&ring), (uint16_t)(i + 1));
+        wn_send_ring_ack(&ring, (uint16_t)i, 0, 0, &has_sample, &sample_ms, NULL);
+        ASSERT_EQ(wn_send_ring_oldest_unacked(&ring), (uint16_t)(i + 1));
     }
-    nl_send_ring_ack(&ring, 7, 0, 0, &has_sample, &sample_ms, NULL);
+    wn_send_ring_ack(&ring, 7, 0, 0, &has_sample, &sample_ms, NULL);
     ASSERT_EQ(ring.unacked_count, 0);
-    ASSERT_EQ(nl_send_ring_oldest_unacked(&ring), 40); /* nothing outstanding */
+    ASSERT_EQ(wn_send_ring_oldest_unacked(&ring), 40); /* nothing outstanding */
 
-    nl_send_ring_free(&ring);
+    wn_send_ring_free(&ring);
 }
 
 /* Regression: an ack can only name the sequences its bitmap reaches back
@@ -318,43 +318,43 @@ TEST(test_oldest_unacked_tracks_span_not_count) {
  * the oldest of a burst of lost packets fell out of every future ack's
  * reach and could never be retired. */
 TEST(test_ack_bitmap_window_covers_cwnd_in_flight) {
-    const int flight = 64; /* == NL_CWND_MAX_PACKETS */
+    const int flight = 64; /* == WN_CWND_MAX_PACKETS */
     const int lost = 8;
-    ASSERT_TRUE(flight <= NL_ACK_WINDOW_BITS);
+    ASSERT_TRUE(flight <= WN_ACK_WINDOW_BITS);
 
-    nl_send_ring_t ring;
-    nl_send_ring_init(&ring);
-    nl_recv_dedupe_t d;
-    nl_recv_dedupe_init(&d);
+    wn_send_ring_t ring;
+    wn_send_ring_init(&ring);
+    wn_recv_dedupe_t d;
+    wn_recv_dedupe_init(&d);
 
     uint8_t payload[] = {0xAA};
     for (int i = 0; i < flight; i++) {
         uint16_t seq;
-        ASSERT_TRUE(nl_send_ring_insert(&ring, payload, 1, 0, &seq));
+        ASSERT_TRUE(wn_send_ring_insert(&ring, payload, 1, 0, &seq));
         ASSERT_EQ(seq, (uint16_t)i);
     }
 
     /* Receiver gets the tail of the flight; the first `lost` are dropped. */
-    for (int i = lost; i < flight; i++) ASSERT_TRUE(nl_recv_dedupe_insert(&d, (uint16_t)i));
-    uint16_t ack; nl_ack_bits_t bits;
-    nl_recv_dedupe_build_ack(&d, &ack, &bits);
+    for (int i = lost; i < flight; i++) ASSERT_TRUE(wn_recv_dedupe_insert(&d, (uint16_t)i));
+    uint16_t ack; wn_ack_bits_t bits;
+    wn_recv_dedupe_build_ack(&d, &ack, &bits);
     ASSERT_EQ(ack, flight - 1);
     bool has_sample; uint32_t sample_ms; uint32_t newly;
-    nl_send_ring_ack(&ring, ack, bits, 50, &has_sample, &sample_ms, &newly);
+    wn_send_ring_ack(&ring, ack, bits, 50, &has_sample, &sample_ms, &newly);
     ASSERT_EQ(ring.unacked_count, lost);
 
     /* The sender's retransmits of those arrive, so the receiver now holds
      * every sequence. The next ack must retire all `lost` of them: the
      * oldest sits at age flight-1, the deepest the bitmap can reach. */
-    for (int i = 0; i < lost; i++) ASSERT_TRUE(nl_recv_dedupe_insert(&d, (uint16_t)i));
-    nl_recv_dedupe_build_ack(&d, &ack, &bits);
+    for (int i = 0; i < lost; i++) ASSERT_TRUE(wn_recv_dedupe_insert(&d, (uint16_t)i));
+    wn_recv_dedupe_build_ack(&d, &ack, &bits);
     ASSERT_EQ(ack, flight - 1);
-    nl_send_ring_ack(&ring, ack, bits, 100, &has_sample, &sample_ms, &newly);
+    wn_send_ring_ack(&ring, ack, bits, 100, &has_sample, &sample_ms, &newly);
     ASSERT_EQ(newly, lost);
     ASSERT_EQ(ring.unacked_count, 0);
 
-    nl_recv_dedupe_free(&d);
-    nl_send_ring_free(&ring);
+    wn_recv_dedupe_free(&d);
+    wn_send_ring_free(&ring);
 }
 
 /* Regression: the same burst seen through fast retransmit. The hole must
@@ -365,131 +365,131 @@ TEST(test_ack_bitmap_covers_burst_loss_at_full_cwnd) {
     const int flight = 64;
     const int lost = 8;
 
-    nl_send_ring_t ring;
-    nl_send_ring_init(&ring);
-    nl_recv_dedupe_t d;
-    nl_recv_dedupe_init(&d);
+    wn_send_ring_t ring;
+    wn_send_ring_init(&ring);
+    wn_recv_dedupe_t d;
+    wn_recv_dedupe_init(&d);
 
     uint8_t payload[] = {0xBB};
     for (int i = 0; i < flight; i++) {
         uint16_t seq;
-        ASSERT_TRUE(nl_send_ring_insert(&ring, payload, 1, 0, &seq));
+        ASSERT_TRUE(wn_send_ring_insert(&ring, payload, 1, 0, &seq));
     }
 
-    for (int i = lost; i < flight; i++) ASSERT_TRUE(nl_recv_dedupe_insert(&d, (uint16_t)i));
-    uint16_t ack; nl_ack_bits_t bits;
+    for (int i = lost; i < flight; i++) ASSERT_TRUE(wn_recv_dedupe_insert(&d, (uint16_t)i));
+    uint16_t ack; wn_ack_bits_t bits;
     bool has_sample; uint32_t sample_ms; uint32_t newly;
 
     fast_retransmit_capture_reset();
-    nl_recv_dedupe_build_ack(&d, &ack, &bits);
-    nl_send_ring_ack(&ring, ack, bits, 50, &has_sample, &sample_ms, &newly);
-    nl_send_ring_fast_retransmit(&ring, ack, bits, /*reorder_threshold*/ 3, 50,
+    wn_recv_dedupe_build_ack(&d, &ack, &bits);
+    wn_send_ring_ack(&ring, ack, bits, 50, &has_sample, &sample_ms, &newly);
+    wn_send_ring_fast_retransmit(&ring, ack, bits, /*reorder_threshold*/ 3, 50,
                                   fast_retransmit_capture, NULL);
     /* Every hole, including the oldest one, is fast-retransmit-eligible. */
     ASSERT_EQ(fast_retransmit_capture_count(), lost);
     for (int i = 0; i < lost; i++) ASSERT_EQ(fast_retransmit_capture_get(i), (uint16_t)i);
 
-    for (int i = 0; i < lost; i++) ASSERT_TRUE(nl_recv_dedupe_insert(&d, (uint16_t)i));
-    nl_recv_dedupe_build_ack(&d, &ack, &bits);
-    nl_send_ring_ack(&ring, ack, bits, 100, &has_sample, &sample_ms, &newly);
+    for (int i = 0; i < lost; i++) ASSERT_TRUE(wn_recv_dedupe_insert(&d, (uint16_t)i));
+    wn_recv_dedupe_build_ack(&d, &ack, &bits);
+    wn_send_ring_ack(&ring, ack, bits, 100, &has_sample, &sample_ms, &newly);
     ASSERT_EQ(ring.unacked_count, 0);
 
-    nl_recv_dedupe_free(&d);
-    nl_send_ring_free(&ring);
+    wn_recv_dedupe_free(&d);
+    wn_send_ring_free(&ring);
 }
 
 /* Regression: fast retransmit had no cooldown, so every inbound packet
  * whose ack horizon was >=3 newer re-fired a retransmit for the same hole,
  * and each of those bumped retry_count -- which is shared with the give-up
  * budget. ~18 acks within a second therefore drove retry_count past
- * NL_MAX_RETRIES and destroyed a healthy connection. */
+ * WN_MAX_RETRIES and destroyed a healthy connection. */
 TEST(test_fast_retransmit_fires_once_per_hole) {
     const int n = 40;
-    nl_send_ring_t ring;
-    nl_send_ring_init(&ring);
-    nl_recv_dedupe_t d;
-    nl_recv_dedupe_init(&d);
+    wn_send_ring_t ring;
+    wn_send_ring_init(&ring);
+    wn_recv_dedupe_t d;
+    wn_recv_dedupe_init(&d);
 
     uint8_t payload[] = {0xCC};
     for (int i = 0; i < n; i++) {
         uint16_t seq;
-        ASSERT_TRUE(nl_send_ring_insert(&ring, payload, 1, 0, &seq));
+        ASSERT_TRUE(wn_send_ring_insert(&ring, payload, 1, 0, &seq));
     }
     /* Sequence 0 is lost; every other packet arrives, one per round, so
      * the ack horizon advances each time. */
 
     bool has_sample; uint32_t sample_ms; uint32_t newly;
-    uint16_t ack; nl_ack_bits_t bits;
+    uint16_t ack; wn_ack_bits_t bits;
 
     fast_retransmit_capture_reset();
     /* 15 successive acks with horizons 3..17: every one of them is past
      * the reorder threshold for the seq-0 hole. */
     for (uint16_t horizon = 3; horizon < 18; horizon++) {
         for (uint16_t i = 1; i <= horizon; i++) {
-            nl_recv_dedupe_insert(&d, i); /* arrives now; all but 0 */
+            wn_recv_dedupe_insert(&d, i); /* arrives now; all but 0 */
         }
-        nl_recv_dedupe_build_ack(&d, &ack, &bits);
+        wn_recv_dedupe_build_ack(&d, &ack, &bits);
         ASSERT_EQ(ack, horizon);
-        nl_send_ring_ack(&ring, ack, bits, 100, &has_sample, &sample_ms, &newly);
-        nl_send_ring_fast_retransmit(&ring, ack, bits, 3, 100, fast_retransmit_capture, NULL);
+        wn_send_ring_ack(&ring, ack, bits, 100, &has_sample, &sample_ms, &newly);
+        wn_send_ring_fast_retransmit(&ring, ack, bits, 3, 100, fast_retransmit_capture, NULL);
     }
 
     ASSERT_EQ(fast_retransmit_capture_count(), 1);
     ASSERT_EQ(fast_retransmit_capture_get(0), 0);
     /* The give-up budget must be untouched by fast retransmit: RTO retries
      * are what the retry_count limit is there for. */
-    nl_send_slot_t *s0 = nl_send_ring_get(&ring, 0);
+    wn_send_slot_t *s0 = wn_send_ring_get(&ring, 0);
     ASSERT_TRUE(s0 != NULL);
     ASSERT_EQ(s0->retry_count, 0);
 
-    nl_recv_dedupe_free(&d);
-    nl_send_ring_free(&ring);
+    wn_recv_dedupe_free(&d);
+    wn_send_ring_free(&ring);
 }
 
 /* Regression: once a fast-retransmitted hole is finally acked, the slot's
  * cooldown must clear too, so a later loss in the same slot can be
  * fast-retransmitted again rather than waiting on the RTO. */
 TEST(test_fast_retransmit_cooldown_clears_on_ack) {
-    nl_send_ring_t ring;
-    nl_send_ring_init(&ring);
+    wn_send_ring_t ring;
+    wn_send_ring_init(&ring);
     uint8_t payload[] = {0xDD};
     uint16_t seqs[5];
-    for (int i = 0; i < 5; i++) ASSERT_TRUE(nl_send_ring_insert(&ring, payload, 1, 0, &seqs[i]));
+    for (int i = 0; i < 5; i++) ASSERT_TRUE(wn_send_ring_insert(&ring, payload, 1, 0, &seqs[i]));
 
-    nl_ack_bits_t bits = (nl_ack_bits_t)1 << 0 | (nl_ack_bits_t)1 << 1 | (nl_ack_bits_t)1 << 2;
+    wn_ack_bits_t bits = (wn_ack_bits_t)1 << 0 | (wn_ack_bits_t)1 << 1 | (wn_ack_bits_t)1 << 2;
     fast_retransmit_capture_reset();
-    nl_send_ring_fast_retransmit(&ring, 4, bits, 3, 100, fast_retransmit_capture, NULL);
+    wn_send_ring_fast_retransmit(&ring, 4, bits, 3, 100, fast_retransmit_capture, NULL);
     ASSERT_EQ(fast_retransmit_capture_count(), 1);
 
     /* Same ack again: still no second fire (cooldown holds). */
-    nl_send_ring_fast_retransmit(&ring, 4, bits, 3, 100, fast_retransmit_capture, NULL);
+    wn_send_ring_fast_retransmit(&ring, 4, bits, 3, 100, fast_retransmit_capture, NULL);
     ASSERT_EQ(fast_retransmit_capture_count(), 1);
 
     /* Ack everything, then re-use the lane for a second loss burst. */
     bool has_sample; uint32_t sample_ms;
     for (uint16_t i = 0; i < 5; i++) {
-        nl_send_ring_ack(&ring, i, 0, 200, &has_sample, &sample_ms, NULL);
+        wn_send_ring_ack(&ring, i, 0, 200, &has_sample, &sample_ms, NULL);
     }
     ASSERT_EQ(ring.unacked_count, 0);
     for (int i = 5; i < 10; i++) {
         uint16_t seq;
-        ASSERT_TRUE(nl_send_ring_insert(&ring, payload, 1, 300, &seq));
+        ASSERT_TRUE(wn_send_ring_insert(&ring, payload, 1, 300, &seq));
     }
     /* Sequences 6..9 received, 5 lost: one hole, so exactly one fire. */
-    nl_ack_bits_t bits2 = (nl_ack_bits_t)1 << 0 | (nl_ack_bits_t)1 << 1 | (nl_ack_bits_t)1 << 2;
-    nl_send_ring_ack(&ring, 9, bits2, 300, &has_sample, &sample_ms, NULL);
+    wn_ack_bits_t bits2 = (wn_ack_bits_t)1 << 0 | (wn_ack_bits_t)1 << 1 | (wn_ack_bits_t)1 << 2;
+    wn_send_ring_ack(&ring, 9, bits2, 300, &has_sample, &sample_ms, NULL);
     fast_retransmit_capture_reset();
-    nl_send_ring_fast_retransmit(&ring, 9, bits2, 3, 400, fast_retransmit_capture, NULL);
+    wn_send_ring_fast_retransmit(&ring, 9, bits2, 3, 400, fast_retransmit_capture, NULL);
     ASSERT_EQ(fast_retransmit_capture_count(), 1);
     ASSERT_EQ(fast_retransmit_capture_get(0), 5);
 
-    nl_send_ring_free(&ring);
+    wn_send_ring_free(&ring);
 }
 
 /* Regression: an RTT sample computed from a now_ms that went BACKWARDS
  * underflowed. `now_ms - send_time_ms` on uint64_t with now < send wraps to
  * ~2^64, and the (uint32_t) truncation lands near 4 billion ms -- which then
- * feeds srtt and is reported verbatim to the app by nl_peer_rtt_ms().
+ * feeds srtt and is reported verbatim to the app by wn_peer_rtt_ms().
  *
  * now_ms can legitimately appear to go backwards: the caller supplies it
  * (the harness and the real endpoint both pass a CLOCK_MONOTONIC reading
@@ -497,75 +497,75 @@ TEST(test_fast_retransmit_cooldown_clears_on_ack) {
  * wrap of any external clock source does the same thing. A bogus sample
  * must be discarded, not clamped -- clamping would still poison srtt. */
 TEST(test_rtt_sample_discarded_when_now_goes_backwards) {
-    nl_send_ring_t ring;
-    nl_send_ring_init(&ring);
+    wn_send_ring_t ring;
+    wn_send_ring_init(&ring);
     uint8_t payload[] = {0xAA};
     uint16_t seq;
-    ASSERT_TRUE(nl_send_ring_insert(&ring, payload, 1, /*send_time_ms*/ 5000, &seq));
+    ASSERT_TRUE(wn_send_ring_insert(&ring, payload, 1, /*send_time_ms*/ 5000, &seq));
 
     /* now_ms = 4000: 500ms "before" the send. Must produce no sample. */
     bool has_sample = true;
     uint32_t sample_ms = 12345;
-    nl_send_ring_ack(&ring, seq, 0, /*now_ms*/ 4000, &has_sample, &sample_ms, NULL);
+    wn_send_ring_ack(&ring, seq, 0, /*now_ms*/ 4000, &has_sample, &sample_ms, NULL);
     ASSERT_FALSE(has_sample);
     ASSERT_EQ(sample_ms, 12345u); /* left untouched, not written with garbage */
 
     /* Equal timestamps are not backwards: no elapsed time, but still a
      * legitimate (zero) sample rather than a discarded one. */
-    nl_send_ring_insert(&ring, payload, 1, 7000, &seq);
-    nl_send_ring_ack(&ring, seq, 0, /*now_ms*/ 7000, &has_sample, &sample_ms, NULL);
+    wn_send_ring_insert(&ring, payload, 1, 7000, &seq);
+    wn_send_ring_ack(&ring, seq, 0, /*now_ms*/ 7000, &has_sample, &sample_ms, NULL);
     ASSERT_TRUE(has_sample);
     ASSERT_EQ(sample_ms, 0u);
 
     /* And a forward sample still works, so the guard isn't over-broad. */
-    nl_send_ring_insert(&ring, payload, 1, 8000, &seq);
-    nl_send_ring_ack(&ring, seq, 0, /*now_ms*/ 8250, &has_sample, &sample_ms, NULL);
+    wn_send_ring_insert(&ring, payload, 1, 8000, &seq);
+    wn_send_ring_ack(&ring, seq, 0, /*now_ms*/ 8250, &has_sample, &sample_ms, NULL);
     ASSERT_TRUE(has_sample);
     ASSERT_EQ(sample_ms, 250u);
 
-    nl_send_ring_free(&ring);
+    wn_send_ring_free(&ring);
 }
 
 TEST(test_recv_dedupe_rejects_duplicates) {
-    nl_recv_dedupe_t d;
-    nl_recv_dedupe_init(&d);
-    ASSERT_TRUE(nl_recv_dedupe_insert(&d, 5));
-    ASSERT_FALSE(nl_recv_dedupe_insert(&d, 5)); /* dup */
-    ASSERT_TRUE(nl_recv_dedupe_insert(&d, 6));
-    ASSERT_FALSE(nl_recv_dedupe_insert(&d, 6));
-    nl_recv_dedupe_free(&d);
+    wn_recv_dedupe_t d;
+    wn_recv_dedupe_init(&d);
+    ASSERT_TRUE(wn_recv_dedupe_insert(&d, 5));
+    ASSERT_FALSE(wn_recv_dedupe_insert(&d, 5)); /* dup */
+    ASSERT_TRUE(wn_recv_dedupe_insert(&d, 6));
+    ASSERT_FALSE(wn_recv_dedupe_insert(&d, 6));
+    wn_recv_dedupe_free(&d);
 }
 
 TEST(test_recv_dedupe_out_of_order_accepted_once) {
-    nl_recv_dedupe_t d;
-    nl_recv_dedupe_init(&d);
-    ASSERT_TRUE(nl_recv_dedupe_insert(&d, 10));
-    ASSERT_TRUE(nl_recv_dedupe_insert(&d, 8));  /* arrives late, still new */
-    ASSERT_FALSE(nl_recv_dedupe_insert(&d, 8)); /* now a dup */
-    ASSERT_TRUE(nl_recv_dedupe_insert(&d, 9));
-    nl_recv_dedupe_free(&d);
+    wn_recv_dedupe_t d;
+    wn_recv_dedupe_init(&d);
+    ASSERT_TRUE(wn_recv_dedupe_insert(&d, 10));
+    ASSERT_TRUE(wn_recv_dedupe_insert(&d, 8));  /* arrives late, still new */
+    ASSERT_FALSE(wn_recv_dedupe_insert(&d, 8)); /* now a dup */
+    ASSERT_TRUE(wn_recv_dedupe_insert(&d, 9));
+    wn_recv_dedupe_free(&d);
 }
 
 TEST(test_recv_dedupe_too_old_rejected) {
-    nl_recv_dedupe_t d;
-    nl_recv_dedupe_init(&d);
-    nl_recv_dedupe_insert(&d, 1000);
+    wn_recv_dedupe_t d;
+    wn_recv_dedupe_init(&d);
+    wn_recv_dedupe_insert(&d, 1000);
     /* 1000 - 260 is outside the 256-wide window */
-    ASSERT_FALSE(nl_recv_dedupe_insert(&d, 1000 - 260));
-    nl_recv_dedupe_free(&d);
+    ASSERT_FALSE(wn_recv_dedupe_insert(&d, 1000 - 260));
+    wn_recv_dedupe_free(&d);
 }
 
 TEST(test_recv_dedupe_build_ack_bitfield) {
-    nl_recv_dedupe_t d;
-    nl_recv_dedupe_init(&d);
-    nl_recv_dedupe_insert(&d, 0);
-    nl_recv_dedupe_insert(&d, 1);
+    wn_recv_dedupe_t d;
+    wn_recv_dedupe_init(&d);
+    wn_recv_dedupe_insert(&d, 0);
+    wn_recv_dedupe_insert(&d, 1);
     /* skip 2 */
-    nl_recv_dedupe_insert(&d, 3);
-    nl_recv_dedupe_insert(&d, 4);
+    wn_recv_dedupe_insert(&d, 3);
+    wn_recv_dedupe_insert(&d, 4);
 
-    uint16_t ack; nl_ack_bits_t bits;
-    nl_recv_dedupe_build_ack(&d, &ack, &bits);
+    uint16_t ack; wn_ack_bits_t bits;
+    wn_recv_dedupe_build_ack(&d, &ack, &bits);
     ASSERT_EQ(ack, 4);
     /* bit0 = seq 3 (received) -> 1
        bit1 = seq 2 (missing)  -> 0
@@ -575,77 +575,77 @@ TEST(test_recv_dedupe_build_ack_bitfield) {
     ASSERT_FALSE(bits & (1u << 1));
     ASSERT_TRUE(bits & (1u << 2));
     ASSERT_TRUE(bits & (1u << 3));
-    nl_recv_dedupe_free(&d);
+    wn_recv_dedupe_free(&d);
 }
 
 TEST(test_recv_dedupe_wraparound) {
-    nl_recv_dedupe_t d;
-    nl_recv_dedupe_init(&d);
-    ASSERT_TRUE(nl_recv_dedupe_insert(&d, 65534));
-    ASSERT_TRUE(nl_recv_dedupe_insert(&d, 65535));
-    ASSERT_TRUE(nl_recv_dedupe_insert(&d, 0)); /* wrapped */
-    ASSERT_TRUE(nl_recv_dedupe_insert(&d, 1));
-    ASSERT_FALSE(nl_recv_dedupe_insert(&d, 0)); /* dup, post-wrap */
-    ASSERT_FALSE(nl_recv_dedupe_insert(&d, 65535)); /* dup, pre-wrap */
-    nl_recv_dedupe_free(&d);
+    wn_recv_dedupe_t d;
+    wn_recv_dedupe_init(&d);
+    ASSERT_TRUE(wn_recv_dedupe_insert(&d, 65534));
+    ASSERT_TRUE(wn_recv_dedupe_insert(&d, 65535));
+    ASSERT_TRUE(wn_recv_dedupe_insert(&d, 0)); /* wrapped */
+    ASSERT_TRUE(wn_recv_dedupe_insert(&d, 1));
+    ASSERT_FALSE(wn_recv_dedupe_insert(&d, 0)); /* dup, post-wrap */
+    ASSERT_FALSE(wn_recv_dedupe_insert(&d, 65535)); /* dup, pre-wrap */
+    wn_recv_dedupe_free(&d);
 }
 
 TEST(test_reorder_ring_in_order_passthrough) {
-    nl_reorder_ring_t ring;
-    nl_reorder_ring_init(&ring);
+    wn_reorder_ring_t ring;
+    wn_reorder_ring_init(&ring);
     uint8_t data[] = {1, 2, 3};
-    uint8_t out[NL_MAX_PACKET_SIZE];
+    uint8_t out[WN_MAX_PACKET_SIZE];
     uint16_t out_len;
 
-    ASSERT_TRUE(nl_reorder_ring_insert(&ring, 0, data, 3));
-    ASSERT_TRUE(nl_reorder_ring_pop_ready(&ring, out, &out_len));
+    ASSERT_TRUE(wn_reorder_ring_insert(&ring, 0, data, 3));
+    ASSERT_TRUE(wn_reorder_ring_pop_ready(&ring, out, &out_len));
     ASSERT_EQ(out_len, 3);
     ASSERT_MEM_EQ(out, data, 3);
-    ASSERT_FALSE(nl_reorder_ring_pop_ready(&ring, out, &out_len)); /* nothing else ready */
+    ASSERT_FALSE(wn_reorder_ring_pop_ready(&ring, out, &out_len)); /* nothing else ready */
 
-    nl_reorder_ring_free(&ring);
+    wn_reorder_ring_free(&ring);
 }
 
 TEST(test_reorder_ring_buffers_out_of_order) {
-    nl_reorder_ring_t ring;
-    nl_reorder_ring_init(&ring);
+    wn_reorder_ring_t ring;
+    wn_reorder_ring_init(&ring);
     uint8_t p0[] = {0}, p1[] = {1}, p2[] = {2};
-    uint8_t out[NL_MAX_PACKET_SIZE];
+    uint8_t out[WN_MAX_PACKET_SIZE];
     uint16_t out_len;
 
     /* Packet 0 arrives first and establishes the base sequence. */
-    ASSERT_TRUE(nl_reorder_ring_insert(&ring, 0, p0, 1));
-    ASSERT_TRUE(nl_reorder_ring_pop_ready(&ring, out, &out_len));
+    ASSERT_TRUE(wn_reorder_ring_insert(&ring, 0, p0, 1));
+    ASSERT_TRUE(wn_reorder_ring_pop_ready(&ring, out, &out_len));
     ASSERT_EQ(out[0], 0);
 
     /* Packet 2 arrives before packet 1 -- buffered, not yet deliverable. */
-    ASSERT_TRUE(nl_reorder_ring_insert(&ring, 2, p2, 1));
-    ASSERT_FALSE(nl_reorder_ring_pop_ready(&ring, out, &out_len));
+    ASSERT_TRUE(wn_reorder_ring_insert(&ring, 2, p2, 1));
+    ASSERT_FALSE(wn_reorder_ring_pop_ready(&ring, out, &out_len));
 
     /* Packet 1 arrives -- now both 1 and 2 should release, in order. */
-    ASSERT_TRUE(nl_reorder_ring_insert(&ring, 1, p1, 1));
-    ASSERT_TRUE(nl_reorder_ring_pop_ready(&ring, out, &out_len));
+    ASSERT_TRUE(wn_reorder_ring_insert(&ring, 1, p1, 1));
+    ASSERT_TRUE(wn_reorder_ring_pop_ready(&ring, out, &out_len));
     ASSERT_EQ(out[0], 1);
-    ASSERT_TRUE(nl_reorder_ring_pop_ready(&ring, out, &out_len));
+    ASSERT_TRUE(wn_reorder_ring_pop_ready(&ring, out, &out_len));
     ASSERT_EQ(out[0], 2);
-    ASSERT_FALSE(nl_reorder_ring_pop_ready(&ring, out, &out_len));
+    ASSERT_FALSE(wn_reorder_ring_pop_ready(&ring, out, &out_len));
 
-    nl_reorder_ring_free(&ring);
+    wn_reorder_ring_free(&ring);
 }
 
 TEST(test_reorder_ring_rejects_stale_duplicate) {
-    nl_reorder_ring_t ring;
-    nl_reorder_ring_init(&ring);
+    wn_reorder_ring_t ring;
+    wn_reorder_ring_init(&ring);
     uint8_t p0[] = {0};
-    uint8_t out[NL_MAX_PACKET_SIZE];
+    uint8_t out[WN_MAX_PACKET_SIZE];
     uint16_t out_len;
 
-    nl_reorder_ring_insert(&ring, 0, p0, 1);
-    nl_reorder_ring_pop_ready(&ring, out, &out_len);
+    wn_reorder_ring_insert(&ring, 0, p0, 1);
+    wn_reorder_ring_pop_ready(&ring, out, &out_len);
     /* Sequence 0 already delivered; a retransmitted duplicate must be rejected. */
-    ASSERT_FALSE(nl_reorder_ring_insert(&ring, 0, p0, 1));
+    ASSERT_FALSE(wn_reorder_ring_insert(&ring, 0, p0, 1));
 
-    nl_reorder_ring_free(&ring);
+    wn_reorder_ring_free(&ring);
 }
 
 TEST(test_reorder_ring_baseline_is_always_zero_not_first_arrival) {
@@ -656,46 +656,46 @@ TEST(test_reorder_ring_baseline_is_always_zero_not_first_arrival) {
      * stream (sequence 1 arriving before sequence 0), it would wrongly
      * treat sequence 1 as "the start" and deliver it immediately --
      * silently breaking the in-order guarantee. */
-    nl_reorder_ring_t ring;
-    nl_reorder_ring_init(&ring);
+    wn_reorder_ring_t ring;
+    wn_reorder_ring_init(&ring);
     uint8_t p0[] = {0xA0}, p1[] = {0xA1};
-    uint8_t out[NL_MAX_PACKET_SIZE];
+    uint8_t out[WN_MAX_PACKET_SIZE];
     uint16_t out_len;
 
     /* Sequence 1 arrives first (reordered by the network). */
-    ASSERT_TRUE(nl_reorder_ring_insert(&ring, 1, p1, 1));
-    ASSERT_FALSE(nl_reorder_ring_pop_ready(&ring, out, &out_len)); /* must NOT release yet */
+    ASSERT_TRUE(wn_reorder_ring_insert(&ring, 1, p1, 1));
+    ASSERT_FALSE(wn_reorder_ring_pop_ready(&ring, out, &out_len)); /* must NOT release yet */
 
     /* Sequence 0 finally arrives -- now both should release, in order. */
-    ASSERT_TRUE(nl_reorder_ring_insert(&ring, 0, p0, 1));
-    ASSERT_TRUE(nl_reorder_ring_pop_ready(&ring, out, &out_len));
+    ASSERT_TRUE(wn_reorder_ring_insert(&ring, 0, p0, 1));
+    ASSERT_TRUE(wn_reorder_ring_pop_ready(&ring, out, &out_len));
     ASSERT_EQ(out[0], 0xA0);
-    ASSERT_TRUE(nl_reorder_ring_pop_ready(&ring, out, &out_len));
+    ASSERT_TRUE(wn_reorder_ring_pop_ready(&ring, out, &out_len));
     ASSERT_EQ(out[0], 0xA1);
-    ASSERT_FALSE(nl_reorder_ring_pop_ready(&ring, out, &out_len));
+    ASSERT_FALSE(wn_reorder_ring_pop_ready(&ring, out, &out_len));
 
-    nl_reorder_ring_free(&ring);
+    wn_reorder_ring_free(&ring);
 }
 
 
 TEST(test_recv_dedupe_seen_is_read_only_and_matches_insert) {
-    nl_recv_dedupe_t d;
-    ASSERT_EQ(nl_recv_dedupe_init(&d), 0);
-    ASSERT_FALSE(nl_recv_dedupe_seen(&d, 5)); /* nothing received yet */
-    ASSERT_TRUE(nl_recv_dedupe_insert(&d, 5));
-    ASSERT_TRUE(nl_recv_dedupe_seen(&d, 5));
-    ASSERT_FALSE(nl_recv_dedupe_seen(&d, 6)); /* newer than anything received */
-    ASSERT_FALSE(nl_recv_dedupe_seen(&d, 4)); /* older but never received */
+    wn_recv_dedupe_t d;
+    ASSERT_EQ(wn_recv_dedupe_init(&d), 0);
+    ASSERT_FALSE(wn_recv_dedupe_seen(&d, 5)); /* nothing received yet */
+    ASSERT_TRUE(wn_recv_dedupe_insert(&d, 5));
+    ASSERT_TRUE(wn_recv_dedupe_seen(&d, 5));
+    ASSERT_FALSE(wn_recv_dedupe_seen(&d, 6)); /* newer than anything received */
+    ASSERT_FALSE(wn_recv_dedupe_seen(&d, 4)); /* older but never received */
     /* seen() must not have recorded anything: 4 and 6 are still new to insert(). */
-    ASSERT_TRUE(nl_recv_dedupe_insert(&d, 6));
-    ASSERT_TRUE(nl_recv_dedupe_insert(&d, 4));
-    uint16_t ack; nl_ack_bits_t bits;
-    nl_recv_dedupe_build_ack(&d, &ack, &bits);
+    ASSERT_TRUE(wn_recv_dedupe_insert(&d, 6));
+    ASSERT_TRUE(wn_recv_dedupe_insert(&d, 4));
+    uint16_t ack; wn_ack_bits_t bits;
+    wn_recv_dedupe_build_ack(&d, &ack, &bits);
     ASSERT_EQ(ack, 6);
     /* A sequence that has fallen out of the window counts as seen, like insert() says. */
-    ASSERT_TRUE(nl_recv_dedupe_insert(&d, (uint16_t)(6 + NL_SEQ_RING_SIZE + 10)));
-    ASSERT_TRUE(nl_recv_dedupe_seen(&d, 5));
-    nl_recv_dedupe_free(&d);
+    ASSERT_TRUE(wn_recv_dedupe_insert(&d, (uint16_t)(6 + WN_SEQ_RING_SIZE + 10)));
+    ASSERT_TRUE(wn_recv_dedupe_seen(&d, 5));
+    wn_recv_dedupe_free(&d);
 }
 
 int main(void) {

@@ -8,23 +8,23 @@
 #include <string.h>
 #include <stdio.h>
 
-struct nl_keypair {
+struct wn_keypair {
     EVP_PKEY *pkey;
 };
 
-void nl_crypto_random(uint8_t *buf, size_t len) {
+void wn_crypto_random(uint8_t *buf, size_t len) {
     if (len == 0) return;
     if (RAND_bytes(buf, (int)len) != 1) {
         /* The system CSPRNG failing is not a recoverable condition for a
          * security-sensitive library: continuing would mean generating
          * predictable keys/nonces. Fail loudly and immediately. */
-        fprintf(stderr, "netlink: fatal: RAND_bytes failed, cannot obtain secure randomness\n");
+        fprintf(stderr, "weft-net: fatal: RAND_bytes failed, cannot obtain secure randomness\n");
         abort();
     }
 }
 
-nl_keypair_t *nl_keypair_generate(void) {
-    nl_keypair_t *kp = (nl_keypair_t *)calloc(1, sizeof(nl_keypair_t));
+wn_keypair_t *wn_keypair_generate(void) {
+    wn_keypair_t *kp = (wn_keypair_t *)calloc(1, sizeof(wn_keypair_t));
     if (!kp) return NULL;
 
     EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
@@ -48,22 +48,22 @@ nl_keypair_t *nl_keypair_generate(void) {
     return kp;
 }
 
-void nl_keypair_free(nl_keypair_t *kp) {
+void wn_keypair_free(wn_keypair_t *kp) {
     if (!kp) return;
     if (kp->pkey) EVP_PKEY_free(kp->pkey);
     free(kp);
 }
 
-bool nl_keypair_public(const nl_keypair_t *kp, uint8_t out[NL_KEY_SIZE]) {
-    size_t len = NL_KEY_SIZE;
+bool wn_keypair_public(const wn_keypair_t *kp, uint8_t out[WN_KEY_SIZE]) {
+    size_t len = WN_KEY_SIZE;
     if (EVP_PKEY_get_raw_public_key(kp->pkey, out, &len) != 1) return false;
-    return len == NL_KEY_SIZE;
+    return len == WN_KEY_SIZE;
 }
 
-bool nl_crypto_x25519(const nl_keypair_t *my_keypair, const uint8_t peer_public[NL_KEY_SIZE],
-                       uint8_t out_shared_secret[NL_KEY_SIZE]) {
+bool wn_crypto_x25519(const wn_keypair_t *my_keypair, const uint8_t peer_public[WN_KEY_SIZE],
+                       uint8_t out_shared_secret[WN_KEY_SIZE]) {
     bool ok = false;
-    EVP_PKEY *peer_pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, peer_public, NL_KEY_SIZE);
+    EVP_PKEY *peer_pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, peer_public, WN_KEY_SIZE);
     if (!peer_pkey) return false;
 
     EVP_PKEY_CTX *dctx = EVP_PKEY_CTX_new(my_keypair->pkey, NULL);
@@ -72,17 +72,17 @@ bool nl_crypto_x25519(const nl_keypair_t *my_keypair, const uint8_t peer_public[
     if (EVP_PKEY_derive_init(dctx) != 1) goto out_free_ctx;
     if (EVP_PKEY_derive_set_peer(dctx, peer_pkey) != 1) goto out_free_ctx;
 
-    size_t secret_len = NL_KEY_SIZE;
+    size_t secret_len = WN_KEY_SIZE;
     if (EVP_PKEY_derive(dctx, out_shared_secret, &secret_len) != 1) goto out_free_ctx;
-    if (secret_len != NL_KEY_SIZE) goto out_free_ctx;
+    if (secret_len != WN_KEY_SIZE) goto out_free_ctx;
 
     /* Reject an all-zero shared secret. X25519 has known low-order points
      * that a malicious peer could send to force a predictable/degenerate
      * shared secret; while X25519 as specified doesn't require this check
      * for security against a passive attacker, checking costs nothing and
      * defends against a peer trying to downgrade the exchange. */
-    uint8_t zero[NL_KEY_SIZE] = {0};
-    if (nl_crypto_const_time_eq(out_shared_secret, zero, NL_KEY_SIZE)) goto out_free_ctx;
+    uint8_t zero[WN_KEY_SIZE] = {0};
+    if (wn_crypto_const_time_eq(out_shared_secret, zero, WN_KEY_SIZE)) goto out_free_ctx;
 
     ok = true;
 
@@ -93,7 +93,7 @@ out_free_peer:
     return ok;
 }
 
-bool nl_crypto_hkdf_sha256(const uint8_t *secret, size_t secret_len,
+bool wn_crypto_hkdf_sha256(const uint8_t *secret, size_t secret_len,
                             const uint8_t *salt, size_t salt_len,
                             const uint8_t *info, size_t info_len,
                             uint8_t *out, size_t out_len) {
@@ -119,7 +119,7 @@ out_free:
     return ok;
 }
 
-bool nl_crypto_hmac_sha256(const uint8_t *key, size_t key_len,
+bool wn_crypto_hmac_sha256(const uint8_t *key, size_t key_len,
                             const uint8_t *data, size_t data_len,
                             uint8_t *out, size_t out_len) {
     if (out_len > 32) return false;
@@ -133,7 +133,7 @@ bool nl_crypto_hmac_sha256(const uint8_t *key, size_t key_len,
     return true;
 }
 
-bool nl_crypto_aead_encrypt(const uint8_t key[NL_KEY_SIZE], const uint8_t nonce[12],
+bool wn_crypto_aead_encrypt(const uint8_t key[WN_KEY_SIZE], const uint8_t nonce[12],
                              const uint8_t *aad, size_t aad_len,
                              const uint8_t *plaintext, size_t plaintext_len,
                              uint8_t *ciphertext_out, uint8_t tag_out[16]) {
@@ -171,7 +171,7 @@ out:
     return ok;
 }
 
-bool nl_crypto_aead_decrypt(const uint8_t key[NL_KEY_SIZE], const uint8_t nonce[12],
+bool wn_crypto_aead_decrypt(const uint8_t key[WN_KEY_SIZE], const uint8_t nonce[12],
                              const uint8_t *aad, size_t aad_len,
                              const uint8_t *ciphertext, size_t ciphertext_len,
                              const uint8_t tag[16],
@@ -215,7 +215,7 @@ out:
     return ok;
 }
 
-void nl_nonce_build(const uint8_t salt[12], uint64_t counter, uint8_t out_nonce[12]) {
+void wn_nonce_build(const uint8_t salt[12], uint64_t counter, uint8_t out_nonce[12]) {
     uint8_t ctr_be[12] = {0};
     for (int i = 0; i < 8; i++) {
         ctr_be[4 + i] = (uint8_t)(counter >> (56 - 8 * i));
@@ -225,7 +225,7 @@ void nl_nonce_build(const uint8_t salt[12], uint64_t counter, uint8_t out_nonce[
     }
 }
 
-bool nl_crypto_const_time_eq(const uint8_t *a, const uint8_t *b, size_t len) {
+bool wn_crypto_const_time_eq(const uint8_t *a, const uint8_t *b, size_t len) {
     uint8_t diff = 0;
     for (size_t i = 0; i < len; i++) {
         diff |= (uint8_t)(a[i] ^ b[i]);
@@ -233,13 +233,13 @@ bool nl_crypto_const_time_eq(const uint8_t *a, const uint8_t *b, size_t len) {
     return diff == 0;
 }
 
-void nl_replay_window_init(nl_replay_window_t *w) {
+void wn_replay_window_init(wn_replay_window_t *w) {
     w->highest = 0;
     w->bitmask = 0;
     w->initialized = false;
 }
 
-bool nl_replay_window_would_accept(const nl_replay_window_t *w, uint64_t counter) {
+bool wn_replay_window_would_accept(const wn_replay_window_t *w, uint64_t counter) {
     if (!w->initialized) return true;
     if (counter > w->highest) return true; /* always new */
     uint64_t age = w->highest - counter;
@@ -248,7 +248,7 @@ bool nl_replay_window_would_accept(const nl_replay_window_t *w, uint64_t counter
     return (w->bitmask & bit) == 0; /* true iff not already seen */
 }
 
-bool nl_replay_window_check(nl_replay_window_t *w, uint64_t counter) {
+bool wn_replay_window_check(wn_replay_window_t *w, uint64_t counter) {
     if (!w->initialized) {
         w->initialized = true;
         w->highest = counter;
@@ -276,6 +276,6 @@ bool nl_replay_window_check(nl_replay_window_t *w, uint64_t counter) {
     return true;
 }
 
-void nl_crypto_wipe(void *p, size_t len) {
+void wn_crypto_wipe(void *p, size_t len) {
     if (p && len) OPENSSL_cleanse(p, len);
 }
