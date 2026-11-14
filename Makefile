@@ -1,4 +1,4 @@
-# NetLink build system.
+# weft-net build system.
 #
 # Targets:
 #   make               - build the static and shared libraries
@@ -7,7 +7,7 @@
 #   make test-bindings - run Python/Go/Rust binding tests (needs go, cargo, python3)
 #   make examples      - build the example programs
 #   make install       - install libs, header, and pkg-config file to $(PREFIX)
-#   make dist          - package netlink-$(VERSION).tar.gz (header + libs + .pc)
+#   make dist          - package weft-net-$(VERSION).tar.gz (header + libs + .pc)
 #   make clean         - remove build artifacts
 #
 # Requires: a C11 compiler, pthreads, and OpenSSL's libcrypto (headers +
@@ -22,11 +22,11 @@ AR      ?= ar
 # be silently DISCARDED, because a command-line assignment takes
 # precedence over everything the makefile does without `override`. -MMD
 # -MP writes a .d file per object so library sources rebuild when a
-# header they include changes (include/netlink.h edits would otherwise
+# header they include changes (include/weft_net.h edits would otherwise
 # leave a stale lib quietly exporting an old ABI/version).
 override CFLAGS  += -std=c11 -Wall -Wextra -O2 -fPIC -MMD -MP
-# Hardening: export only the NL_API surface from the shared library (every
-# internal nl_crypto_* / nl_channel_* / *_for_test symbol used to be public ABI),
+# Hardening: export only the WN_API surface from the shared library (every
+# internal wn_crypto_* / wn_channel_* / *_for_test symbol used to be public ABI),
 # and turn on _FORTIFY_SOURCE so an overlong memcpy into a fixed buffer aborts
 # instead of corrupting the stack. -U first because some distro compilers
 # already define it and a plain -D would warn about the redefinition.
@@ -37,7 +37,7 @@ ifeq ($(shell uname -s),Linux)
 override LDFLAGS += -Wl,-z,relro,-z,now
 endif
 
-# Keep in sync with NL_VERSION_* in include/netlink.h and version fields
+# Keep in sync with WN_VERSION_* in include/weft_net.h and version fields
 # in bindings/python, bindings/rust.
 VERSION := 1.3.0
 
@@ -54,8 +54,8 @@ SRC := src/endpoint.c src/connection.c src/channel.c src/seqbuf.c \
        src/fragment.c src/crypto.c src/util.c src/websocket.c
 OBJ := $(SRC:src/%.c=$(BUILD_DIR)/%.o)
 
-STATIC_LIB := $(BUILD_DIR)/libnetlink.a
-SHARED_LIB := $(BUILD_DIR)/libnetlink.so
+STATIC_LIB := $(BUILD_DIR)/libweft_net.a
+SHARED_LIB := $(BUILD_DIR)/libweft_net.so
 
 INCLUDES := -Iinclude -Isrc $(CRYPTO_CFLAGS)
 LIBS := $(CRYPTO_LIBS) -lpthread
@@ -94,7 +94,7 @@ test: all test-unit test-integration
 # stderr visible so failures are readable instead of silenced.
 test-bindings: all
 	@echo "--- Python binding tests ---"
-	cd bindings/python && NETLINK_LIBRARY_PATH=../../build/libnetlink.so \
+	cd bindings/python && WEFT_NET_LIBRARY_PATH=../../build/libweft_net.so \
 		sh -c 'if python3 -m pytest --version >/dev/null 2>&1; then python3 -m pytest tests/ -v; else python3 tests/test_python_bindings.py; fi'
 	@echo "--- Go binding tests ---"
 	cd bindings/go && test -z "$$(gofmt -l .)"
@@ -139,9 +139,9 @@ test-integration: | $(BUILD_DIR)
 # pending tables). These are built with ThreadSanitizer instead -- TSan and
 # ASan cannot be combined in one binary.
 TSAN_DIR := $(BUILD_DIR)/tsan
-# NL_TEST_NO_LONGJMP: TSan cannot follow setjmp/longjmp (it aborts with "can't
+# WN_TEST_NO_LONGJMP: TSan cannot follow setjmp/longjmp (it aborts with "can't
 # find longjmp buf"), so the harness exits on the first failure instead.
-TSAN_CFLAGS := $(CFLAGS) -g -O1 -fsanitize=thread -DNL_TEST_NO_LONGJMP $(INCLUDES)
+TSAN_CFLAGS := $(CFLAGS) -g -O1 -fsanitize=thread -DWN_TEST_NO_LONGJMP $(INCLUDES)
 TSAN_SUPPRESSIONS := tests/tsan.supp
 
 .PHONY: test-tsan
@@ -171,38 +171,38 @@ clean:
 PREFIX ?= /usr/local
 PKGCONFIG_DIR ?= $(PREFIX)/lib/pkgconfig
 
-# pkg-config file for downstream consumers (`pkg-config --cflags --libs netlink`).
-$(BUILD_DIR)/netlink.pc: | $(BUILD_DIR)
+# pkg-config file for downstream consumers (`pkg-config --cflags --libs weft-net`).
+$(BUILD_DIR)/weft_net.pc: | $(BUILD_DIR)
 	@echo "prefix=$(PREFIX)"                    > $@
 	@echo "exec_prefix=\$${prefix}"            >> $@
 	@echo "libdir=\$${exec_prefix}/lib"        >> $@
 	@echo "includedir=\$${prefix}/include"     >> $@
 	@echo ""                                   >> $@
-	@echo "Name: netlink"                      >> $@
+	@echo "Name: weft-net"                      >> $@
 	@echo "Description: Secure UDP/WebSocket networking library" >> $@
 	@echo "Version: $(VERSION)"                 >> $@
-	@echo "Libs: -L\$${libdir} -lnetlink"      >> $@
+	@echo "Libs: -L\$${libdir} -lweft_net"      >> $@
 	@echo "Libs.private: -lcrypto -lpthread"   >> $@
 	@echo "Cflags: -I\$${includedir}"          >> $@
 
-install: all $(BUILD_DIR)/netlink.pc
+install: all $(BUILD_DIR)/weft_net.pc
 	install -d $(PREFIX)/lib $(PREFIX)/include $(PKGCONFIG_DIR)
 	install -m 644 $(STATIC_LIB) $(SHARED_LIB) $(PREFIX)/lib/
-	install -m 644 include/netlink.h $(PREFIX)/include/
-	install -m 644 $(BUILD_DIR)/netlink.pc $(PKGCONFIG_DIR)/
+	install -m 644 include/weft_net.h $(PREFIX)/include/
+	install -m 644 $(BUILD_DIR)/weft_net.pc $(PKGCONFIG_DIR)/
 
 # Self-contained tarball of everything a downstream project needs: header,
 # static + shared libraries, pkg-config file, license, README, examples.
-dist: all $(BUILD_DIR)/netlink.pc
+dist: all $(BUILD_DIR)/weft_net.pc
 	rm -rf $(BUILD_DIR)/dist
-	mkdir -p $(BUILD_DIR)/dist/netlink-$(VERSION)/include
-	mkdir -p $(BUILD_DIR)/dist/netlink-$(VERSION)/lib
-	mkdir -p $(BUILD_DIR)/dist/netlink-$(VERSION)/lib/pkgconfig
-	mkdir -p $(BUILD_DIR)/dist/netlink-$(VERSION)/examples
-	cp include/netlink.h $(BUILD_DIR)/dist/netlink-$(VERSION)/include/
-	cp $(STATIC_LIB) $(SHARED_LIB) $(BUILD_DIR)/dist/netlink-$(VERSION)/lib/
-	cp $(BUILD_DIR)/netlink.pc $(BUILD_DIR)/dist/netlink-$(VERSION)/lib/pkgconfig/
-	cp LICENSE README.md $(BUILD_DIR)/dist/netlink-$(VERSION)/
-	cp examples/echo_server.c examples/echo_client.c $(BUILD_DIR)/dist/netlink-$(VERSION)/examples/
-	tar -C $(BUILD_DIR)/dist -czf $(BUILD_DIR)/netlink-$(VERSION).tar.gz netlink-$(VERSION)
-	@echo "Created $(BUILD_DIR)/netlink-$(VERSION).tar.gz"
+	mkdir -p $(BUILD_DIR)/dist/weft-net-$(VERSION)/include
+	mkdir -p $(BUILD_DIR)/dist/weft-net-$(VERSION)/lib
+	mkdir -p $(BUILD_DIR)/dist/weft-net-$(VERSION)/lib/pkgconfig
+	mkdir -p $(BUILD_DIR)/dist/weft-net-$(VERSION)/examples
+	cp include/weft_net.h $(BUILD_DIR)/dist/weft-net-$(VERSION)/include/
+	cp $(STATIC_LIB) $(SHARED_LIB) $(BUILD_DIR)/dist/weft-net-$(VERSION)/lib/
+	cp $(BUILD_DIR)/weft_net.pc $(BUILD_DIR)/dist/weft-net-$(VERSION)/lib/pkgconfig/
+	cp LICENSE README.md $(BUILD_DIR)/dist/weft-net-$(VERSION)/
+	cp examples/echo_server.c examples/echo_client.c $(BUILD_DIR)/dist/weft-net-$(VERSION)/examples/
+	tar -C $(BUILD_DIR)/dist -czf $(BUILD_DIR)/weft-net-$(VERSION).tar.gz weft-net-$(VERSION)
+	@echo "Created $(BUILD_DIR)/weft-net-$(VERSION).tar.gz"

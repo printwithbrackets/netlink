@@ -1,12 +1,12 @@
 [package]
-name = "netlink-rs"
+name = "weft-net-rs"
 version = "1.3.0"
 edition = "2021"
-description = "Rust bindings for the NetLink secure UDP networking library"
+description = "Rust bindings for the weft-net secure UDP networking library"
 license = "MIT"
 
 [lib]
-name = "netlink"
+name = "weft_net"
 path = "src/lib.rs"
 
 [build-dependencies]

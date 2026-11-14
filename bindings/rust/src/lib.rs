@@ -1,17 +1,17 @@
-//! Rust bindings for the NetLink C library.
+//! Rust bindings for the weft-net C library.
 //!
-//! Thin wrapper over the stable C ABI (`include/netlink.h`); covered by
+//! Thin wrapper over the stable C ABI (`include/weft_net.h`); covered by
 //! real-socket tests (`cargo test`).
 //!
 //! # Example
 //! ```no_run
-//! use netlink::{Client, Config};
+//! use weft_net::{Client, Config};
 //! use std::time::Duration;
 //!
 //! let mut client = Client::new(Config::default()).unwrap();
 //! let peer = client.connect("127.0.0.1", 9000).unwrap();
 //! let event = client.wait_connected(Duration::from_secs(5)).unwrap();
-//! client.send(peer, 0, netlink::Delivery::ReliableOrdered, b"hello").unwrap();
+//! client.send(peer, 0, weft_net::Delivery::ReliableOrdered, b"hello").unwrap();
 //! ```
 
 use std::ffi::{CStr, CString};
@@ -22,17 +22,17 @@ use std::time::{Duration, Instant};
 mod raw {
     use std::os::raw::{c_char, c_int};
 
-    pub const NL_OK: c_int = 0;
-    pub const NL_SERVER_NAME_MAX: usize = 64;
+    pub const WN_OK: c_int = 0;
+    pub const WN_SERVER_NAME_MAX: usize = 64;
 
     #[repr(C)]
-    pub struct nl_endpoint_t {
+    pub struct wn_endpoint_t {
         _private: [u8; 0],
     }
 
     #[repr(C)]
     #[derive(Clone, Copy)]
-    pub struct nl_address_t {
+    pub struct wn_address_t {
         pub host: [c_char; 64],
         pub port: u16,
         pub family: c_int,
@@ -40,7 +40,7 @@ mod raw {
 
     #[repr(C)]
     #[derive(Clone, Copy)]
-    pub struct nl_config_t {
+    pub struct wn_config_t {
         pub transport: c_int,
         pub family: c_int,
         pub channel_count: u8,
@@ -49,7 +49,7 @@ mod raw {
         pub keepalive_interval_ms: u32,
         pub encryption_enabled: bool,
         pub server_name: *const c_char,
-        // Fields added with protocol v2 (keep in sync with nl_config_t).
+        // Fields added with protocol v2 (keep in sync with wn_config_t).
         pub max_send_bytes_per_sec: u32,
         pub recv_window_bytes: u32,
         pub event_queue_max_bytes: u32,
@@ -58,51 +58,51 @@ mod raw {
 
     #[repr(C)]
     #[derive(Clone, Copy)]
-    pub struct nl_event_t {
+    pub struct wn_event_t {
         pub event_type: c_int,
         pub peer: u64,
         pub channel: u8,
         pub data: *const u8,
         pub data_len: usize,
         pub disconnect_reason: c_int,
-        pub from_address: nl_address_t,
-        pub server_name: [c_char; NL_SERVER_NAME_MAX],
+        pub from_address: wn_address_t,
+        pub server_name: [c_char; WN_SERVER_NAME_MAX],
         pub server_player_count: u32,
         pub server_max_players: u32,
     }
 
     extern "C" {
-        pub fn nl_version_string() -> *const c_char;
-        pub fn nl_error_string(code: c_int) -> *const c_char;
-        pub fn nl_config_default(cfg: *mut nl_config_t);
+        pub fn wn_version_string() -> *const c_char;
+        pub fn wn_error_string(code: c_int) -> *const c_char;
+        pub fn wn_config_default(cfg: *mut wn_config_t);
 
-        pub fn nl_server_create(
-            bind_addr: *const nl_address_t,
-            cfg: *const nl_config_t,
-            out_endpoint: *mut *mut nl_endpoint_t,
+        pub fn wn_server_create(
+            bind_addr: *const wn_address_t,
+            cfg: *const wn_config_t,
+            out_endpoint: *mut *mut wn_endpoint_t,
         ) -> c_int;
-        pub fn nl_client_create(
-            cfg: *const nl_config_t,
-            out_endpoint: *mut *mut nl_endpoint_t,
+        pub fn wn_client_create(
+            cfg: *const wn_config_t,
+            out_endpoint: *mut *mut wn_endpoint_t,
         ) -> c_int;
-        pub fn nl_connect(
-            ep: *mut nl_endpoint_t,
-            server_addr: *const nl_address_t,
+        pub fn wn_connect(
+            ep: *mut wn_endpoint_t,
+            server_addr: *const wn_address_t,
             out_peer: *mut u64,
         ) -> c_int;
-        pub fn nl_disconnect(ep: *mut nl_endpoint_t, peer: u64) -> c_int;
-        pub fn nl_endpoint_destroy(ep: *mut nl_endpoint_t);
+        pub fn wn_disconnect(ep: *mut wn_endpoint_t, peer: u64) -> c_int;
+        pub fn wn_endpoint_destroy(ep: *mut wn_endpoint_t);
 
-        pub fn nl_send(
-            ep: *mut nl_endpoint_t,
+        pub fn wn_send(
+            ep: *mut wn_endpoint_t,
             peer: u64,
             channel: u8,
             delivery: c_int,
             data: *const u8,
             len: usize,
         ) -> c_int;
-        pub fn nl_send_ex(
-            ep: *mut nl_endpoint_t,
+        pub fn wn_send_ex(
+            ep: *mut wn_endpoint_t,
             peer: u64,
             channel: u8,
             delivery: c_int,
@@ -110,28 +110,28 @@ mod raw {
             len: usize,
             priority: u8,
         ) -> c_int;
-        pub fn nl_poll_event(
-            ep: *mut nl_endpoint_t,
-            out: *mut nl_event_t,
+        pub fn wn_poll_event(
+            ep: *mut wn_endpoint_t,
+            out: *mut wn_event_t,
             timeout_ms: c_int,
         ) -> bool;
 
-        pub fn nl_discovery_enable(ep: *mut nl_endpoint_t, discovery_port: u16) -> c_int;
-        pub fn nl_discovery_probe(
-            ep: *mut nl_endpoint_t,
+        pub fn wn_discovery_enable(ep: *mut wn_endpoint_t, discovery_port: u16) -> c_int;
+        pub fn wn_discovery_probe(
+            ep: *mut wn_endpoint_t,
             discovery_port: u16,
             timeout_ms: c_int,
         ) -> c_int;
 
-        pub fn nl_peer_rtt_ms(ep: *mut nl_endpoint_t, peer: u64) -> u32;
-        pub fn nl_peer_count(ep: *mut nl_endpoint_t) -> u32;
-        pub fn nl_peer_stats(ep: *mut nl_endpoint_t, peer: u64, out: *mut nl_peer_stats_t) -> bool;
-        pub fn nl_peer_capabilities(ep: *mut nl_endpoint_t, peer: u64, out: *mut u32) -> bool;
+        pub fn wn_peer_rtt_ms(ep: *mut wn_endpoint_t, peer: u64) -> u32;
+        pub fn wn_peer_count(ep: *mut wn_endpoint_t) -> u32;
+        pub fn wn_peer_stats(ep: *mut wn_endpoint_t, peer: u64, out: *mut wn_peer_stats_t) -> bool;
+        pub fn wn_peer_capabilities(ep: *mut wn_endpoint_t, peer: u64, out: *mut u32) -> bool;
     }
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug)]
-    pub struct nl_peer_stats_t {
+    pub struct wn_peer_stats_t {
         pub packets_sent: u64,
         pub packets_received: u64,
         pub bytes_sent: u64,
@@ -180,7 +180,7 @@ impl EventType {
 /// A peer connection identifier, valid within the endpoint that produced it.
 pub type PeerId = u64;
 
-/// Send priorities for `send_ex` (mirrors `NL_PRIORITY_*`).
+/// Send priorities for `send_ex` (mirrors `WN_PRIORITY_*`).
 pub mod priority {
     pub const LOW: u8 = 0;
     pub const NORMAL: u8 = 64;
@@ -188,14 +188,14 @@ pub mod priority {
     pub const CRITICAL: u8 = 192;
 }
 
-/// Capability bits negotiated in the handshake (mirrors `NL_CAP_*`).
+/// Capability bits negotiated in the handshake (mirrors `WN_CAP_*`).
 pub mod caps {
     pub const FLOW_CONTROL: u32 = 0x0000_0001;
     pub const PRIORITY: u32 = 0x0000_0002;
     pub const RATE_LIMIT: u32 = 0x0000_0004;
 }
 
-/// Snapshot of per-peer counters and RTT estimates (`nl_peer_stats`).
+/// Snapshot of per-peer counters and RTT estimates (`wn_peer_stats`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PeerStats {
     pub packets_sent: u64,
@@ -209,40 +209,40 @@ pub struct PeerStats {
     pub rto_ms: u32,
 }
 
-/// An error returned by the underlying library (a non-OK `nl_result_t`).
+/// An error returned by the underlying library (a non-OK `wn_result_t`).
 #[derive(Debug, Clone)]
-pub struct NetLinkError {
+pub struct WeftNetError {
     pub code: i32,
     pub message: String,
 }
 
-impl std::fmt::Display for NetLinkError {
+impl std::fmt::Display for WeftNetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "netlink error {}: {}", self.code, self.message)
+        write!(f, "weft-net error {}: {}", self.code, self.message)
     }
 }
-impl std::error::Error for NetLinkError {}
+impl std::error::Error for WeftNetError {}
 
-fn check(code: c_int) -> Result<(), NetLinkError> {
-    if code == raw::NL_OK {
+fn check(code: c_int) -> Result<(), WeftNetError> {
+    if code == raw::WN_OK {
         Ok(())
     } else {
         let msg = unsafe {
-            let ptr = raw::nl_error_string(code);
+            let ptr = raw::wn_error_string(code);
             if ptr.is_null() {
                 "unknown error".to_string()
             } else {
                 CStr::from_ptr(ptr).to_string_lossy().into_owned()
             }
         };
-        Err(NetLinkError {
+        Err(WeftNetError {
             code: code as i32,
             message: msg,
         })
     }
 }
 
-/// Transport selection (mirrors `nl_transport_t`).
+/// Transport selection (mirrors `wn_transport_t`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
     Udp = 0,
@@ -250,7 +250,7 @@ pub enum Transport {
 }
 
 /// Endpoint configuration. Use `Config::default()` for the library's
-/// defaults (via `nl_config_default`: 4 channels, 64 max connections,
+/// defaults (via `wn_config_default`: 4 channels, 64 max connections,
 /// 10s idle timeout, 1s keepalive, encryption on, plus transport/window/
 /// capabilities).
 #[derive(Debug, Clone)]
@@ -266,16 +266,16 @@ pub struct Config {
     pub max_send_bytes_per_sec: u32,
     pub recv_window_bytes: u32,
     /// Global byte cap on queued event payloads; 0 = library default
-    /// (NL_EVENT_QUEUE_MAX_BYTES_DEFAULT), 0xFFFFFFFF = unlimited.
+    /// (WN_EVENT_QUEUE_MAX_BYTES_DEFAULT), 0xFFFFFFFF = unlimited.
     pub event_queue_max_bytes: u32,
     pub capabilities: u32,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        let mut raw_cfg = std::mem::MaybeUninit::<raw::nl_config_t>::uninit();
+        let mut raw_cfg = std::mem::MaybeUninit::<raw::wn_config_t>::uninit();
         unsafe {
-            raw::nl_config_default(raw_cfg.as_mut_ptr());
+            raw::wn_config_default(raw_cfg.as_mut_ptr());
             let raw_cfg = raw_cfg.assume_init();
             Config {
                 channel_count: raw_cfg.channel_count,
@@ -300,10 +300,10 @@ impl Default for Config {
 }
 
 impl Config {
-    fn to_raw(&self, name_storage: &mut Option<CString>) -> raw::nl_config_t {
+    fn to_raw(&self, name_storage: &mut Option<CString>) -> raw::wn_config_t {
         let mut raw_cfg = unsafe {
-            let mut c = std::mem::MaybeUninit::<raw::nl_config_t>::uninit();
-            raw::nl_config_default(c.as_mut_ptr());
+            let mut c = std::mem::MaybeUninit::<raw::wn_config_t>::uninit();
+            raw::wn_config_default(c.as_mut_ptr());
             c.assume_init()
         };
         raw_cfg.channel_count = self.channel_count;
@@ -320,7 +320,7 @@ impl Config {
         if let Some(name) = &self.server_name {
             let cstr = CString::new(name.as_str()).unwrap_or_default();
             raw_cfg.server_name = cstr.as_ptr();
-            *name_storage = Some(cstr); // keep alive until nl_server_create returns
+            *name_storage = Some(cstr); // keep alive until wn_server_create returns
         }
         raw_cfg
     }
@@ -331,17 +331,17 @@ fn clamp_timeout_ms(timeout: Duration) -> c_int {
     ms
 }
 
-fn make_address(host: &str, port: u16) -> Result<raw::nl_address_t, NetLinkError> {
+fn make_address(host: &str, port: u16) -> Result<raw::wn_address_t, WeftNetError> {
     if host.len() >= 64 {
-        return Err(NetLinkError {
+        return Err(WeftNetError {
             code: -1,
             message: "invalid argument".to_string(),
         });
     }
-    let mut addr = raw::nl_address_t {
+    let mut addr = raw::wn_address_t {
         host: [0 as c_char; 64],
         port,
-        family: 0, // NL_AF_UNSPEC
+        family: 0, // WN_AF_UNSPEC
     };
     let bytes = host.as_bytes();
     let n = bytes.len().min(addr.host.len() - 1);
@@ -359,7 +359,7 @@ pub struct Event {
     pub peer: PeerId,
     pub channel: u8,
     pub data: Vec<u8>,
-    pub disconnect_reason: Option<NetLinkError>,
+    pub disconnect_reason: Option<WeftNetError>,
     pub from_host: String,
     pub from_port: u16,
     pub server_name: String,
@@ -367,7 +367,7 @@ pub struct Event {
     pub server_max_players: u32,
 }
 
-fn event_from_raw(raw_ev: &raw::nl_event_t) -> Event {
+fn event_from_raw(raw_ev: &raw::wn_event_t) -> Event {
     let data = if !raw_ev.data.is_null() && raw_ev.data_len > 0 {
         unsafe { std::slice::from_raw_parts(raw_ev.data, raw_ev.data_len).to_vec() }
     } else {
@@ -379,7 +379,7 @@ fn event_from_raw(raw_ev: &raw::nl_event_t) -> Event {
     let server_name = unsafe { CStr::from_ptr(raw_ev.server_name.as_ptr()) }
         .to_string_lossy()
         .into_owned();
-    let disconnect_reason = if raw_ev.disconnect_reason != raw::NL_OK {
+    let disconnect_reason = if raw_ev.disconnect_reason != raw::WN_OK {
         check(raw_ev.disconnect_reason).err()
     } else {
         None
@@ -400,10 +400,10 @@ fn event_from_raw(raw_ev: &raw::nl_event_t) -> Event {
 
 /// Shared functionality between `Server` and `Client`.
 pub struct Endpoint {
-    handle: *mut raw::nl_endpoint_t,
+    handle: *mut raw::wn_endpoint_t,
 }
 
-// The underlying C endpoint is internally thread-safe (see include/netlink.h);
+// The underlying C endpoint is internally thread-safe (see include/weft_net.h);
 // it's sound to share/move handles across Rust threads.
 //
 // `poll_event` copies the borrowed payload into an owned `Vec` before
@@ -423,14 +423,14 @@ impl Endpoint {
         channel: u8,
         delivery: Delivery,
         data: &[u8],
-    ) -> Result<(), NetLinkError> {
+    ) -> Result<(), WeftNetError> {
         let ptr = if data.is_empty() {
             std::ptr::null()
         } else {
             data.as_ptr()
         };
         let res = unsafe {
-            raw::nl_send(
+            raw::wn_send(
                 self.handle,
                 peer,
                 channel,
@@ -452,14 +452,14 @@ impl Endpoint {
         delivery: Delivery,
         data: &[u8],
         priority: u8,
-    ) -> Result<(), NetLinkError> {
+    ) -> Result<(), WeftNetError> {
         let ptr = if data.is_empty() {
             std::ptr::null()
         } else {
             data.as_ptr()
         };
         let res = unsafe {
-            raw::nl_send_ex(
+            raw::wn_send_ex(
                 self.handle,
                 peer,
                 channel,
@@ -480,9 +480,9 @@ impl Endpoint {
     /// borrows to this thread), so it stays valid after the next
     /// `poll_event` call.
     pub fn poll_event(&self, timeout: Duration) -> Option<Event> {
-        let mut raw_ev = unsafe { std::mem::zeroed::<raw::nl_event_t>() };
+        let mut raw_ev = unsafe { std::mem::zeroed::<raw::wn_event_t>() };
         let ms = clamp_timeout_ms(timeout);
-        let got = unsafe { raw::nl_poll_event(self.handle, &mut raw_ev, ms) };
+        let got = unsafe { raw::wn_poll_event(self.handle, &mut raw_ev, ms) };
         if got {
             Some(event_from_raw(&raw_ev))
         } else {
@@ -491,23 +491,23 @@ impl Endpoint {
     }
 
     /// Gracefully close a connection.
-    pub fn disconnect(&self, peer: PeerId) -> Result<(), NetLinkError> {
-        check(unsafe { raw::nl_disconnect(self.handle, peer) })
+    pub fn disconnect(&self, peer: PeerId) -> Result<(), WeftNetError> {
+        check(unsafe { raw::wn_disconnect(self.handle, peer) })
     }
 
     pub fn peer_rtt_ms(&self, peer: PeerId) -> u32 {
-        unsafe { raw::nl_peer_rtt_ms(self.handle, peer) }
+        unsafe { raw::wn_peer_rtt_ms(self.handle, peer) }
     }
 
     pub fn peer_count(&self) -> u32 {
-        unsafe { raw::nl_peer_count(self.handle) }
+        unsafe { raw::wn_peer_count(self.handle) }
     }
 
     /// Snapshot of per-peer counters and RTT estimates. Returns `None`
     /// if `peer` is not a currently-known connection.
     pub fn peer_stats(&self, peer: PeerId) -> Option<PeerStats> {
-        let mut raw_stats = unsafe { std::mem::zeroed::<raw::nl_peer_stats_t>() };
-        let ok = unsafe { raw::nl_peer_stats(self.handle, peer, &mut raw_stats) };
+        let mut raw_stats = unsafe { std::mem::zeroed::<raw::wn_peer_stats_t>() };
+        let ok = unsafe { raw::wn_peer_stats(self.handle, peer, &mut raw_stats) };
         if !ok {
             return None;
         }
@@ -524,11 +524,11 @@ impl Endpoint {
         })
     }
 
-    /// Negotiated `NL_CAP_*` bitmask with this peer. Returns `None` if
+    /// Negotiated `WN_CAP_*` bitmask with this peer. Returns `None` if
     /// `peer` is not a currently-known connection.
     pub fn peer_capabilities(&self, peer: PeerId) -> Option<u32> {
         let mut caps: u32 = 0;
-        let ok = unsafe { raw::nl_peer_capabilities(self.handle, peer, &mut caps) };
+        let ok = unsafe { raw::wn_peer_capabilities(self.handle, peer, &mut caps) };
         if ok {
             Some(caps)
         } else {
@@ -540,7 +540,7 @@ impl Endpoint {
 impl Drop for Endpoint {
     fn drop(&mut self) {
         if !self.handle.is_null() {
-            unsafe { raw::nl_endpoint_destroy(self.handle) };
+            unsafe { raw::wn_endpoint_destroy(self.handle) };
             self.handle = std::ptr::null_mut();
         }
     }
@@ -560,12 +560,12 @@ impl std::ops::Deref for Server {
 
 impl Server {
     /// Bind to `host:port` and start accepting connections in a background thread.
-    pub fn new(host: &str, port: u16, config: Config) -> Result<Self, NetLinkError> {
+    pub fn new(host: &str, port: u16, config: Config) -> Result<Self, WeftNetError> {
         let addr = make_address(host, port)?;
         let mut name_storage = None;
         let raw_cfg = config.to_raw(&mut name_storage);
-        let mut handle: *mut raw::nl_endpoint_t = std::ptr::null_mut();
-        let res = unsafe { raw::nl_server_create(&addr, &raw_cfg, &mut handle) };
+        let mut handle: *mut raw::wn_endpoint_t = std::ptr::null_mut();
+        let res = unsafe { raw::wn_server_create(&addr, &raw_cfg, &mut handle) };
         check(res)?;
         Ok(Server {
             inner: Endpoint { handle },
@@ -573,8 +573,8 @@ impl Server {
     }
 
     /// Start responding to LAN discovery broadcasts on `discovery_port`.
-    pub fn enable_discovery(&self, discovery_port: u16) -> Result<(), NetLinkError> {
-        check(unsafe { raw::nl_discovery_enable(self.inner.handle, discovery_port) })
+    pub fn enable_discovery(&self, discovery_port: u16) -> Result<(), WeftNetError> {
+        check(unsafe { raw::wn_discovery_enable(self.inner.handle, discovery_port) })
     }
 }
 
@@ -591,11 +591,11 @@ impl std::ops::Deref for Client {
 }
 
 impl Client {
-    pub fn new(config: Config) -> Result<Self, NetLinkError> {
+    pub fn new(config: Config) -> Result<Self, WeftNetError> {
         let mut name_storage = None;
         let raw_cfg = config.to_raw(&mut name_storage);
-        let mut handle: *mut raw::nl_endpoint_t = std::ptr::null_mut();
-        let res = unsafe { raw::nl_client_create(&raw_cfg, &mut handle) };
+        let mut handle: *mut raw::wn_endpoint_t = std::ptr::null_mut();
+        let res = unsafe { raw::wn_client_create(&raw_cfg, &mut handle) };
         check(res)?;
         Ok(Client {
             inner: Endpoint { handle },
@@ -605,25 +605,25 @@ impl Client {
     /// Begin connecting to `host:port`. Returns immediately with the peer
     /// id that will identify this connection; wait for `Connected` (or
     /// `ConnectFailed`) via `poll_event` or `wait_connected`.
-    pub fn connect(&mut self, host: &str, port: u16) -> Result<PeerId, NetLinkError> {
+    pub fn connect(&mut self, host: &str, port: u16) -> Result<PeerId, WeftNetError> {
         let addr = make_address(host, port)?;
         let mut peer: u64 = 0;
-        let res = unsafe { raw::nl_connect(self.inner.handle, &addr, &mut peer) };
+        let res = unsafe { raw::wn_connect(self.inner.handle, &addr, &mut peer) };
         check(res)?;
         Ok(peer)
     }
 
     /// Broadcast a LAN discovery probe; replies arrive as `DiscoveryReply`
     /// events over subsequent `poll_event` calls.
-    pub fn probe_lan(&self, discovery_port: u16, timeout: Duration) -> Result<(), NetLinkError> {
+    pub fn probe_lan(&self, discovery_port: u16, timeout: Duration) -> Result<(), WeftNetError> {
         check(unsafe {
-            raw::nl_discovery_probe(self.inner.handle, discovery_port, clamp_timeout_ms(timeout))
+            raw::wn_discovery_probe(self.inner.handle, discovery_port, clamp_timeout_ms(timeout))
         })
     }
 
     /// Block (polling internally) until the connection succeeds or fails,
     /// or `timeout` elapses.
-    pub fn wait_connected(&self, timeout: Duration) -> Result<Event, NetLinkError> {
+    pub fn wait_connected(&self, timeout: Duration) -> Result<Event, WeftNetError> {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if let Some(ev) = self.inner.poll_event(Duration::from_millis(100)) {
@@ -634,7 +634,7 @@ impl Client {
                 }
             }
         }
-        Err(NetLinkError {
+        Err(WeftNetError {
             code: -12,
             message: "timed out waiting to connect".to_string(),
         })
@@ -644,7 +644,7 @@ impl Client {
 /// Returns the library's version string (e.g. "1.3.0").
 pub fn version() -> String {
     unsafe {
-        CStr::from_ptr(raw::nl_version_string())
+        CStr::from_ptr(raw::wn_version_string())
             .to_string_lossy()
             .into_owned()
     }

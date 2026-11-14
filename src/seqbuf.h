@@ -5,31 +5,31 @@
  * wrap of the 16-bit sequence space are detected instead of misread as
  * live data:
  *
- *   nl_send_ring_t    - unacked outgoing packets, kept around for
+ *   wn_send_ring_t    - unacked outgoing packets, kept around for
  *                        retransmission until acked or given up on.
- *   nl_recv_dedupe_t  - lightweight "have I seen sequence N" tracker,
- *                        also produces the NL_ACK_WINDOW_BITS-bit ack
+ *   wn_recv_dedupe_t  - lightweight "have I seen sequence N" tracker,
+ *                        also produces the WN_ACK_WINDOW_BITS-bit ack
  *                        bitfield we piggyback on outgoing packets.
- *   nl_reorder_ring_t - buffers reliable packets that arrived ahead of the
+ *   wn_reorder_ring_t - buffers reliable packets that arrived ahead of the
  *                        next expected in-order sequence, for channels
- *                        using NL_RELIABLE_ORDERED.
+ *                        using WN_RELIABLE_ORDERED.
  *
  * All sequence numbers are uint16_t and wrap at 65536. Comparisons use
- * nl_seq_greater_than(), which handles wraparound correctly as long as the
+ * wn_seq_greater_than(), which handles wraparound correctly as long as the
  * two sequences being compared are never more than 32768 apart (true in
  * practice: the ring buffer size bounds how far sender/receiver can drift).
  */
-#ifndef NETLINK_SEQBUF_H
-#define NETLINK_SEQBUF_H
+#ifndef WEFT_NET_SEQBUF_H
+#define WEFT_NET_SEQBUF_H
 
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
-#include "../include/netlink.h" /* NL_MAX_PACKET_SIZE */
+#include "../include/weft_net.h" /* WN_MAX_PACKET_SIZE */
 
-#define NL_MAX_PACKET_SIZE_INTERNAL NL_MAX_PACKET_SIZE
-#define NL_SEQ_RING_SIZE 256 /* must be a power of two */
-#define NL_SEQ_RING_MASK (NL_SEQ_RING_SIZE - 1)
+#define WN_MAX_PACKET_SIZE_INTERNAL WN_MAX_PACKET_SIZE
+#define WN_SEQ_RING_SIZE 256 /* must be a power of two */
+#define WN_SEQ_RING_MASK (WN_SEQ_RING_SIZE - 1)
 /* How many sequences below the receiver's newest one an ack can name.
  * This is the ack bitmap's width, and therefore the hard ceiling on how
  * many reliable packets may be in flight: a still-unacked sequence that
@@ -41,9 +41,9 @@
  * 64 rather than 32 so a comfortable window is nameable without making the
  * in-flight ceiling the binding constraint on throughput; the send ring is
  * 256 deep, so the receiver's tracking comfortably covers it. */
-#define NL_ACK_WINDOW_BITS 64
+#define WN_ACK_WINDOW_BITS 64
 
-static inline bool nl_seq_greater_than(uint16_t s1, uint16_t s2) {
+static inline bool wn_seq_greater_than(uint16_t s1, uint16_t s2) {
     /* Standard signed-wraparound sequence comparison (Fiedler-style). */
     return ((s1 > s2) && (uint16_t)(s1 - s2) <= 32768) ||
            ((s1 < s2) && (uint16_t)(s2 - s1) > 32768);
@@ -59,35 +59,35 @@ typedef struct {
     uint64_t send_time_ms;
     uint32_t retry_count;
     /* This slot has already been fast-retransmitted once and is waiting to
-     * be acked. Cleared by ack_one(); set by nl_send_ring_fast_retransmit.
+     * be acked. Cleared by ack_one(); set by wn_send_ring_fast_retransmit.
      * Without it, every inbound packet whose ack horizon is far enough
      * ahead re-fires a retransmit for the same hole. */
     bool     fast_retx_done;
-    uint8_t  data[NL_MAX_PACKET_SIZE_INTERNAL];
-} nl_send_slot_t;
+    uint8_t  data[WN_MAX_PACKET_SIZE_INTERNAL];
+} wn_send_slot_t;
 
 typedef struct {
-    nl_send_slot_t *slots; /* heap allocated, NL_SEQ_RING_SIZE entries */
+    wn_send_slot_t *slots; /* heap allocated, WN_SEQ_RING_SIZE entries */
     uint16_t next_sequence;
     uint16_t unacked_count; /* valid && !acked slots; maintained by insert/ack
                              * so congestion control can gate on in-flight
                              * packets without rescanning the ring */
-} nl_send_ring_t;
+} wn_send_ring_t;
 
-int  nl_send_ring_init(nl_send_ring_t *ring);
-void nl_send_ring_free(nl_send_ring_t *ring);
-/* Bits in the ack bitmap (NL_ACK_WINDOW_BITS), so callers don't repeat the
+int  wn_send_ring_init(wn_send_ring_t *ring);
+void wn_send_ring_free(wn_send_ring_t *ring);
+/* Bits in the ack bitmap (WN_ACK_WINDOW_BITS), so callers don't repeat the
  * width as a literal at each call site. */
-typedef uint64_t nl_ack_bits_t;
+typedef uint64_t wn_ack_bits_t;
 
 /* Insert data at `next_sequence`, return the sequence used, and advance.
  * Returns false if len exceeds the max slot size, or if the target slot
  * still holds a live unacked packet (never overwrite un-retransmittable
  * state -- see seqbuf.c). */
-bool nl_send_ring_insert(nl_send_ring_t *ring, const uint8_t *data, uint16_t len,
+bool wn_send_ring_insert(wn_send_ring_t *ring, const uint8_t *data, uint16_t len,
                           uint64_t now_ms, uint16_t *out_seq);
 /* Mark `sequence` (and, per the ack-bitfield convention, the
- * NL_ACK_WINDOW_BITS preceding sequences whose corresponding bit is set in
+ * WN_ACK_WINDOW_BITS preceding sequences whose corresponding bit is set in
  * ack_bits) as acked.
  *
  * If the exact `ack` sequence was newly acked by this call (not already
@@ -110,7 +110,7 @@ bool nl_send_ring_insert(nl_send_ring_t *ring, const uint8_t *data, uint16_t len
  * *out_has_rtt_sample is left false when `now_ms` precedes the slot's
  * send_time_ms: an RTT sample is a duration, and a backwards clock reading
  * cannot produce one. The slot is still marked acked. */
-void nl_send_ring_ack(nl_send_ring_t *ring, uint16_t ack, nl_ack_bits_t ack_bits, uint64_t now_ms,
+void wn_send_ring_ack(wn_send_ring_t *ring, uint16_t ack, wn_ack_bits_t ack_bits, uint64_t now_ms,
                        bool *out_has_rtt_sample, uint32_t *out_rtt_sample_ms,
                        uint32_t *out_newly_acked);
 
@@ -130,51 +130,51 @@ void nl_send_ring_ack(nl_send_ring_t *ring, uint16_t ack, nl_ack_bits_t ack_bits
  *
  * Whether a candidate slot is itself already acked is re-derived directly
  * from (ack, ack_bits) rather than solely trusted from slot->acked, so
- * this gives correct results independent of whether nl_send_ring_ack was
+ * this gives correct results independent of whether wn_send_ring_ack was
  * called first with these same values (real callers always do both
  * together with one incoming packet's ack/ack_bits, but correctness here
  * doesn't depend on that ordering). */
-typedef void (*nl_fast_retransmit_fn)(void *ctx, uint16_t sequence);
-void nl_send_ring_fast_retransmit(nl_send_ring_t *ring, uint16_t ack, nl_ack_bits_t ack_bits,
+typedef void (*wn_fast_retransmit_fn)(void *ctx, uint16_t sequence);
+void wn_send_ring_fast_retransmit(wn_send_ring_t *ring, uint16_t ack, wn_ack_bits_t ack_bits,
                                    uint32_t reorder_threshold, uint64_t now_ms,
-                                   nl_fast_retransmit_fn emit, void *ctx);
+                                   wn_fast_retransmit_fn emit, void *ctx);
 /* Look up an entry by exact sequence, for a caller that wants to inspect it
  * (e.g. retransmission scan). Returns NULL if not present/valid. */
-nl_send_slot_t *nl_send_ring_get(nl_send_ring_t *ring, uint16_t sequence);
+wn_send_slot_t *wn_send_ring_get(wn_send_ring_t *ring, uint16_t sequence);
 /* Oldest sequence still awaiting an ack, or ring->next_sequence if nothing
  * is outstanding. The *span* from here to next_sequence -- not the count of
  * unacked slots -- is what an ack must be able to reach, so congestion
  * control has to gate on it: counting unacked packets understates the
  * window whenever earlier packets are still missing. */
-uint16_t nl_send_ring_oldest_unacked(const nl_send_ring_t *ring);
+uint16_t wn_send_ring_oldest_unacked(const wn_send_ring_t *ring);
 
 /* ---- receive dedupe: "have I seen this sequence" + ack bitfield ---- */
 
 typedef struct {
     uint16_t sequence;
     bool     valid;
-} nl_recv_slot_t;
+} wn_recv_slot_t;
 
 typedef struct {
-    nl_recv_slot_t *slots; /* heap allocated, NL_SEQ_RING_SIZE entries */
+    wn_recv_slot_t *slots; /* heap allocated, WN_SEQ_RING_SIZE entries */
     uint16_t most_recent;
     bool     has_received_any;
-} nl_recv_dedupe_t;
+} wn_recv_dedupe_t;
 
-int  nl_recv_dedupe_init(nl_recv_dedupe_t *d);
-void nl_recv_dedupe_free(nl_recv_dedupe_t *d);
+int  wn_recv_dedupe_init(wn_recv_dedupe_t *d);
+void wn_recv_dedupe_free(wn_recv_dedupe_t *d);
 /* Returns true if `sequence` is new (not previously seen and not too old
  * to track), and records it. Returns false for duplicates or packets so
  * old they've fallen out of the tracked window (treat as duplicates). */
-bool nl_recv_dedupe_insert(nl_recv_dedupe_t *d, uint16_t sequence);
-/* Read-only counterpart of nl_recv_dedupe_insert: true if inserting
+bool wn_recv_dedupe_insert(wn_recv_dedupe_t *d, uint16_t sequence);
+/* Read-only counterpart of wn_recv_dedupe_insert: true if inserting
  * `sequence` would report a duplicate (already recorded, or too old to be
  * tracked). Never modifies the window, so a caller can decide whether to
  * accept a packet before it becomes visible in the ack. */
-bool nl_recv_dedupe_seen(const nl_recv_dedupe_t *d, uint16_t sequence);
+bool wn_recv_dedupe_seen(const wn_recv_dedupe_t *d, uint16_t sequence);
 /* Produce the (ack, ack_bits) pair to piggyback on an outgoing packet,
  * describing everything received up through `most_recent`. */
-void nl_recv_dedupe_build_ack(const nl_recv_dedupe_t *d, uint16_t *out_ack, nl_ack_bits_t *out_ack_bits);
+void wn_recv_dedupe_build_ack(const wn_recv_dedupe_t *d, uint16_t *out_ack, wn_ack_bits_t *out_ack_bits);
 
 /* ---- reorder ring: buffers early-arriving reliable-ordered packets ---- */
 
@@ -182,33 +182,33 @@ typedef struct {
     uint16_t sequence;
     bool     valid;
     uint16_t len;
-    uint8_t  data[NL_MAX_PACKET_SIZE_INTERNAL];
-} nl_reorder_slot_t;
+    uint8_t  data[WN_MAX_PACKET_SIZE_INTERNAL];
+} wn_reorder_slot_t;
 
 typedef struct {
-    nl_reorder_slot_t *slots;
+    wn_reorder_slot_t *slots;
     uint16_t next_expected;
     bool     initialized;
-} nl_reorder_ring_t;
+} wn_reorder_ring_t;
 
-int  nl_reorder_ring_init(nl_reorder_ring_t *ring);
-void nl_reorder_ring_free(nl_reorder_ring_t *ring);
+int  wn_reorder_ring_init(wn_reorder_ring_t *ring);
+void wn_reorder_ring_free(wn_reorder_ring_t *ring);
 /* True when `sequence` is close enough behind/ahead of next_expected that
- * nl_reorder_ring_insert can actually buffer it. Far ahead is the only
+ * wn_reorder_ring_insert can actually buffer it. Far ahead is the only
  * unrecoverable case: a stale or already-buffered sequence will resolve
  * itself (it was delivered, or is already waiting its turn), but one beyond
  * the window is dropped outright and must never be acked -- acking it tells
  * the sender to stop retransmitting a packet that will never be delivered,
  * and for RELIABLE_ORDERED it wedges next_expected behind the gap forever.
  * Exposed so callers can make that decision without duplicating the rule. */
-bool nl_reorder_ring_reachable(const nl_reorder_ring_t *ring, uint16_t sequence);
+bool wn_reorder_ring_reachable(const wn_reorder_ring_t *ring, uint16_t sequence);
 /* Buffer an out-of-order packet. Returns false if it's a duplicate of
  * something already buffered or already delivered (stale), or if it's too
- * far ahead to fit the window (see nl_reorder_ring_reachable). */
-bool nl_reorder_ring_insert(nl_reorder_ring_t *ring, uint16_t sequence, const uint8_t *data, uint16_t len);
+ * far ahead to fit the window (see wn_reorder_ring_reachable). */
+bool wn_reorder_ring_insert(wn_reorder_ring_t *ring, uint16_t sequence, const uint8_t *data, uint16_t len);
 /* Pop the next in-order packet if it's available (either just inserted or
  * previously buffered). Call repeatedly until it returns false -- multiple
  * packets can become deliverable at once when a gap-filling packet arrives. */
-bool nl_reorder_ring_pop_ready(nl_reorder_ring_t *ring, uint8_t *out_data, uint16_t *out_len);
+bool wn_reorder_ring_pop_ready(wn_reorder_ring_t *ring, uint8_t *out_data, uint16_t *out_len);
 
-#endif /* NETLINK_SEQBUF_H */
+#endif /* WEFT_NET_SEQBUF_H */

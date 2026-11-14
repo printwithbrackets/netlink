@@ -1,9 +1,9 @@
-/* Integration tests: real nl_endpoint_t client + server talking over
+/* Integration tests: real wn_endpoint_t client + server talking over
  * actual loopback UDP sockets (127.0.0.1 and ::1), exercising the full
  * stack end to end -- handshake, encryption, all delivery modes,
  * multiple channels, fragmentation, disconnects, and discovery. */
 #include "../test_framework.h"
-#include "../../include/netlink.h"
+#include "../../include/weft_net.h"
 #include "../../src/byteorder.h"
 #include "../../src/protocol.h"
 #include <string.h>
@@ -19,10 +19,10 @@
 #include <pthread.h>
 #include <stdatomic.h>
 
-static bool wait_for_event(nl_endpoint_t *ep, nl_event_type_t type, nl_event_t *out, int timeout_ms) {
+static bool wait_for_event(wn_endpoint_t *ep, wn_event_type_t type, wn_event_t *out, int timeout_ms) {
     uint64_t deadline_iterations = (uint64_t)timeout_ms / 50 + 1;
     for (uint64_t i = 0; i < deadline_iterations; i++) {
-        if (nl_poll_event(ep, out, 50)) {
+        if (wn_poll_event(ep, out, 50)) {
             if (out->event_type == type) return true;
             /* not the event we wanted yet; keep waiting for the remaining budget */
         }
@@ -30,33 +30,33 @@ static bool wait_for_event(nl_endpoint_t *ep, nl_event_type_t type, nl_event_t *
     return false;
 }
 
-static nl_address_t addr(const char *host, uint16_t port) {
-    nl_address_t a; memset(&a, 0, sizeof(a));
+static wn_address_t addr(const char *host, uint16_t port) {
+    wn_address_t a; memset(&a, 0, sizeof(a));
     strncpy(a.host, host, sizeof(a.host) - 1);
     a.port = port;
-    a.family = NL_AF_UNSPEC;
+    a.family = WN_AF_UNSPEC;
     return a;
 }
 
 TEST(test_connect_and_reliable_ordered_data) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    nl_endpoint_t *server = NULL, *client = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34701);
-    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
-    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+    wn_config_t cfg; wn_config_default(&cfg);
+    wn_endpoint_t *server = NULL, *client = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34701);
+    ASSERT_EQ(wn_server_create(&bind_addr, &cfg, &server), WN_OK);
+    ASSERT_EQ(wn_client_create(&cfg, &client), WN_OK);
 
-    nl_peer_id_t client_peer;
-    ASSERT_EQ(nl_connect(client, &bind_addr, &client_peer), NL_OK);
+    wn_peer_id_t client_peer;
+    ASSERT_EQ(wn_connect(client, &bind_addr, &client_peer), WN_OK);
 
-    nl_event_t ev;
-    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 3000));
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 3000));
-    nl_peer_id_t server_side_peer = ev.peer;
+    wn_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, WN_EVENT_CONNECTED, &ev, 3000));
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_CONNECTED, &ev, 3000));
+    wn_peer_id_t server_side_peer = ev.peer;
 
     const char *msg = "hello from client, reliably and in order";
-    ASSERT_EQ(nl_send(client, client_peer, 0, NL_RELIABLE_ORDERED, (const uint8_t *)msg, strlen(msg)), NL_OK);
+    ASSERT_EQ(wn_send(client, client_peer, 0, WN_RELIABLE_ORDERED, (const uint8_t *)msg, strlen(msg)), WN_OK);
 
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_DATA, &ev, 3000));
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_DATA, &ev, 3000));
     ASSERT_EQ(ev.peer, server_side_peer);
     ASSERT_EQ(ev.channel, 0);
     ASSERT_EQ(ev.data_len, strlen(msg));
@@ -64,330 +64,330 @@ TEST(test_connect_and_reliable_ordered_data) {
 
     /* And the reverse direction. */
     const char *reply = "hello back from server";
-    ASSERT_EQ(nl_send(server, server_side_peer, 0, NL_RELIABLE_ORDERED, (const uint8_t *)reply, strlen(reply)), NL_OK);
-    ASSERT_TRUE(wait_for_event(client, NL_EVENT_DATA, &ev, 3000));
+    ASSERT_EQ(wn_send(server, server_side_peer, 0, WN_RELIABLE_ORDERED, (const uint8_t *)reply, strlen(reply)), WN_OK);
+    ASSERT_TRUE(wait_for_event(client, WN_EVENT_DATA, &ev, 3000));
     ASSERT_EQ(ev.data_len, strlen(reply));
     ASSERT_MEM_EQ(ev.data, reply, strlen(reply));
 
-    nl_endpoint_destroy(client);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
 }
 
 TEST(test_capability_negotiation_intersects_both_sides) {
     /* Server advertises flow-control + rate-limit only; client advertises
      * flow-control + priority only. Negotiated set on both sides must be
      * the intersection (flow-control alone), never the local full set. */
-    nl_config_t scfg, ccfg;
-    nl_config_default(&scfg);
-    nl_config_default(&ccfg);
-    scfg.capabilities = NL_CAP_FLOW_CONTROL | NL_CAP_RATE_LIMIT;
-    ccfg.capabilities = NL_CAP_FLOW_CONTROL | NL_CAP_PRIORITY;
+    wn_config_t scfg, ccfg;
+    wn_config_default(&scfg);
+    wn_config_default(&ccfg);
+    scfg.capabilities = WN_CAP_FLOW_CONTROL | WN_CAP_RATE_LIMIT;
+    ccfg.capabilities = WN_CAP_FLOW_CONTROL | WN_CAP_PRIORITY;
 
-    nl_endpoint_t *server = NULL, *client = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34717);
-    ASSERT_EQ(nl_server_create(&bind_addr, &scfg, &server), NL_OK);
-    ASSERT_EQ(nl_client_create(&ccfg, &client), NL_OK);
+    wn_endpoint_t *server = NULL, *client = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34717);
+    ASSERT_EQ(wn_server_create(&bind_addr, &scfg, &server), WN_OK);
+    ASSERT_EQ(wn_client_create(&ccfg, &client), WN_OK);
 
-    nl_peer_id_t client_peer;
-    ASSERT_EQ(nl_connect(client, &bind_addr, &client_peer), NL_OK);
+    wn_peer_id_t client_peer;
+    ASSERT_EQ(wn_connect(client, &bind_addr, &client_peer), WN_OK);
 
-    nl_event_t ev;
-    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 3000));
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 3000));
-    nl_peer_id_t server_side_peer = ev.peer;
+    wn_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, WN_EVENT_CONNECTED, &ev, 3000));
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_CONNECTED, &ev, 3000));
+    wn_peer_id_t server_side_peer = ev.peer;
 
     uint32_t client_caps = 0, server_caps = 0;
-    ASSERT_TRUE(nl_peer_capabilities(client, client_peer, &client_caps));
-    ASSERT_TRUE(nl_peer_capabilities(server, server_side_peer, &server_caps));
-    ASSERT_EQ(client_caps, NL_CAP_FLOW_CONTROL);
-    ASSERT_EQ(server_caps, NL_CAP_FLOW_CONTROL);
+    ASSERT_TRUE(wn_peer_capabilities(client, client_peer, &client_caps));
+    ASSERT_TRUE(wn_peer_capabilities(server, server_side_peer, &server_caps));
+    ASSERT_EQ(client_caps, WN_CAP_FLOW_CONTROL);
+    ASSERT_EQ(server_caps, WN_CAP_FLOW_CONTROL);
 
     const char *msg = "negotiated";
-    ASSERT_EQ(nl_send(client, client_peer, 0, NL_RELIABLE_ORDERED,
-                      (const uint8_t *)msg, strlen(msg)), NL_OK);
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_DATA, &ev, 3000));
+    ASSERT_EQ(wn_send(client, client_peer, 0, WN_RELIABLE_ORDERED,
+                      (const uint8_t *)msg, strlen(msg)), WN_OK);
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_DATA, &ev, 3000));
     ASSERT_MEM_EQ(ev.data, msg, strlen(msg));
 
-    nl_endpoint_destroy(client);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
 }
 
 TEST(test_all_delivery_modes_over_real_sockets) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    nl_endpoint_t *server = NULL, *client = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34702);
-    nl_server_create(&bind_addr, &cfg, &server);
-    nl_client_create(&cfg, &client);
+    wn_config_t cfg; wn_config_default(&cfg);
+    wn_endpoint_t *server = NULL, *client = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34702);
+    wn_server_create(&bind_addr, &cfg, &server);
+    wn_client_create(&cfg, &client);
 
-    nl_peer_id_t client_peer;
-    nl_connect(client, &bind_addr, &client_peer);
-    nl_event_t ev;
-    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 3000));
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 3000));
+    wn_peer_id_t client_peer;
+    wn_connect(client, &bind_addr, &client_peer);
+    wn_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, WN_EVENT_CONNECTED, &ev, 3000));
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_CONNECTED, &ev, 3000));
 
-    nl_delivery_t modes[4] = { NL_UNRELIABLE, NL_UNRELIABLE_SEQUENCED, NL_RELIABLE_UNORDERED, NL_RELIABLE_ORDERED };
+    wn_delivery_t modes[4] = { WN_UNRELIABLE, WN_UNRELIABLE_SEQUENCED, WN_RELIABLE_UNORDERED, WN_RELIABLE_ORDERED };
     for (int i = 0; i < 4; i++) {
         char msg[64];
         snprintf(msg, sizeof(msg), "mode-%d-payload", i);
-        ASSERT_EQ(nl_send(client, client_peer, (uint8_t)i, modes[i], (const uint8_t *)msg, strlen(msg)), NL_OK);
-        ASSERT_TRUE(wait_for_event(server, NL_EVENT_DATA, &ev, 3000));
+        ASSERT_EQ(wn_send(client, client_peer, (uint8_t)i, modes[i], (const uint8_t *)msg, strlen(msg)), WN_OK);
+        ASSERT_TRUE(wait_for_event(server, WN_EVENT_DATA, &ev, 3000));
         ASSERT_EQ(ev.channel, i);
         ASSERT_MEM_EQ(ev.data, msg, strlen(msg));
     }
 
-    nl_endpoint_destroy(client);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
 }
 
 TEST(test_fragmentation_over_real_sockets) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    nl_endpoint_t *server = NULL, *client = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34703);
-    nl_server_create(&bind_addr, &cfg, &server);
-    nl_client_create(&cfg, &client);
+    wn_config_t cfg; wn_config_default(&cfg);
+    wn_endpoint_t *server = NULL, *client = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34703);
+    wn_server_create(&bind_addr, &cfg, &server);
+    wn_client_create(&cfg, &client);
 
-    nl_peer_id_t client_peer;
-    nl_connect(client, &bind_addr, &client_peer);
-    nl_event_t ev;
-    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 3000));
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 3000));
+    wn_peer_id_t client_peer;
+    wn_connect(client, &bind_addr, &client_peer);
+    wn_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, WN_EVENT_CONNECTED, &ev, 3000));
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_CONNECTED, &ev, 3000));
 
     size_t big_len = 5000; /* forces multiple fragments at 1024 bytes/chunk */
     uint8_t *big = (uint8_t *)malloc(big_len);
     for (size_t i = 0; i < big_len; i++) big[i] = (uint8_t)((i * 31 + 5) & 0xFF);
 
-    ASSERT_EQ(nl_send(client, client_peer, 0, NL_RELIABLE_ORDERED, big, big_len), NL_OK);
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_DATA, &ev, 5000));
+    ASSERT_EQ(wn_send(client, client_peer, 0, WN_RELIABLE_ORDERED, big, big_len), WN_OK);
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_DATA, &ev, 5000));
     ASSERT_EQ(ev.data_len, big_len);
     ASSERT_MEM_EQ(ev.data, big, big_len);
 
     free(big);
-    nl_endpoint_destroy(client);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
 }
 
 /* Large message over real sockets: 40000 bytes (40 fragments) exceeds the
  * initial congestion window, so delivery depends on the endpoint's
- * post-drain standalone-ack flush (NL_PKT_ACK) and continuation parking. */
+ * post-drain standalone-ack flush (WN_PKT_ACK) and continuation parking. */
 TEST(test_large_message_40000_over_real_sockets) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    nl_endpoint_t *server = NULL, *client = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34715);
-    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
-    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+    wn_config_t cfg; wn_config_default(&cfg);
+    wn_endpoint_t *server = NULL, *client = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34715);
+    ASSERT_EQ(wn_server_create(&bind_addr, &cfg, &server), WN_OK);
+    ASSERT_EQ(wn_client_create(&cfg, &client), WN_OK);
 
-    nl_peer_id_t client_peer;
-    ASSERT_EQ(nl_connect(client, &bind_addr, &client_peer), NL_OK);
-    nl_event_t ev;
-    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 3000));
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 3000));
+    wn_peer_id_t client_peer;
+    ASSERT_EQ(wn_connect(client, &bind_addr, &client_peer), WN_OK);
+    wn_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, WN_EVENT_CONNECTED, &ev, 3000));
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_CONNECTED, &ev, 3000));
 
     size_t big_len = 40000;
     uint8_t *big = (uint8_t *)malloc(big_len);
     ASSERT_TRUE(big != NULL);
     for (size_t i = 0; i < big_len; i++) big[i] = (uint8_t)((i * 17 + 3) & 0xFF);
 
-    ASSERT_EQ(nl_send(client, client_peer, 0, NL_RELIABLE_ORDERED, big, big_len), NL_OK);
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_DATA, &ev, 15000));
+    ASSERT_EQ(wn_send(client, client_peer, 0, WN_RELIABLE_ORDERED, big, big_len), WN_OK);
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_DATA, &ev, 15000));
     ASSERT_EQ(ev.data_len, big_len);
     ASSERT_MEM_EQ(ev.data, big, big_len);
 
     /* Server must still be connected (acks kept the client from giving up). */
-    nl_peer_stats_t cstats;
-    ASSERT_TRUE(nl_peer_stats(client, client_peer, &cstats));
+    wn_peer_stats_t cstats;
+    ASSERT_TRUE(wn_peer_stats(client, client_peer, &cstats));
 
     free(big);
-    nl_endpoint_destroy(client);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
 }
 
 /* One-way reliable traffic: the server never sends application data, so
- * every ack must ride on a standalone NL_PKT_ACK (endpoint flush after
+ * every ack must ride on a standalone WN_PKT_ACK (endpoint flush after
  * socket drain). Without those, the client would retransmit until give-up
  * and the server would see duplicates/timeout. */
 TEST(test_one_way_reliable_over_real_sockets) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    nl_endpoint_t *server = NULL, *client = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34716);
-    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
-    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+    wn_config_t cfg; wn_config_default(&cfg);
+    wn_endpoint_t *server = NULL, *client = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34716);
+    ASSERT_EQ(wn_server_create(&bind_addr, &cfg, &server), WN_OK);
+    ASSERT_EQ(wn_client_create(&cfg, &client), WN_OK);
 
-    nl_peer_id_t client_peer;
-    ASSERT_EQ(nl_connect(client, &bind_addr, &client_peer), NL_OK);
-    nl_event_t ev;
-    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 3000));
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 3000));
+    wn_peer_id_t client_peer;
+    ASSERT_EQ(wn_connect(client, &bind_addr, &client_peer), WN_OK);
+    wn_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, WN_EVENT_CONNECTED, &ev, 3000));
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_CONNECTED, &ev, 3000));
 
     for (int i = 0; i < 5; i++) {
         char msg[8];
         snprintf(msg, sizeof(msg), "ow%d", i);
-        ASSERT_EQ(nl_send(client, client_peer, 0, NL_RELIABLE_ORDERED,
-                          (const uint8_t *)msg, strlen(msg)), NL_OK);
+        ASSERT_EQ(wn_send(client, client_peer, 0, WN_RELIABLE_ORDERED,
+                          (const uint8_t *)msg, strlen(msg)), WN_OK);
     }
 
     for (int i = 0; i < 5; i++) {
-        ASSERT_TRUE(wait_for_event(server, NL_EVENT_DATA, &ev, 5000));
+        ASSERT_TRUE(wait_for_event(server, WN_EVENT_DATA, &ev, 5000));
         ASSERT_EQ(ev.channel, 0);
     }
 
     /* Let acks round-trip and any RTO fire: client stats must show no
-     * retransmits (acks arrived via NL_PKT_ACK before the first RTO). */
-    nl_peer_stats_t cstats;
-    ASSERT_TRUE(nl_peer_stats(client, client_peer, &cstats));
+     * retransmits (acks arrived via WN_PKT_ACK before the first RTO). */
+    wn_peer_stats_t cstats;
+    ASSERT_TRUE(wn_peer_stats(client, client_peer, &cstats));
     ASSERT_EQ(cstats.retransmits, 0u);
 
-    nl_endpoint_destroy(client);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
 }
 
 TEST(test_multiple_channels_dont_block_each_other) {
-    nl_config_t cfg; nl_config_default(&cfg);
+    wn_config_t cfg; wn_config_default(&cfg);
     cfg.channel_count = 4;
-    nl_endpoint_t *server = NULL, *client = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34704);
-    nl_server_create(&bind_addr, &cfg, &server);
-    nl_client_create(&cfg, &client);
+    wn_endpoint_t *server = NULL, *client = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34704);
+    wn_server_create(&bind_addr, &cfg, &server);
+    wn_client_create(&cfg, &client);
 
-    nl_peer_id_t client_peer;
-    nl_connect(client, &bind_addr, &client_peer);
-    nl_event_t ev;
-    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 3000));
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 3000));
+    wn_peer_id_t client_peer;
+    wn_connect(client, &bind_addr, &client_peer);
+    wn_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, WN_EVENT_CONNECTED, &ev, 3000));
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_CONNECTED, &ev, 3000));
 
     /* Send on channel 3 first, then channel 0 -- both must arrive
      * independently (proves channels aren't sharing one sequence space). */
-    nl_send(client, client_peer, 3, NL_RELIABLE_ORDERED, (const uint8_t *)"chan3", 5);
-    nl_send(client, client_peer, 0, NL_RELIABLE_ORDERED, (const uint8_t *)"chan0", 5);
+    wn_send(client, client_peer, 3, WN_RELIABLE_ORDERED, (const uint8_t *)"chan3", 5);
+    wn_send(client, client_peer, 0, WN_RELIABLE_ORDERED, (const uint8_t *)"chan0", 5);
 
     bool saw_chan0 = false, saw_chan3 = false;
     for (int i = 0; i < 2; i++) {
-        ASSERT_TRUE(wait_for_event(server, NL_EVENT_DATA, &ev, 3000));
+        ASSERT_TRUE(wait_for_event(server, WN_EVENT_DATA, &ev, 3000));
         if (ev.channel == 0) { saw_chan0 = true; ASSERT_MEM_EQ(ev.data, "chan0", 5); }
         if (ev.channel == 3) { saw_chan3 = true; ASSERT_MEM_EQ(ev.data, "chan3", 5); }
     }
     ASSERT_TRUE(saw_chan0);
     ASSERT_TRUE(saw_chan3);
 
-    nl_endpoint_destroy(client);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
 }
 
 TEST(test_graceful_disconnect_over_real_sockets) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    nl_endpoint_t *server = NULL, *client = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34705);
-    nl_server_create(&bind_addr, &cfg, &server);
-    nl_client_create(&cfg, &client);
+    wn_config_t cfg; wn_config_default(&cfg);
+    wn_endpoint_t *server = NULL, *client = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34705);
+    wn_server_create(&bind_addr, &cfg, &server);
+    wn_client_create(&cfg, &client);
 
-    nl_peer_id_t client_peer;
-    nl_connect(client, &bind_addr, &client_peer);
-    nl_event_t ev;
-    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 3000));
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 3000));
+    wn_peer_id_t client_peer;
+    wn_connect(client, &bind_addr, &client_peer);
+    wn_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, WN_EVENT_CONNECTED, &ev, 3000));
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_CONNECTED, &ev, 3000));
 
-    ASSERT_EQ(nl_disconnect(client, client_peer), NL_OK);
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_DISCONNECTED, &ev, 3000));
-    ASSERT_EQ(ev.disconnect_reason, NL_OK); /* graceful, not a timeout */
+    ASSERT_EQ(wn_disconnect(client, client_peer), WN_OK);
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_DISCONNECTED, &ev, 3000));
+    ASSERT_EQ(ev.disconnect_reason, WN_OK); /* graceful, not a timeout */
 
-    nl_endpoint_destroy(client);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
 }
 
 TEST(test_ipv6_loopback) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    cfg.family = NL_AF_INET6;
-    nl_endpoint_t *server = NULL, *client = NULL;
-    nl_address_t bind_addr = addr("::1", 34706);
-    bind_addr.family = NL_AF_INET6;
+    wn_config_t cfg; wn_config_default(&cfg);
+    cfg.family = WN_AF_INET6;
+    wn_endpoint_t *server = NULL, *client = NULL;
+    wn_address_t bind_addr = addr("::1", 34706);
+    bind_addr.family = WN_AF_INET6;
 
-    nl_result_t r = nl_server_create(&bind_addr, &cfg, &server);
-    if (r != NL_OK) {
+    wn_result_t r = wn_server_create(&bind_addr, &cfg, &server);
+    if (r != WN_OK) {
         /* IPv6 loopback may be unavailable in some sandboxed CI network
          * namespaces -- skip rather than fail the whole suite in that case. */
         printf("  SKIP test_ipv6_loopback: server bind failed (%s) -- IPv6 may be unavailable here\n",
-               nl_error_string(r));
+               wn_error_string(r));
         return;
     }
-    nl_client_create(&cfg, &client);
+    wn_client_create(&cfg, &client);
 
-    nl_peer_id_t client_peer;
-    ASSERT_EQ(nl_connect(client, &bind_addr, &client_peer), NL_OK);
-    nl_event_t ev;
-    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 3000));
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 3000));
+    wn_peer_id_t client_peer;
+    ASSERT_EQ(wn_connect(client, &bind_addr, &client_peer), WN_OK);
+    wn_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, WN_EVENT_CONNECTED, &ev, 3000));
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_CONNECTED, &ev, 3000));
 
     const char *msg = "hello over ipv6";
-    ASSERT_EQ(nl_send(client, client_peer, 0, NL_RELIABLE_ORDERED, (const uint8_t *)msg, strlen(msg)), NL_OK);
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_DATA, &ev, 3000));
+    ASSERT_EQ(wn_send(client, client_peer, 0, WN_RELIABLE_ORDERED, (const uint8_t *)msg, strlen(msg)), WN_OK);
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_DATA, &ev, 3000));
     ASSERT_MEM_EQ(ev.data, msg, strlen(msg));
 
-    nl_endpoint_destroy(client);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
 }
 
 TEST(test_discovery_over_real_sockets) {
-    nl_config_t cfg; nl_config_default(&cfg);
+    wn_config_t cfg; wn_config_default(&cfg);
     cfg.server_name = "Test Arena";
-    nl_endpoint_t *server = NULL, *client = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34707);
-    nl_server_create(&bind_addr, &cfg, &server);
-    nl_client_create(&cfg, &client);
+    wn_endpoint_t *server = NULL, *client = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34707);
+    wn_server_create(&bind_addr, &cfg, &server);
+    wn_client_create(&cfg, &client);
 
-    ASSERT_EQ(nl_discovery_enable(server, 34799), NL_OK);
-    nl_result_t probe = nl_discovery_probe(client, 34799, 1000);
-    if (probe != NL_OK) {
+    ASSERT_EQ(wn_discovery_enable(server, 34799), WN_OK);
+    wn_result_t probe = wn_discovery_probe(client, 34799, 1000);
+    if (probe != WN_OK) {
         /* Broadcast (and loopback fallback) may both be unavailable in a
          * restricted namespace; skip rather than fail the whole suite. */
-        printf("  SKIP test_discovery_over_real_sockets: nl_discovery_probe failed (%d)\n", probe);
-        nl_endpoint_destroy(client);
-        nl_endpoint_destroy(server);
+        printf("  SKIP test_discovery_over_real_sockets: wn_discovery_probe failed (%d)\n", probe);
+        wn_endpoint_destroy(client);
+        wn_endpoint_destroy(server);
         return;
     }
 
-    nl_event_t ev;
-    bool got = wait_for_event(client, NL_EVENT_DISCOVERY_REPLY, &ev, 3000);
+    wn_event_t ev;
+    bool got = wait_for_event(client, WN_EVENT_DISCOVERY_REPLY, &ev, 3000);
     if (!got) {
         /* UDP broadcast can be filtered in some sandboxed network
          * namespaces even on loopback-adjacent setups; skip rather than
          * fail outright, but note it clearly. */
         printf("  SKIP test_discovery_over_real_sockets: no broadcast reply received "
                "(broadcast may be filtered in this network namespace)\n");
-        nl_endpoint_destroy(client);
-        nl_endpoint_destroy(server);
+        wn_endpoint_destroy(client);
+        wn_endpoint_destroy(server);
         return;
     }
     ASSERT_TRUE(strcmp(ev.server_name, "Test Arena") == 0);
 
-    nl_endpoint_destroy(client);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
 }
 
 TEST(test_peer_stats_over_real_sockets) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    nl_endpoint_t *server = NULL, *client = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34709);
-    nl_server_create(&bind_addr, &cfg, &server);
-    nl_client_create(&cfg, &client);
+    wn_config_t cfg; wn_config_default(&cfg);
+    wn_endpoint_t *server = NULL, *client = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34709);
+    wn_server_create(&bind_addr, &cfg, &server);
+    wn_client_create(&cfg, &client);
 
-    nl_peer_id_t client_peer;
-    nl_connect(client, &bind_addr, &client_peer);
-    nl_event_t ev;
-    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 3000));
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 3000));
-    nl_peer_id_t server_peer = ev.peer;
+    wn_peer_id_t client_peer;
+    wn_connect(client, &bind_addr, &client_peer);
+    wn_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, WN_EVENT_CONNECTED, &ev, 3000));
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_CONNECTED, &ev, 3000));
+    wn_peer_id_t server_peer = ev.peer;
 
     const char *msg = "measure me";
-    nl_send(client, client_peer, 0, NL_RELIABLE_ORDERED, (const uint8_t *)msg, strlen(msg));
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_DATA, &ev, 3000));
+    wn_send(client, client_peer, 0, WN_RELIABLE_ORDERED, (const uint8_t *)msg, strlen(msg));
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_DATA, &ev, 3000));
 
     /* Give the reliable ack a moment to round-trip back to the client so
      * an RTT sample has actually landed (real sockets, real timing). */
-    nl_send(server, server_peer, 0, NL_RELIABLE_ORDERED, (const uint8_t *)"ack", 3);
-    ASSERT_TRUE(wait_for_event(client, NL_EVENT_DATA, &ev, 3000));
+    wn_send(server, server_peer, 0, WN_RELIABLE_ORDERED, (const uint8_t *)"ack", 3);
+    ASSERT_TRUE(wait_for_event(client, WN_EVENT_DATA, &ev, 3000));
 
-    nl_peer_stats_t cstats, sstats;
-    ASSERT_TRUE(nl_peer_stats(client, client_peer, &cstats));
-    ASSERT_TRUE(nl_peer_stats(server, server_peer, &sstats));
+    wn_peer_stats_t cstats, sstats;
+    ASSERT_TRUE(wn_peer_stats(client, client_peer, &cstats));
+    ASSERT_TRUE(wn_peer_stats(server, server_peer, &sstats));
 
     ASSERT_TRUE(cstats.packets_sent >= 1);
     ASSERT_TRUE(cstats.bytes_sent > 0);
@@ -398,99 +398,99 @@ TEST(test_peer_stats_over_real_sockets) {
      * not absurd (e.g. not accidentally reporting seconds as ms). */
     ASSERT_TRUE(cstats.rtt_ms < 2000);
 
-    ASSERT_FALSE(nl_peer_stats(client, 0xDEADBEEF, &cstats)); /* unknown peer */
+    ASSERT_FALSE(wn_peer_stats(client, 0xDEADBEEF, &cstats)); /* unknown peer */
 
-    nl_endpoint_destroy(client);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
 }
 
 TEST(test_server_denies_when_full) {
-    nl_config_t cfg; nl_config_default(&cfg);
+    wn_config_t cfg; wn_config_default(&cfg);
     cfg.max_connections = 1;
-    nl_endpoint_t *server = NULL, *c1 = NULL, *c2 = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34708);
-    nl_server_create(&bind_addr, &cfg, &server);
-    nl_client_create(&cfg, &c1);
-    nl_client_create(&cfg, &c2);
+    wn_endpoint_t *server = NULL, *c1 = NULL, *c2 = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34708);
+    wn_server_create(&bind_addr, &cfg, &server);
+    wn_client_create(&cfg, &c1);
+    wn_client_create(&cfg, &c2);
 
-    nl_peer_id_t p1, p2;
-    nl_connect(c1, &bind_addr, &p1);
-    nl_event_t ev;
-    ASSERT_TRUE(wait_for_event(c1, NL_EVENT_CONNECTED, &ev, 3000));
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 3000));
+    wn_peer_id_t p1, p2;
+    wn_connect(c1, &bind_addr, &p1);
+    wn_event_t ev;
+    ASSERT_TRUE(wait_for_event(c1, WN_EVENT_CONNECTED, &ev, 3000));
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_CONNECTED, &ev, 3000));
 
-    nl_connect(c2, &bind_addr, &p2);
-    ASSERT_TRUE(wait_for_event(c2, NL_EVENT_CONNECT_FAILED, &ev, 3000));
-    ASSERT_EQ(ev.disconnect_reason, NL_ERR_SERVER_FULL);
+    wn_connect(c2, &bind_addr, &p2);
+    ASSERT_TRUE(wait_for_event(c2, WN_EVENT_CONNECT_FAILED, &ev, 3000));
+    ASSERT_EQ(ev.disconnect_reason, WN_ERR_SERVER_FULL);
 
-    nl_endpoint_destroy(c1);
-    nl_endpoint_destroy(c2);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(c1);
+    wn_endpoint_destroy(c2);
+    wn_endpoint_destroy(server);
 }
 
 /* Regression: encryption_enabled=false must be rejected at construction --
  * there is no cleartext mode; silently encrypting anyway or shipping a
  * protocol hole would both be wrong. */
 TEST(test_encryption_disabled_rejected) {
-    nl_config_t cfg; nl_config_default(&cfg);
+    wn_config_t cfg; wn_config_default(&cfg);
     cfg.encryption_enabled = false;
-    nl_endpoint_t *ep = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34710);
+    wn_endpoint_t *ep = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34710);
 
-    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &ep), NL_ERR_UNSUPPORTED);
+    ASSERT_EQ(wn_server_create(&bind_addr, &cfg, &ep), WN_ERR_UNSUPPORTED);
     ASSERT_TRUE(ep == NULL);
     ep = NULL;
-    ASSERT_EQ(nl_client_create(&cfg, &ep), NL_ERR_UNSUPPORTED);
+    ASSERT_EQ(wn_client_create(&cfg, &ep), WN_ERR_UNSUPPORTED);
     ASSERT_TRUE(ep == NULL);
 }
 
-/* Regression: a second nl_connect() to the same address while one is in
- * flight (or already established) must return NL_ERR_ALREADY_CONNECTED
+/* Regression: a second wn_connect() to the same address while one is in
+ * flight (or already established) must return WN_ERR_ALREADY_CONNECTED
  * rather than collide on the pending table's address-keyed lookups. */
 TEST(test_duplicate_connect_same_address_rejected) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    nl_endpoint_t *server = NULL, *client = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34711);
-    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
-    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+    wn_config_t cfg; wn_config_default(&cfg);
+    wn_endpoint_t *server = NULL, *client = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34711);
+    ASSERT_EQ(wn_server_create(&bind_addr, &cfg, &server), WN_OK);
+    ASSERT_EQ(wn_client_create(&cfg, &client), WN_OK);
 
-    nl_peer_id_t p1, p2;
-    ASSERT_EQ(nl_connect(client, &bind_addr, &p1), NL_OK);
+    wn_peer_id_t p1, p2;
+    ASSERT_EQ(wn_connect(client, &bind_addr, &p1), WN_OK);
     /* Second connect while first is still in flight (AWAIT_CHALLENGE). */
-    ASSERT_EQ(nl_connect(client, &bind_addr, &p2), NL_ERR_ALREADY_CONNECTED);
+    ASSERT_EQ(wn_connect(client, &bind_addr, &p2), WN_ERR_ALREADY_CONNECTED);
 
     /* Let the first handshake finish, then a third connect (now established). */
-    nl_event_t ev;
-    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 3000));
-    ASSERT_EQ(nl_connect(client, &bind_addr, &p2), NL_ERR_ALREADY_CONNECTED);
+    wn_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, WN_EVENT_CONNECTED, &ev, 3000));
+    ASSERT_EQ(wn_connect(client, &bind_addr, &p2), WN_ERR_ALREADY_CONNECTED);
 
-    nl_endpoint_destroy(client);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
 }
 
 /* Regression: max_connections above the hard internal cap (512) must be
  * clamped so discovery advertises the real limit, not a value that would
  * make REQUEST-time checks pass and then fail silently at slot alloc. */
 TEST(test_max_connections_clamped_to_internal_cap) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    cfg.max_connections = 10000; /* way above NL_MAX_CONNECTIONS_INTERNAL */
+    wn_config_t cfg; wn_config_default(&cfg);
+    cfg.max_connections = 10000; /* way above WN_MAX_CONNECTIONS_INTERNAL */
     cfg.server_name = "Clamp Test";
-    nl_endpoint_t *server = NULL, *client = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34712);
-    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
-    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+    wn_endpoint_t *server = NULL, *client = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34712);
+    ASSERT_EQ(wn_server_create(&bind_addr, &cfg, &server), WN_OK);
+    ASSERT_EQ(wn_client_create(&cfg, &client), WN_OK);
 
-    ASSERT_EQ(nl_discovery_enable(server, 34801), NL_OK);
-    nl_result_t probe = nl_discovery_probe(client, 34801, 500);
-    if (probe != NL_OK) {
-        printf("  SKIP clamp discovery assert: nl_discovery_probe failed (%d)\n", probe);
-        nl_endpoint_destroy(client);
-        nl_endpoint_destroy(server);
+    ASSERT_EQ(wn_discovery_enable(server, 34801), WN_OK);
+    wn_result_t probe = wn_discovery_probe(client, 34801, 500);
+    if (probe != WN_OK) {
+        printf("  SKIP clamp discovery assert: wn_discovery_probe failed (%d)\n", probe);
+        wn_endpoint_destroy(client);
+        wn_endpoint_destroy(server);
         return;
     }
 
-    nl_event_t ev;
-    bool got = wait_for_event(client, NL_EVENT_DISCOVERY_REPLY, &ev, 3000);
+    wn_event_t ev;
+    bool got = wait_for_event(client, WN_EVENT_DISCOVERY_REPLY, &ev, 3000);
     if (got) {
         /* Advertised max must be the clamped 512, not 10000. */
         ASSERT_EQ(ev.server_max_players, 512u);
@@ -498,49 +498,49 @@ TEST(test_max_connections_clamped_to_internal_cap) {
         printf("  SKIP clamp discovery assert: broadcast filtered in this namespace\n");
     }
 
-    nl_endpoint_destroy(client);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
 }
 
 /* Regression: server_name must be copied into the endpoint at create time.
  * If config.server_name is only a shallow pointer, clobbering the caller's
- * buffer after nl_server_create would change what discovery reports. */
+ * buffer after wn_server_create would change what discovery reports. */
 TEST(test_server_name_copied_at_create_time) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    char name_buf[NL_SERVER_NAME_MAX];
+    wn_config_t cfg; wn_config_default(&cfg);
+    char name_buf[WN_SERVER_NAME_MAX];
     strncpy(name_buf, "Stable Name", sizeof(name_buf) - 1);
     name_buf[sizeof(name_buf) - 1] = '\0';
     cfg.server_name = name_buf;
 
-    nl_endpoint_t *server = NULL, *client = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34713);
-    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+    wn_endpoint_t *server = NULL, *client = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34713);
+    ASSERT_EQ(wn_server_create(&bind_addr, &cfg, &server), WN_OK);
 
     /* Clobber the caller's buffer -- discovery must still report the
      * original name (proving the library made its own copy). */
     memset(name_buf, 'X', sizeof(name_buf) - 1);
     name_buf[sizeof(name_buf) - 1] = '\0';
 
-    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
-    ASSERT_EQ(nl_discovery_enable(server, 34802), NL_OK);
-    nl_result_t probe = nl_discovery_probe(client, 34802, 500);
-    if (probe != NL_OK) {
-        printf("  SKIP server_name discovery assert: nl_discovery_probe failed (%d)\n", probe);
-        nl_endpoint_destroy(client);
-        nl_endpoint_destroy(server);
+    ASSERT_EQ(wn_client_create(&cfg, &client), WN_OK);
+    ASSERT_EQ(wn_discovery_enable(server, 34802), WN_OK);
+    wn_result_t probe = wn_discovery_probe(client, 34802, 500);
+    if (probe != WN_OK) {
+        printf("  SKIP server_name discovery assert: wn_discovery_probe failed (%d)\n", probe);
+        wn_endpoint_destroy(client);
+        wn_endpoint_destroy(server);
         return;
     }
 
-    nl_event_t ev;
-    bool got = wait_for_event(client, NL_EVENT_DISCOVERY_REPLY, &ev, 3000);
+    wn_event_t ev;
+    bool got = wait_for_event(client, WN_EVENT_DISCOVERY_REPLY, &ev, 3000);
     if (got) {
         ASSERT_TRUE(strcmp(ev.server_name, "Stable Name") == 0);
     } else {
         printf("  SKIP server_name discovery assert: broadcast filtered in this namespace\n");
     }
 
-    nl_endpoint_destroy(client);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
 }
 
 /* Regression (finding 5): a DISCOVERY_RESPONSE whose nonce does not match
@@ -550,8 +550,8 @@ TEST(test_server_name_copied_at_create_time) {
  * its real nonce for the positive case. Also checks that from_address
  * comes from the packet's socket source, not the body's server_port. */
 TEST(test_discovery_wrong_nonce_ignored) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    nl_endpoint_t *client = NULL;
+    wn_config_t cfg; wn_config_default(&cfg);
+    wn_endpoint_t *client = NULL;
 
     /* Bind before probing so the client's unconditional loopback copy
      * (127.0.0.1:34804) lands here and we can read the random nonce. */
@@ -567,27 +567,27 @@ TEST(test_discovery_wrong_nonce_ignored) {
     struct timeval tv = { .tv_sec = 0, .tv_usec = 300000 };
     setsockopt(raw, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
-    nl_result_t probe = nl_discovery_probe(client, 34804, 500);
-    if (probe != NL_OK) {
-        printf("  SKIP test_discovery_wrong_nonce_ignored: nl_discovery_probe failed (%d)\n", probe);
+    ASSERT_EQ(wn_client_create(&cfg, &client), WN_OK);
+    wn_result_t probe = wn_discovery_probe(client, 34804, 500);
+    if (probe != WN_OK) {
+        printf("  SKIP test_discovery_wrong_nonce_ignored: wn_discovery_probe failed (%d)\n", probe);
         close(raw);
-        nl_endpoint_destroy(client);
+        wn_endpoint_destroy(client);
         return;
     }
 
     /* Capture the outgoing DISCOVERY_REQUEST (loopback copy). */
-    uint8_t req[NL_DISCOVERY_REQUEST_SIZE + 16];
+    uint8_t req[WN_DISCOVERY_REQUEST_SIZE + 16];
     struct sockaddr_storage from;
     socklen_t from_len = sizeof(from);
     ssize_t n = recvfrom(raw, req, sizeof(req), 0, (struct sockaddr *)&from, &from_len);
-    if (n < (ssize_t)NL_DISCOVERY_REQUEST_SIZE || req[0] != NL_PKT_DISCOVERY_REQUEST) {
+    if (n < (ssize_t)WN_DISCOVERY_REQUEST_SIZE || req[0] != WN_PKT_DISCOVERY_REQUEST) {
         printf("  SKIP test_discovery_wrong_nonce_ignored: no probe captured on loopback\n");
         close(raw);
-        nl_endpoint_destroy(client);
+        wn_endpoint_destroy(client);
         return;
     }
-    uint32_t real_nonce = nl_get_u32(req + 5);
+    uint32_t real_nonce = wn_get_u32(req + 5);
     ASSERT_TRUE(real_nonce != 0); /* probes are never zero so 0 is a guaranteed-wrong nonce */
 
     struct sockaddr_in reply_to;
@@ -598,40 +598,40 @@ TEST(test_discovery_wrong_nonce_ignored) {
 
     /* Nonce 0: guaranteed wrong -- must not surface. Body claims port 9999
      * so a buggy from_address (body-sourced) would be distinguishable. */
-    uint8_t resp[NL_DISCOVERY_RESPONSE_MIN_SIZE + 16];
+    uint8_t resp[WN_DISCOVERY_RESPONSE_MIN_SIZE + 16];
     size_t o = 0;
-    resp[o++] = NL_PKT_DISCOVERY_RESPONSE;
-    nl_put_u32(resp + o, 0); o += 4;
-    nl_put_u16(resp + o, 9999); o += 2;
-    nl_put_u32(resp + o, 0); o += 4;
-    nl_put_u32(resp + o, 64); o += 4;
+    resp[o++] = WN_PKT_DISCOVERY_RESPONSE;
+    wn_put_u32(resp + o, 0); o += 4;
+    wn_put_u16(resp + o, 9999); o += 2;
+    wn_put_u32(resp + o, 0); o += 4;
+    wn_put_u32(resp + o, 64); o += 4;
     resp[o++] = 4;
     memcpy(resp + o, "fake", 4); o += 4;
     ASSERT_TRUE(sendto(raw, resp, o, 0, (struct sockaddr *)&reply_to, sizeof(reply_to)) >= 0);
 
-    nl_event_t ev;
-    bool got_bad = wait_for_event(client, NL_EVENT_DISCOVERY_REPLY, &ev, 300);
+    wn_event_t ev;
+    bool got_bad = wait_for_event(client, WN_EVENT_DISCOVERY_REPLY, &ev, 300);
     ASSERT_TRUE(!got_bad); /* wrong nonce must not surface */
 
     /* Captured nonce must be accepted. Body still claims 9999; the event's
      * from_address.port must be THIS socket's source (34804), proving the
      * library used the socket source, not the attacker-controlled body. */
     o = 0;
-    resp[o++] = NL_PKT_DISCOVERY_RESPONSE;
-    nl_put_u32(resp + o, real_nonce); o += 4;
-    nl_put_u16(resp + o, 9999); o += 2; /* lie in the body */
-    nl_put_u32(resp + o, 0); o += 4;
-    nl_put_u32(resp + o, 64); o += 4;
+    resp[o++] = WN_PKT_DISCOVERY_RESPONSE;
+    wn_put_u32(resp + o, real_nonce); o += 4;
+    wn_put_u16(resp + o, 9999); o += 2; /* lie in the body */
+    wn_put_u32(resp + o, 0); o += 4;
+    wn_put_u32(resp + o, 64); o += 4;
     resp[o++] = 5;
     memcpy(resp + o, "valid", 5); o += 5;
     ASSERT_TRUE(sendto(raw, resp, o, 0, (struct sockaddr *)&reply_to, sizeof(reply_to)) >= 0);
 
-    ASSERT_TRUE(wait_for_event(client, NL_EVENT_DISCOVERY_REPLY, &ev, 1000));
+    ASSERT_TRUE(wait_for_event(client, WN_EVENT_DISCOVERY_REPLY, &ev, 1000));
     ASSERT_TRUE(strcmp(ev.server_name, "valid") == 0);
     ASSERT_EQ(ev.from_address.port, 34804u); /* socket source, not body's 9999 */
 
     close(raw);
-    nl_endpoint_destroy(client);
+    wn_endpoint_destroy(client);
 }
 
 /* Regression (finding 5): discovery replies have their own rate-limit
@@ -639,12 +639,12 @@ TEST(test_discovery_wrong_nonce_ignored) {
  * responses. Unicast (no broadcast required): fire far more requests than
  * the per-window cap and assert the server stops answering. */
 TEST(test_discovery_rate_limited) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    nl_endpoint_t *server = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34714);
-    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+    wn_config_t cfg; wn_config_default(&cfg);
+    wn_endpoint_t *server = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34714);
+    ASSERT_EQ(wn_server_create(&bind_addr, &cfg, &server), WN_OK);
     const uint16_t dport = 34805;
-    ASSERT_EQ(nl_discovery_enable(server, dport), NL_OK);
+    ASSERT_EQ(wn_discovery_enable(server, dport), WN_OK);
 
     int raw = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     ASSERT_TRUE(raw >= 0);
@@ -657,13 +657,13 @@ TEST(test_discovery_rate_limited) {
     dst.sin_port = htons(dport);
     dst.sin_addr.s_addr = inet_addr("127.0.0.1");
 
-    /* Well above NL_RATE_LIMIT_MAX_PER_WINDOW (200), all in one window. */
+    /* Well above WN_RATE_LIMIT_MAX_PER_WINDOW (200), all in one window. */
     const int flood = 300;
-    uint8_t req[NL_DISCOVERY_REQUEST_SIZE];
-    req[0] = NL_PKT_DISCOVERY_REQUEST;
-    nl_put_u32(req + 1, NL_MAGIC);
+    uint8_t req[WN_DISCOVERY_REQUEST_SIZE];
+    req[0] = WN_PKT_DISCOVERY_REQUEST;
+    wn_put_u32(req + 1, WN_MAGIC);
     for (int i = 0; i < flood; i++) {
-        nl_put_u32(req + 5, (uint32_t)(i + 1));
+        wn_put_u32(req + 5, (uint32_t)(i + 1));
         ASSERT_TRUE(sendto(raw, req, sizeof(req), 0, (struct sockaddr *)&dst, sizeof(dst)) >= 0);
     }
 
@@ -673,7 +673,7 @@ TEST(test_discovery_rate_limited) {
     for (;;) {
         ssize_t n = recv(raw, buf, sizeof(buf), 0);
         if (n < 0) break;
-        if (n >= 1 && buf[0] == NL_PKT_DISCOVERY_RESPONSE) responses++;
+        if (n >= 1 && buf[0] == WN_PKT_DISCOVERY_RESPONSE) responses++;
     }
 
     /* Sanity: unicast discovery works at all in this namespace. */
@@ -685,10 +685,10 @@ TEST(test_discovery_rate_limited) {
     ASSERT_TRUE(responses <= 210);
 
     close(raw);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(server);
 }
 
-/* Regression: the payload nl_poll_event hands out was a single
+/* Regression: the payload wn_poll_event hands out was a single
  * endpoint-wide "returned_owned_data" slot, freed by the next poll from ANY
  * thread. Two threads polling concurrently meant one thread's poll freed a
  * buffer the other was still reading -- a use-after-free that also made the
@@ -701,7 +701,7 @@ TEST(test_discovery_rate_limited) {
 #define PAYLOAD_BYTE 0xC3
 
 typedef struct {
-    nl_endpoint_t *server;
+    wn_endpoint_t *server;
     int delivered;
     int corrupted;   /* payload bytes not matching the sent pattern */
     int missing;     /* polls that timed out */
@@ -713,9 +713,9 @@ typedef struct {
 static void *poller_main(void *arg) {
     poller_ctx_t *ctx = (poller_ctx_t *)arg;
     for (int i = 0; i < POLLS_PER_THREAD; i++) {
-        nl_event_t ev;
-        if (!nl_poll_event(ctx->server, &ev, 10000)) { ctx->missing++; continue; }
-        if (ev.event_type != NL_EVENT_DATA) continue;
+        wn_event_t ev;
+        if (!wn_poll_event(ctx->server, &ev, 10000)) { ctx->missing++; continue; }
+        if (ev.event_type != WN_EVENT_DATA) continue;
         /* The payload is only valid until THIS thread's next poll, so read
          * it immediately -- a shared endpoint-wide borrow slot would already
          * have been freed by another thread's poll by now. */
@@ -729,17 +729,17 @@ static void *poller_main(void *arg) {
 }
 
 TEST(test_concurrent_pollers_do_not_free_each_others_payloads) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    nl_endpoint_t *server = NULL, *client = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34730);
-    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
-    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+    wn_config_t cfg; wn_config_default(&cfg);
+    wn_endpoint_t *server = NULL, *client = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34730);
+    ASSERT_EQ(wn_server_create(&bind_addr, &cfg, &server), WN_OK);
+    ASSERT_EQ(wn_client_create(&cfg, &client), WN_OK);
 
-    nl_peer_id_t client_peer;
-    ASSERT_EQ(nl_connect(client, &bind_addr, &client_peer), NL_OK);
-    nl_event_t ev;
-    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 5000));
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 5000));
+    wn_peer_id_t client_peer;
+    ASSERT_EQ(wn_connect(client, &bind_addr, &client_peer), WN_OK);
+    wn_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, WN_EVENT_CONNECTED, &ev, 5000));
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_CONNECTED, &ev, 5000));
 
     const int total = POLLER_THREADS * POLLS_PER_THREAD;
     pthread_t threads[POLLER_THREADS];
@@ -759,9 +759,9 @@ TEST(test_concurrent_pollers_do_not_free_each_others_payloads) {
     memset(payload, PAYLOAD_BYTE, sizeof(payload));
     int sent = 0, idle_rounds = 0;
     while (sent < total && idle_rounds < 200) {
-        nl_result_t r = nl_send(client, client_peer, 0, NL_RELIABLE_ORDERED,
+        wn_result_t r = wn_send(client, client_peer, 0, WN_RELIABLE_ORDERED,
                                 payload, sizeof(payload));
-        if (r == NL_OK) { sent++; idle_rounds = 0; continue; }
+        if (r == WN_OK) { sent++; idle_rounds = 0; continue; }
         usleep(2000);
         idle_rounds++;
     }
@@ -784,11 +784,11 @@ TEST(test_concurrent_pollers_do_not_free_each_others_payloads) {
     ASSERT_EQ(missing, 0);
     ASSERT_EQ(delivered, total);
 
-    nl_endpoint_destroy(client);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
 }
 
-/* Version consistency: nl_version_string() must match the NL_VERSION_*
+/* Version consistency: wn_version_string() must match the WN_VERSION_*
  * macros so bindings and callers that parse either stay in sync. */
 /* Regression: the handshake retransmit path copied the retained packet
  * into a buffer sized for CONNECT_RESPONSE (65) while a server entry
@@ -799,10 +799,10 @@ TEST(test_concurrent_pollers_do_not_free_each_others_payloads) {
  * for real and requires the retransmitted CHALLENGE to be byte-identical to
  * the original at full length. */
 TEST(test_server_challenge_retransmit_roundtrips_at_full_length) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    nl_endpoint_t *server = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34722);
-    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+    wn_config_t cfg; wn_config_default(&cfg);
+    wn_endpoint_t *server = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34722);
+    ASSERT_EQ(wn_server_create(&bind_addr, &cfg, &server), WN_OK);
 
     /* Speak the handshake by hand so we control whether the RESPONSE is ever
      * sent -- which is what keeps the server's pending entry alive and armed
@@ -818,17 +818,17 @@ TEST(test_server_challenge_retransmit_roundtrips_at_full_length) {
     server_addr.sin_port = htons(bind_addr.port);
     server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
 
-    uint8_t req[NL_CONNECT_REQUEST_SIZE];
+    uint8_t req[WN_CONNECT_REQUEST_SIZE];
     memset(req, 0, sizeof(req));
-    req[0] = NL_PKT_CONNECT_REQUEST;
-    nl_put_u32(req + 1, NL_MAGIC);
-    nl_put_u16(req + 5, NL_PROTOCOL_VERSION);
+    req[0] = WN_PKT_CONNECT_REQUEST;
+    wn_put_u32(req + 1, WN_MAGIC);
+    wn_put_u16(req + 5, WN_PROTOCOL_VERSION);
     req[7] = 4; /* channel_count */
-    nl_put_u64(req + 8, 0x0123456789ABCDEFull);
+    wn_put_u64(req + 8, 0x0123456789ABCDEFull);
     for (int i = 0; i < 32; i++) req[16 + i] = (uint8_t)(i * 7 + 1);  /* client pubkey */
     for (int i = 0; i < 16; i++) req[48 + i] = (uint8_t)(i * 11 + 3); /* client nonce */
-    nl_put_u32(req + 64, cfg.capabilities);
-    ASSERT_EQ((int)sizeof(req), NL_CONNECT_REQUEST_SIZE);
+    wn_put_u32(req + 64, cfg.capabilities);
+    ASSERT_EQ((int)sizeof(req), WN_CONNECT_REQUEST_SIZE);
 
     ASSERT_TRUE(sendto(raw, req, sizeof(req), 0,
                        (struct sockaddr *)&server_addr, sizeof(server_addr)) >= 0);
@@ -836,35 +836,35 @@ TEST(test_server_challenge_retransmit_roundtrips_at_full_length) {
     uint8_t first[256];
     ssize_t n = recv(raw, first, sizeof(first), 0);
     ASSERT_TRUE(n >= 1);
-    ASSERT_EQ(first[0], NL_PKT_CONNECT_CHALLENGE);
-    ASSERT_EQ(n, NL_CONNECT_CHALLENGE_SIZE); /* the full, untruncated packet */
+    ASSERT_EQ(first[0], WN_PKT_CONNECT_CHALLENGE);
+    ASSERT_EQ(n, WN_CONNECT_CHALLENGE_SIZE); /* the full, untruncated packet */
     uint8_t original[256];
-    memcpy(original, first, NL_CONNECT_CHALLENGE_SIZE);
+    memcpy(original, first, WN_CONNECT_CHALLENGE_SIZE);
 
     /* Answer nothing: the server must retransmit its CHALLENGE on its
-     * NL_HANDSHAKE_RETRY_MS timer. */
+     * WN_HANDSHAKE_RETRY_MS timer. */
     uint8_t again[256];
     n = recv(raw, again, sizeof(again), 0);
     ASSERT_TRUE(n >= 1);
-    ASSERT_EQ(again[0], NL_PKT_CONNECT_CHALLENGE);
-    ASSERT_EQ(n, NL_CONNECT_CHALLENGE_SIZE);
+    ASSERT_EQ(again[0], WN_PKT_CONNECT_CHALLENGE);
+    ASSERT_EQ(n, WN_CONNECT_CHALLENGE_SIZE);
     /* Byte-identical: the cookie, both nonces and the server pubkey all
      * survived the copy out of the pending table. */
-    CHECK_MEM_EQ(again, original, NL_CONNECT_CHALLENGE_SIZE);
+    CHECK_MEM_EQ(again, original, WN_CONNECT_CHALLENGE_SIZE);
 
     close(raw);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(server);
 }
 
 /* The retained-handshake buffer must fit every handshake packet, and the
  * CHALLENGE (server-side) is the largest. */
-_Static_assert(NL_CONNECT_MAX_PACKET_SIZE >= NL_CONNECT_CHALLENGE_SIZE,
+_Static_assert(WN_CONNECT_MAX_PACKET_SIZE >= WN_CONNECT_CHALLENGE_SIZE,
                "retained handshake buffer must fit a CONNECT_CHALLENGE");
-_Static_assert(NL_CONNECT_MAX_PACKET_SIZE >= NL_CONNECT_RESPONSE_SIZE,
+_Static_assert(WN_CONNECT_MAX_PACKET_SIZE >= WN_CONNECT_RESPONSE_SIZE,
                "retained handshake buffer must fit a CONNECT_RESPONSE");
-_Static_assert(NL_CONNECT_MAX_PACKET_SIZE >= NL_CONNECT_REQUEST_SIZE,
+_Static_assert(WN_CONNECT_MAX_PACKET_SIZE >= WN_CONNECT_REQUEST_SIZE,
                "retained handshake buffer must fit a CONNECT_REQUEST");
-_Static_assert(NL_CONNECT_CHALLENGE_SIZE > NL_CONNECT_RESPONSE_SIZE,
+_Static_assert(WN_CONNECT_CHALLENGE_SIZE > WN_CONNECT_RESPONSE_SIZE,
                "if CHALLENGE ever becomes smaller than RESPONSE, the "
                "max-size sizing above still holds but this test's premise "
                "(that the old sizing was wrong) no longer describes the bug");
@@ -872,196 +872,196 @@ _Static_assert(NL_CONNECT_CHALLENGE_SIZE > NL_CONNECT_RESPONSE_SIZE,
 TEST(test_version_string_matches_macros) {
     char expected[32];
     snprintf(expected, sizeof(expected), "%d.%d.%d",
-             NL_VERSION_MAJOR, NL_VERSION_MINOR, NL_VERSION_PATCH);
-    ASSERT_TRUE(strcmp(nl_version_string(), expected) == 0);
+             WN_VERSION_MAJOR, WN_VERSION_MINOR, WN_VERSION_PATCH);
+    ASSERT_TRUE(strcmp(wn_version_string(), expected) == 0);
 }
 
-/* nl_error_string must return a stable, non-empty description for every
+/* wn_error_string must return a stable, non-empty description for every
  * documented error code (and "unknown error" for out-of-range values) so
  * bindings that surface it to users never get NULL or "". */
 TEST(test_error_string_covers_all_codes) {
-    const nl_result_t codes[] = {
-        NL_OK, NL_ERR_INVALID_ARGUMENT, NL_ERR_OUT_OF_MEMORY, NL_ERR_SOCKET,
-        NL_ERR_BIND_FAILED, NL_ERR_NOT_CONNECTED, NL_ERR_ALREADY_CONNECTED,
-        NL_ERR_MESSAGE_TOO_LARGE, NL_ERR_CHANNEL_OUT_OF_RANGE, NL_ERR_QUEUE_FULL,
-        NL_ERR_CRYPTO, NL_ERR_PROTOCOL_MISMATCH, NL_ERR_TIMEOUT,
-        NL_ERR_PEER_NOT_FOUND, NL_ERR_DENIED, NL_ERR_UNSUPPORTED,
-        NL_ERR_SERVER_FULL, NL_ERR_INTERNAL,
+    const wn_result_t codes[] = {
+        WN_OK, WN_ERR_INVALID_ARGUMENT, WN_ERR_OUT_OF_MEMORY, WN_ERR_SOCKET,
+        WN_ERR_BIND_FAILED, WN_ERR_NOT_CONNECTED, WN_ERR_ALREADY_CONNECTED,
+        WN_ERR_MESSAGE_TOO_LARGE, WN_ERR_CHANNEL_OUT_OF_RANGE, WN_ERR_QUEUE_FULL,
+        WN_ERR_CRYPTO, WN_ERR_PROTOCOL_MISMATCH, WN_ERR_TIMEOUT,
+        WN_ERR_PEER_NOT_FOUND, WN_ERR_DENIED, WN_ERR_UNSUPPORTED,
+        WN_ERR_SERVER_FULL, WN_ERR_INTERNAL,
     };
     for (size_t i = 0; i < sizeof(codes) / sizeof(codes[0]); i++) {
-        const char *s = nl_error_string(codes[i]);
+        const char *s = wn_error_string(codes[i]);
         ASSERT_TRUE(s != NULL);
         ASSERT_TRUE(s[0] != '\0');
         ASSERT_TRUE(strcmp(s, "unknown error") != 0);
     }
     /* Out-of-range: still returns a non-NULL fallback. */
-    ASSERT_TRUE(strcmp(nl_error_string((nl_result_t)-12345), "unknown error") == 0);
-    ASSERT_TRUE(strcmp(nl_error_string(NL_OK), "ok") == 0);
+    ASSERT_TRUE(strcmp(wn_error_string((wn_result_t)-12345), "unknown error") == 0);
+    ASSERT_TRUE(strcmp(wn_error_string(WN_OK), "ok") == 0);
 }
 
-/* nl_send_ex is the priority-tagged send path; exercise a high-priority
+/* wn_send_ex is the priority-tagged send path; exercise a high-priority
  * send end-to-end and confirm it arrives intact (priority is local
  * queue-ordering, so we only assert delivery, not wire encoding). */
 TEST(test_send_ex_high_priority_over_real_sockets) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    nl_endpoint_t *server = NULL, *client = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34718);
-    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
-    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+    wn_config_t cfg; wn_config_default(&cfg);
+    wn_endpoint_t *server = NULL, *client = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34718);
+    ASSERT_EQ(wn_server_create(&bind_addr, &cfg, &server), WN_OK);
+    ASSERT_EQ(wn_client_create(&cfg, &client), WN_OK);
 
-    nl_peer_id_t client_peer;
-    ASSERT_EQ(nl_connect(client, &bind_addr, &client_peer), NL_OK);
-    nl_event_t ev;
-    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 3000));
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 3000));
-    nl_peer_id_t server_peer = ev.peer;
+    wn_peer_id_t client_peer;
+    ASSERT_EQ(wn_connect(client, &bind_addr, &client_peer), WN_OK);
+    wn_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, WN_EVENT_CONNECTED, &ev, 3000));
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_CONNECTED, &ev, 3000));
+    wn_peer_id_t server_peer = ev.peer;
 
     const char *msg = "urgent high-priority payload";
-    ASSERT_EQ(nl_send_ex(client, client_peer, 0, NL_RELIABLE_ORDERED,
-                         (const uint8_t *)msg, strlen(msg), NL_PRIORITY_HIGH), NL_OK);
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_DATA, &ev, 3000));
+    ASSERT_EQ(wn_send_ex(client, client_peer, 0, WN_RELIABLE_ORDERED,
+                         (const uint8_t *)msg, strlen(msg), WN_PRIORITY_HIGH), WN_OK);
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_DATA, &ev, 3000));
     ASSERT_EQ(ev.data_len, strlen(msg));
     ASSERT_MEM_EQ(ev.data, msg, strlen(msg));
 
     /* Error paths: unknown peer and null endpoint. */
-    ASSERT_EQ(nl_send_ex(client, 0xDEADBEEF, 0, NL_RELIABLE_ORDERED,
-                         (const uint8_t *)msg, strlen(msg), NL_PRIORITY_NORMAL),
-              NL_ERR_PEER_NOT_FOUND);
-    ASSERT_EQ(nl_send_ex(NULL, client_peer, 0, NL_RELIABLE_ORDERED,
-                         (const uint8_t *)msg, strlen(msg), NL_PRIORITY_NORMAL),
-              NL_ERR_INVALID_ARGUMENT);
-    ASSERT_EQ(nl_send_ex(client, client_peer, 0, NL_RELIABLE_ORDERED, NULL, 5,
-                         NL_PRIORITY_NORMAL), NL_ERR_INVALID_ARGUMENT);
+    ASSERT_EQ(wn_send_ex(client, 0xDEADBEEF, 0, WN_RELIABLE_ORDERED,
+                         (const uint8_t *)msg, strlen(msg), WN_PRIORITY_NORMAL),
+              WN_ERR_PEER_NOT_FOUND);
+    ASSERT_EQ(wn_send_ex(NULL, client_peer, 0, WN_RELIABLE_ORDERED,
+                         (const uint8_t *)msg, strlen(msg), WN_PRIORITY_NORMAL),
+              WN_ERR_INVALID_ARGUMENT);
+    ASSERT_EQ(wn_send_ex(client, client_peer, 0, WN_RELIABLE_ORDERED, NULL, 5,
+                         WN_PRIORITY_NORMAL), WN_ERR_INVALID_ARGUMENT);
 
     (void)server_peer;
-    nl_endpoint_destroy(client);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
 }
 
-/* nl_peer_address: returns the remote address of a live connection and
+/* wn_peer_address: returns the remote address of a live connection and
  * false for unknown peers / null args. */
 TEST(test_peer_address_over_real_sockets) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    nl_endpoint_t *server = NULL, *client = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34719);
-    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
-    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+    wn_config_t cfg; wn_config_default(&cfg);
+    wn_endpoint_t *server = NULL, *client = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34719);
+    ASSERT_EQ(wn_server_create(&bind_addr, &cfg, &server), WN_OK);
+    ASSERT_EQ(wn_client_create(&cfg, &client), WN_OK);
 
-    nl_peer_id_t client_peer;
-    ASSERT_EQ(nl_connect(client, &bind_addr, &client_peer), NL_OK);
-    nl_event_t ev;
-    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 3000));
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 3000));
-    nl_peer_id_t server_peer = ev.peer;
+    wn_peer_id_t client_peer;
+    ASSERT_EQ(wn_connect(client, &bind_addr, &client_peer), WN_OK);
+    wn_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, WN_EVENT_CONNECTED, &ev, 3000));
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_CONNECTED, &ev, 3000));
+    wn_peer_id_t server_peer = ev.peer;
 
-    nl_address_t out;
+    wn_address_t out;
     memset(&out, 0, sizeof(out));
-    ASSERT_TRUE(nl_peer_address(server, server_peer, &out));
+    ASSERT_TRUE(wn_peer_address(server, server_peer, &out));
     ASSERT_TRUE(strcmp(out.host, "127.0.0.1") == 0);
     ASSERT_TRUE(out.port != 0);
 
     memset(&out, 0, sizeof(out));
-    ASSERT_TRUE(nl_peer_address(client, client_peer, &out));
+    ASSERT_TRUE(wn_peer_address(client, client_peer, &out));
     ASSERT_TRUE(out.port != 0);
 
-    ASSERT_FALSE(nl_peer_address(client, 0xDEADBEEF, &out));
-    ASSERT_FALSE(nl_peer_address(NULL, client_peer, &out));
-    ASSERT_FALSE(nl_peer_address(client, client_peer, NULL));
+    ASSERT_FALSE(wn_peer_address(client, 0xDEADBEEF, &out));
+    ASSERT_FALSE(wn_peer_address(NULL, client_peer, &out));
+    ASSERT_FALSE(wn_peer_address(client, client_peer, NULL));
 
-    nl_endpoint_destroy(client);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
 }
 
-/* nl_peer_rtt_ms / nl_peer_count: after a reliable round trip the RTT
+/* wn_peer_rtt_ms / wn_peer_count: after a reliable round trip the RTT
  * estimate must be wired up (bounded), and peer_count must track live
  * connections (0 before, 1 after, 0 after disconnect). */
 TEST(test_peer_rtt_ms_and_peer_count) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    nl_endpoint_t *server = NULL, *client = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34720);
-    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
-    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+    wn_config_t cfg; wn_config_default(&cfg);
+    wn_endpoint_t *server = NULL, *client = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34720);
+    ASSERT_EQ(wn_server_create(&bind_addr, &cfg, &server), WN_OK);
+    ASSERT_EQ(wn_client_create(&cfg, &client), WN_OK);
 
-    ASSERT_EQ(nl_peer_count(client), 0u);
-    ASSERT_EQ(nl_peer_count(server), 0u);
-    ASSERT_EQ(nl_peer_rtt_ms(client, 1), 0u); /* unknown peer -> 0 */
-    ASSERT_EQ(nl_peer_rtt_ms(NULL, 1), 0u);
+    ASSERT_EQ(wn_peer_count(client), 0u);
+    ASSERT_EQ(wn_peer_count(server), 0u);
+    ASSERT_EQ(wn_peer_rtt_ms(client, 1), 0u); /* unknown peer -> 0 */
+    ASSERT_EQ(wn_peer_rtt_ms(NULL, 1), 0u);
 
-    nl_peer_id_t client_peer;
-    ASSERT_EQ(nl_connect(client, &bind_addr, &client_peer), NL_OK);
-    nl_event_t ev;
-    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 3000));
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 3000));
-    nl_peer_id_t server_peer = ev.peer;
+    wn_peer_id_t client_peer;
+    ASSERT_EQ(wn_connect(client, &bind_addr, &client_peer), WN_OK);
+    wn_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, WN_EVENT_CONNECTED, &ev, 3000));
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_CONNECTED, &ev, 3000));
+    wn_peer_id_t server_peer = ev.peer;
 
-    ASSERT_EQ(nl_peer_count(client), 1u);
-    ASSERT_EQ(nl_peer_count(server), 1u);
+    ASSERT_EQ(wn_peer_count(client), 1u);
+    ASSERT_EQ(wn_peer_count(server), 1u);
 
     const char *msg = "ping for rtt";
-    ASSERT_EQ(nl_send(client, client_peer, 0, NL_RELIABLE_ORDERED,
-                      (const uint8_t *)msg, strlen(msg)), NL_OK);
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_DATA, &ev, 3000));
-    ASSERT_EQ(nl_send(server, server_peer, 0, NL_RELIABLE_ORDERED,
-                      (const uint8_t *)"pong", 4), NL_OK);
-    ASSERT_TRUE(wait_for_event(client, NL_EVENT_DATA, &ev, 3000));
+    ASSERT_EQ(wn_send(client, client_peer, 0, WN_RELIABLE_ORDERED,
+                      (const uint8_t *)msg, strlen(msg)), WN_OK);
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_DATA, &ev, 3000));
+    ASSERT_EQ(wn_send(server, server_peer, 0, WN_RELIABLE_ORDERED,
+                      (const uint8_t *)"pong", 4), WN_OK);
+    ASSERT_TRUE(wait_for_event(client, WN_EVENT_DATA, &ev, 3000));
 
     /* Loopback RTT should be small but the estimate must be live. */
-    ASSERT_TRUE(nl_peer_rtt_ms(client, client_peer) < 2000);
-    ASSERT_TRUE(nl_peer_rtt_ms(client, 0xDEADBEEF) == 0u);
+    ASSERT_TRUE(wn_peer_rtt_ms(client, client_peer) < 2000);
+    ASSERT_TRUE(wn_peer_rtt_ms(client, 0xDEADBEEF) == 0u);
 
-    ASSERT_EQ(nl_disconnect(client, client_peer), NL_OK);
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_DISCONNECTED, &ev, 3000));
+    ASSERT_EQ(wn_disconnect(client, client_peer), WN_OK);
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_DISCONNECTED, &ev, 3000));
 
     /* Allow the client's local side to tear the connection down too. */
-    for (int i = 0; i < 40 && nl_peer_count(client) > 0; i++) {
-        nl_poll_event(client, &ev, 50);
+    for (int i = 0; i < 40 && wn_peer_count(client) > 0; i++) {
+        wn_poll_event(client, &ev, 50);
     }
-    ASSERT_EQ(nl_peer_count(client), 0u);
+    ASSERT_EQ(wn_peer_count(client), 0u);
 
-    nl_endpoint_destroy(client);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
 }
 
-/* Regression (P1-7): an empty nl_connect host must be rejected with
- * NL_ERR_INVALID_ARGUMENT rather than silently defaulting to 127.0.0.1. */
+/* Regression (P1-7): an empty wn_connect host must be rejected with
+ * WN_ERR_INVALID_ARGUMENT rather than silently defaulting to 127.0.0.1. */
 TEST(test_connect_empty_host_rejected) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    nl_endpoint_t *client = NULL;
-    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+    wn_config_t cfg; wn_config_default(&cfg);
+    wn_endpoint_t *client = NULL;
+    ASSERT_EQ(wn_client_create(&cfg, &client), WN_OK);
 
-    nl_address_t empty;
+    wn_address_t empty;
     memset(&empty, 0, sizeof(empty));
     empty.port = 34732;
-    empty.family = NL_AF_UNSPEC;
-    nl_peer_id_t peer = 0;
-    ASSERT_EQ(nl_connect(client, &empty, &peer), NL_ERR_INVALID_ARGUMENT);
+    empty.family = WN_AF_UNSPEC;
+    wn_peer_id_t peer = 0;
+    ASSERT_EQ(wn_connect(client, &empty, &peer), WN_ERR_INVALID_ARGUMENT);
 
-    nl_endpoint_destroy(client);
+    wn_endpoint_destroy(client);
 }
 
 /* Regression (P1-3): zero-length sends (data==NULL, len==0) must not
  * pass NULL to memcpy, even with a zero length (UB), and must round-trip
  * as an empty DATA event. */
 TEST(test_zero_length_send_roundtrips) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    nl_endpoint_t *server = NULL, *client = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34731);
-    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
-    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+    wn_config_t cfg; wn_config_default(&cfg);
+    wn_endpoint_t *server = NULL, *client = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34731);
+    ASSERT_EQ(wn_server_create(&bind_addr, &cfg, &server), WN_OK);
+    ASSERT_EQ(wn_client_create(&cfg, &client), WN_OK);
 
-    nl_peer_id_t client_peer;
-    ASSERT_EQ(nl_connect(client, &bind_addr, &client_peer), NL_OK);
-    nl_event_t ev;
-    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 3000));
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 3000));
+    wn_peer_id_t client_peer;
+    ASSERT_EQ(wn_connect(client, &bind_addr, &client_peer), WN_OK);
+    wn_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, WN_EVENT_CONNECTED, &ev, 3000));
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_CONNECTED, &ev, 3000));
 
-    ASSERT_EQ(nl_send(client, client_peer, 0, NL_RELIABLE_ORDERED, NULL, 0), NL_OK);
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_DATA, &ev, 3000));
+    ASSERT_EQ(wn_send(client, client_peer, 0, WN_RELIABLE_ORDERED, NULL, 0), WN_OK);
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_DATA, &ev, 3000));
     ASSERT_EQ(ev.data_len, 0u);
     /* ev.data is NULL for empty payloads (no allocation); just don't crash. */
 
-    nl_endpoint_destroy(client);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
 }
 
 /* Test-only visibility into the pending handshake table and the event
@@ -1070,25 +1070,25 @@ TEST(test_zero_length_send_roundtrips) {
 
 /* Build a well-formed CONNECT_REQUEST with caller-chosen identity fields. */
 static void build_connect_request(uint8_t *req, uint64_t connid, uint8_t seed) {
-    memset(req, 0, NL_CONNECT_REQUEST_SIZE);
-    req[0] = NL_PKT_CONNECT_REQUEST;
-    nl_put_u32(req + 1, NL_MAGIC);
-    nl_put_u16(req + 5, NL_PROTOCOL_VERSION);
+    memset(req, 0, WN_CONNECT_REQUEST_SIZE);
+    req[0] = WN_PKT_CONNECT_REQUEST;
+    wn_put_u32(req + 1, WN_MAGIC);
+    wn_put_u16(req + 5, WN_PROTOCOL_VERSION);
     req[7] = 4; /* channel_count */
-    nl_put_u64(req + 8, connid);
+    wn_put_u64(req + 8, connid);
     for (int i = 0; i < 32; i++) req[16 + i] = (uint8_t)(i * 7 + seed);  /* client pubkey */
     for (int i = 0; i < 16; i++) req[48 + i] = (uint8_t)(i * 11 + seed); /* client nonce */
-    nl_put_u32(req + 64, NL_CAP_DEFAULT);
+    wn_put_u32(req + 64, WN_CAP_DEFAULT);
 }
 
 /* Regression: a handshake whose magic or protocol version does not match
  * must get an explicit CONNECT_DENIED(PROTOCOL_MISMATCH), not silence --
  * v1 clients rely on the explicit deny to surface a useful error. */
 TEST(test_server_denies_protocol_mismatch) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    nl_endpoint_t *server = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34810);
-    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+    wn_config_t cfg; wn_config_default(&cfg);
+    wn_endpoint_t *server = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34810);
+    ASSERT_EQ(wn_server_create(&bind_addr, &cfg, &server), WN_OK);
 
     int raw = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     ASSERT_TRUE(raw >= 0);
@@ -1102,39 +1102,39 @@ TEST(test_server_denies_protocol_mismatch) {
     server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
 
     /* Wrong protocol version. */
-    uint8_t req[NL_CONNECT_REQUEST_SIZE];
+    uint8_t req[WN_CONNECT_REQUEST_SIZE];
     build_connect_request(req, 0xAAAA0001, 1);
-    nl_put_u16(req + 5, NL_PROTOCOL_VERSION + 1);
+    wn_put_u16(req + 5, WN_PROTOCOL_VERSION + 1);
     ASSERT_TRUE(sendto(raw, req, sizeof(req), 0,
                        (struct sockaddr *)&server_addr, sizeof(server_addr)) >= 0);
     uint8_t resp[256];
     ssize_t n = recv(raw, resp, sizeof(resp), 0);
-    ASSERT_TRUE(n >= (ssize_t)NL_CONNECT_DENIED_SIZE);
-    ASSERT_EQ(resp[0], NL_PKT_CONNECT_DENIED);
-    ASSERT_EQ(resp[1], NL_DENY_PROTOCOL_MISMATCH);
+    ASSERT_TRUE(n >= (ssize_t)WN_CONNECT_DENIED_SIZE);
+    ASSERT_EQ(resp[0], WN_PKT_CONNECT_DENIED);
+    ASSERT_EQ(resp[1], WN_DENY_PROTOCOL_MISMATCH);
 
     /* Wrong magic, right version. */
     build_connect_request(req, 0xAAAA0002, 2);
-    nl_put_u32(req + 1, NL_MAGIC + 1);
+    wn_put_u32(req + 1, WN_MAGIC + 1);
     ASSERT_TRUE(sendto(raw, req, sizeof(req), 0,
                        (struct sockaddr *)&server_addr, sizeof(server_addr)) >= 0);
     n = recv(raw, resp, sizeof(resp), 0);
-    ASSERT_TRUE(n >= (ssize_t)NL_CONNECT_DENIED_SIZE);
-    ASSERT_EQ(resp[0], NL_PKT_CONNECT_DENIED);
-    ASSERT_EQ(resp[1], NL_DENY_PROTOCOL_MISMATCH);
+    ASSERT_TRUE(n >= (ssize_t)WN_CONNECT_DENIED_SIZE);
+    ASSERT_EQ(resp[0], WN_PKT_CONNECT_DENIED);
+    ASSERT_EQ(resp[1], WN_DENY_PROTOCOL_MISMATCH);
 
     close(raw);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(server);
 }
 
 /* The client side of the same contract: a CONNECT_DENIED carrying the
- * protocol-mismatch reason must surface as NL_EVENT_CONNECT_FAILED with
- * NL_ERR_PROTOCOL_MISMATCH (not a generic deny), and must consume the
+ * protocol-mismatch reason must surface as WN_EVENT_CONNECT_FAILED with
+ * WN_ERR_PROTOCOL_MISMATCH (not a generic deny), and must consume the
  * pending handshake entry. */
 TEST(test_client_surfaces_protocol_mismatch_deny) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    nl_endpoint_t *client = NULL;
-    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+    wn_config_t cfg; wn_config_default(&cfg);
+    wn_endpoint_t *client = NULL;
+    ASSERT_EQ(wn_client_create(&cfg, &client), WN_OK);
 
     /* Fake server: a bound UDP socket that answers the first REQUEST with
      * a DENIED(PROTOCOL_MISMATCH) and nothing else. */
@@ -1149,28 +1149,28 @@ TEST(test_client_surfaces_protocol_mismatch_deny) {
     struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
     setsockopt(raw, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    nl_address_t server_addr = addr("127.0.0.1", 34811);
-    nl_peer_id_t peer = 0;
-    ASSERT_EQ(nl_connect(client, &server_addr, &peer), NL_OK);
+    wn_address_t server_addr = addr("127.0.0.1", 34811);
+    wn_peer_id_t peer = 0;
+    ASSERT_EQ(wn_connect(client, &server_addr, &peer), WN_OK);
 
     uint8_t req[256];
     struct sockaddr_storage from; socklen_t from_len = sizeof(from);
     ssize_t n = recvfrom(raw, req, sizeof(req), 0, (struct sockaddr *)&from, &from_len);
-    ASSERT_TRUE(n >= (ssize_t)NL_CONNECT_REQUEST_SIZE);
-    ASSERT_EQ(req[0], NL_PKT_CONNECT_REQUEST);
+    ASSERT_TRUE(n >= (ssize_t)WN_CONNECT_REQUEST_SIZE);
+    ASSERT_EQ(req[0], WN_PKT_CONNECT_REQUEST);
 
-    uint8_t denied[NL_CONNECT_DENIED_SIZE] = { NL_PKT_CONNECT_DENIED, NL_DENY_PROTOCOL_MISMATCH };
+    uint8_t denied[WN_CONNECT_DENIED_SIZE] = { WN_PKT_CONNECT_DENIED, WN_DENY_PROTOCOL_MISMATCH };
     ASSERT_TRUE(sendto(raw, denied, sizeof(denied), 0,
                        (struct sockaddr *)&from, from_len) >= 0);
 
-    nl_event_t ev;
-    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECT_FAILED, &ev, 3000));
-    ASSERT_EQ(ev.disconnect_reason, NL_ERR_PROTOCOL_MISMATCH);
+    wn_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, WN_EVENT_CONNECT_FAILED, &ev, 3000));
+    ASSERT_EQ(ev.disconnect_reason, WN_ERR_PROTOCOL_MISMATCH);
     /* The failed handshake must have released its pending slot. */
-    ASSERT_EQ(nl_endpoint_pending_used_for_test(client), 0);
+    ASSERT_EQ(wn_endpoint_pending_used_for_test(client), 0);
 
     close(raw);
-    nl_endpoint_destroy(client);
+    wn_endpoint_destroy(client);
 }
 
 /* Cookie rejection: a CONNECT_RESPONSE whose cookie does not match the
@@ -1179,10 +1179,10 @@ TEST(test_client_surfaces_protocol_mismatch_deny) {
  * honest response arrives -- the bogus one must not burn the pending
  * entry or poison the cookie comparison. */
 TEST(test_spoofed_connect_response_rejected) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    nl_endpoint_t *server = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34812);
-    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+    wn_config_t cfg; wn_config_default(&cfg);
+    wn_endpoint_t *server = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34812);
+    ASSERT_EQ(wn_server_create(&bind_addr, &cfg, &server), WN_OK);
 
     int raw = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     ASSERT_TRUE(raw >= 0);
@@ -1195,22 +1195,22 @@ TEST(test_spoofed_connect_response_rejected) {
     server_addr.sin_port = htons(bind_addr.port);
     server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
 
-    uint8_t req[NL_CONNECT_REQUEST_SIZE];
+    uint8_t req[WN_CONNECT_REQUEST_SIZE];
     build_connect_request(req, 0xBBBB0001, 3);
     ASSERT_TRUE(sendto(raw, req, sizeof(req), 0,
                        (struct sockaddr *)&server_addr, sizeof(server_addr)) >= 0);
 
     uint8_t challenge[256];
     ssize_t n = recv(raw, challenge, sizeof(challenge), 0);
-    ASSERT_TRUE(n >= (ssize_t)NL_CONNECT_CHALLENGE_SIZE);
-    ASSERT_EQ(challenge[0], NL_PKT_CONNECT_CHALLENGE);
+    ASSERT_TRUE(n >= (ssize_t)WN_CONNECT_CHALLENGE_SIZE);
+    ASSERT_EQ(challenge[0], WN_PKT_CONNECT_CHALLENGE);
     /* CHALLENGE: type(1) server_pub(32) server_nonce(16) cookie(16) caps(4). */
     uint8_t cookie[16];
     memcpy(cookie, challenge + 1 + 32 + 16, 16);
 
     /* Spoofed response: right pubkey/nonce echo, corrupted cookie. */
-    uint8_t resp[NL_CONNECT_RESPONSE_SIZE];
-    resp[0] = NL_PKT_CONNECT_RESPONSE;
+    uint8_t resp[WN_CONNECT_RESPONSE_SIZE];
+    resp[0] = WN_PKT_CONNECT_RESPONSE;
     memcpy(resp + 1, cookie, 16);
     resp[1] ^= 0xFF; /* corrupt the cookie */
     memcpy(resp + 17, req + 16, 32);  /* client pubkey echo */
@@ -1224,12 +1224,12 @@ TEST(test_spoofed_connect_response_rejected) {
         uint8_t buf[256];
         ssize_t m = recv(raw, buf, sizeof(buf), 0);
         if (m < 1) break; /* timed out: good, nothing more is coming */
-        ASSERT_FALSE(buf[0] == NL_PKT_CONNECT_ACCEPTED);
+        ASSERT_FALSE(buf[0] == WN_PKT_CONNECT_ACCEPTED);
     }
 
     /* The honest response must still complete the handshake: the spoofed
      * one must not have released or corrupted the pending entry. */
-    resp[0] = NL_PKT_CONNECT_RESPONSE;
+    resp[0] = WN_PKT_CONNECT_RESPONSE;
     memcpy(resp + 1, cookie, 16);
     ASSERT_TRUE(sendto(raw, resp, sizeof(resp), 0,
                        (struct sockaddr *)&server_addr, sizeof(server_addr)) >= 0);
@@ -1237,19 +1237,19 @@ TEST(test_spoofed_connect_response_rejected) {
     uint8_t accepted[256];
     n = recv(raw, accepted, sizeof(accepted), 0);
     ASSERT_TRUE(n >= 1);
-    ASSERT_EQ(accepted[0], NL_PKT_CONNECT_ACCEPTED);
+    ASSERT_EQ(accepted[0], WN_PKT_CONNECT_ACCEPTED);
 
     close(raw);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(server);
 }
 
 /* Handshake timeout: a server that never answers must produce
- * NL_EVENT_CONNECT_FAILED with NL_ERR_TIMEOUT once the pending entry
- * expires (NL_PENDING_TIMEOUT_MS), not hang forever. */
+ * WN_EVENT_CONNECT_FAILED with WN_ERR_TIMEOUT once the pending entry
+ * expires (WN_PENDING_TIMEOUT_MS), not hang forever. */
 TEST(test_connect_timeout_when_server_silent) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    nl_endpoint_t *client = NULL;
-    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+    wn_config_t cfg; wn_config_default(&cfg);
+    wn_endpoint_t *client = NULL;
+    ASSERT_EQ(wn_client_create(&cfg, &client), WN_OK);
 
     /* A black hole: bound, never reads, never replies. */
     int raw = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -1261,29 +1261,29 @@ TEST(test_connect_timeout_when_server_silent) {
     sink.sin_addr.s_addr = inet_addr("127.0.0.1");
     ASSERT_EQ(bind(raw, (struct sockaddr *)&sink, sizeof(sink)), 0);
 
-    nl_address_t server_addr = addr("127.0.0.1", 34813);
-    nl_peer_id_t peer = 0;
-    ASSERT_EQ(nl_connect(client, &server_addr, &peer), NL_OK);
+    wn_address_t server_addr = addr("127.0.0.1", 34813);
+    wn_peer_id_t peer = 0;
+    ASSERT_EQ(wn_connect(client, &server_addr, &peer), WN_OK);
 
-    nl_event_t ev;
-    /* NL_PENDING_TIMEOUT_MS is 5000; allow generous margin for scheduler
+    wn_event_t ev;
+    /* WN_PENDING_TIMEOUT_MS is 5000; allow generous margin for scheduler
      * delay under sanitizers. */
-    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECT_FAILED, &ev, 10000));
-    ASSERT_EQ(ev.disconnect_reason, NL_ERR_TIMEOUT);
-    ASSERT_EQ(nl_endpoint_pending_used_for_test(client), 0);
+    ASSERT_TRUE(wait_for_event(client, WN_EVENT_CONNECT_FAILED, &ev, 10000));
+    ASSERT_EQ(ev.disconnect_reason, WN_ERR_TIMEOUT);
+    ASSERT_EQ(wn_endpoint_pending_used_for_test(client), 0);
 
     close(raw);
-    nl_endpoint_destroy(client);
+    wn_endpoint_destroy(client);
 }
 
 /* Handshake rate limiting: a flood of CONNECT_REQUESTs must stop being
  * answered once the per-window budget is spent (silently dropped, no
  * amplify-on-flood), while still answering the first few. */
 TEST(test_handshake_rate_limited) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    nl_endpoint_t *server = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34814);
-    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+    wn_config_t cfg; wn_config_default(&cfg);
+    wn_endpoint_t *server = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34814);
+    ASSERT_EQ(wn_server_create(&bind_addr, &cfg, &server), WN_OK);
 
     int raw = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     ASSERT_TRUE(raw >= 0);
@@ -1296,11 +1296,11 @@ TEST(test_handshake_rate_limited) {
     server_addr.sin_port = htons(bind_addr.port);
     server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
 
-    /* Well above NL_RATE_LIMIT_MAX_PER_WINDOW (200), all in one window.
+    /* Well above WN_RATE_LIMIT_MAX_PER_WINDOW (200), all in one window.
      * Distinct connid/pubkey/nonce per request so each is a fresh
      * handshake, not a retransmit of one. */
     const int flood = 300;
-    uint8_t req[NL_CONNECT_REQUEST_SIZE];
+    uint8_t req[WN_CONNECT_REQUEST_SIZE];
     for (int i = 0; i < flood; i++) {
         build_connect_request(req, (uint64_t)(0xCC000000u + (uint32_t)i), (uint8_t)(i + 1));
         ASSERT_TRUE(sendto(raw, req, sizeof(req), 0,
@@ -1319,7 +1319,7 @@ TEST(test_handshake_rate_limited) {
     for (;;) {
         ssize_t n = recv(raw, buf, sizeof(buf), 0);
         if (n < 0) break;
-        if (n >= NL_CONNECT_CHALLENGE_SIZE && buf[0] == NL_PKT_CONNECT_CHALLENGE) {
+        if (n >= WN_CONNECT_CHALLENGE_SIZE && buf[0] == WN_PKT_CONNECT_CHALLENGE) {
             int seen = 0;
             for (int i = 0; i < fresh; i++) {
                 if (memcmp(nonces[i], buf + 1 + 32, 16) == 0) { seen = 1; break; }
@@ -1340,7 +1340,7 @@ TEST(test_handshake_rate_limited) {
     ASSERT_TRUE(fresh <= 210);
 
     close(raw);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(server);
 }
 
 /* ---- event-queue byte cap (event_queue_max_bytes) ---- */
@@ -1355,8 +1355,8 @@ TEST(test_handshake_rate_limited) {
 #define H1_FLOOD_BURST_SIZE 400
 
 typedef struct {
-    nl_endpoint_t *ep; /* the (never destroyed) client sends from here */
-    nl_peer_id_t peer;
+    wn_endpoint_t *ep; /* the (never destroyed) client sends from here */
+    wn_peer_id_t peer;
     atomic_bool stop;
 } h1_flood_ctx_t;
 
@@ -1366,7 +1366,7 @@ static void *h1_flood_main(void *arg) {
     memset(payload, 0xB7, sizeof(payload));
     for (int burst = 0; burst < H1_FLOOD_BURSTS && !atomic_load(&c->stop); burst++) {
         for (int i = 0; i < H1_FLOOD_BURST_SIZE && !atomic_load(&c->stop); i++) {
-            if (nl_send(c->ep, c->peer, 0, NL_UNRELIABLE, payload, sizeof(payload)) != NL_OK) {
+            if (wn_send(c->ep, c->peer, 0, WN_UNRELIABLE, payload, sizeof(payload)) != WN_OK) {
                 break; /* window/queue closed: continue to the next burst */
             }
         }
@@ -1376,18 +1376,18 @@ static void *h1_flood_main(void *arg) {
 }
 
 TEST(test_event_queue_cap_bounds_hostile_flood) {
-    nl_config_t cfg; nl_config_default(&cfg);
+    wn_config_t cfg; wn_config_default(&cfg);
     cfg.event_queue_max_bytes = H1_MSG_CAP;
-    nl_endpoint_t *server = NULL, *client = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", H1_FLOOD_PORT);
-    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
-    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+    wn_endpoint_t *server = NULL, *client = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", H1_FLOOD_PORT);
+    ASSERT_EQ(wn_server_create(&bind_addr, &cfg, &server), WN_OK);
+    ASSERT_EQ(wn_client_create(&cfg, &client), WN_OK);
 
-    nl_peer_id_t client_peer;
-    ASSERT_EQ(nl_connect(client, &bind_addr, &client_peer), NL_OK);
-    nl_event_t ev;
-    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 5000));
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 5000));
+    wn_peer_id_t client_peer;
+    ASSERT_EQ(wn_connect(client, &bind_addr, &client_peer), WN_OK);
+    wn_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, WN_EVENT_CONNECTED, &ev, 5000));
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_CONNECTED, &ev, 5000));
 
     /* The queue must have grown while floored, but the total is the
      * invariant: at flood end the queue holds at least a burst's worth
@@ -1402,7 +1402,7 @@ TEST(test_event_queue_cap_bounds_hostile_flood) {
     ASSERT_EQ(pthread_create(&flood, NULL, h1_flood_main, &fc), 0);
     pthread_join(flood, NULL);
 
-    size_t bytes = nl_endpoint_event_queue_bytes_for_test(server);
+    size_t bytes = wn_endpoint_event_queue_bytes_for_test(server);
     printf("    queue bytes after flood: %zu of cap %d\n", bytes, H1_MSG_CAP);
     ASSERT_TRUE(bytes > 0);
     ASSERT_TRUE(bytes <= (size_t)H1_MSG_CAP);
@@ -1416,18 +1416,18 @@ TEST(test_event_queue_cap_bounds_hostile_flood) {
      * deferred queue until the peer sends, which is a behavior of the
      * window protocol, not of the event cap. */
     for (int i = 0; i < 400; i++) {
-        nl_event_t ev2;
-        if (!nl_poll_event(server, &ev2, 20)) break;
+        wn_event_t ev2;
+        if (!wn_poll_event(server, &ev2, 20)) break;
     }
     usleep(100 * 1000);
     for (int i = 0; i < 100; i++) {
-        nl_event_t ev2;
-        if (!nl_poll_event(server, &ev2, 20)) break;
+        wn_event_t ev2;
+        if (!wn_poll_event(server, &ev2, 20)) break;
     }
-    ASSERT_TRUE(nl_endpoint_event_queue_bytes_for_test(server) < (size_t)H1_MSG_LEN);
+    ASSERT_TRUE(wn_endpoint_event_queue_bytes_for_test(server) < (size_t)H1_MSG_LEN);
 
-    nl_endpoint_destroy(client);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
 }
 
 /* A small cap must not break ordinary draining traffic either: with the
@@ -1435,34 +1435,34 @@ TEST(test_event_queue_cap_bounds_hostile_flood) {
  * request/response still round-trips (events are consumed as fast as
  * they are produced). */
 TEST(test_event_queue_cap_legit_traffic_flows) {
-    nl_config_t cfg; nl_config_default(&cfg);
+    wn_config_t cfg; wn_config_default(&cfg);
     cfg.event_queue_max_bytes = H1_MSG_CAP;
-    nl_endpoint_t *server = NULL, *client = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", H1_FLOOD_PORT + 1);
-    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
-    ASSERT_EQ(nl_client_create(&cfg, &client), NL_OK);
+    wn_endpoint_t *server = NULL, *client = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", H1_FLOOD_PORT + 1);
+    ASSERT_EQ(wn_server_create(&bind_addr, &cfg, &server), WN_OK);
+    ASSERT_EQ(wn_client_create(&cfg, &client), WN_OK);
 
-    nl_peer_id_t client_peer;
-    ASSERT_EQ(nl_connect(client, &bind_addr, &client_peer), NL_OK);
-    nl_event_t ev;
-    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 5000));
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 5000));
-    nl_peer_id_t server_peer = ev.peer;
+    wn_peer_id_t client_peer;
+    ASSERT_EQ(wn_connect(client, &bind_addr, &client_peer), WN_OK);
+    wn_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, WN_EVENT_CONNECTED, &ev, 5000));
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_CONNECTED, &ev, 5000));
+    wn_peer_id_t server_peer = ev.peer;
 
     for (int i = 0; i < 20; i++) {
         const char request[32] = { 0 }; /* content just needs to round-trip */
-        ASSERT_EQ(nl_send(client, client_peer, 0, NL_RELIABLE_ORDERED,
-                          (const uint8_t *)request, sizeof(request)), NL_OK);
-        ASSERT_TRUE(wait_for_event(server, NL_EVENT_DATA, &ev, 5000));
+        ASSERT_EQ(wn_send(client, client_peer, 0, WN_RELIABLE_ORDERED,
+                          (const uint8_t *)request, sizeof(request)), WN_OK);
+        ASSERT_TRUE(wait_for_event(server, WN_EVENT_DATA, &ev, 5000));
         ASSERT_EQ(ev.data_len, sizeof(request));
-        ASSERT_EQ(nl_send(server, server_peer, 0, NL_RELIABLE_ORDERED,
-                          (const uint8_t *)request, sizeof(request)), NL_OK);
-        ASSERT_TRUE(wait_for_event(client, NL_EVENT_DATA, &ev, 5000));
+        ASSERT_EQ(wn_send(server, server_peer, 0, WN_RELIABLE_ORDERED,
+                          (const uint8_t *)request, sizeof(request)), WN_OK);
+        ASSERT_TRUE(wait_for_event(client, WN_EVENT_DATA, &ev, 5000));
         ASSERT_EQ(ev.data_len, sizeof(request));
     }
 
-    nl_endpoint_destroy(client);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
 }
 
 /* ---- server-side channel clamp (H2) ---- */
@@ -1470,30 +1470,30 @@ TEST(test_event_queue_cap_legit_traffic_flows) {
 
 /* The server must clamp the negotiated channel count down to ITS config,
  * regardless of what the client requests: a client can ask for the 32
- * (NL_MAX_CHANNELS) and the server with fewer configured channels must
+ * (WN_MAX_CHANNELS) and the server with fewer configured channels must
  * serve fewer per-connection buffers, not attacker-inflated ones. */
 TEST(test_server_clamps_negotiated_channel_count) {
-    nl_config_t server_cfg; nl_config_default(&server_cfg);
+    wn_config_t server_cfg; wn_config_default(&server_cfg);
     server_cfg.channel_count = 2;          /* server's own max */
-    nl_config_t client_cfg; nl_config_default(&client_cfg);
-    client_cfg.channel_count = NL_MAX_CHANNELS; /* client asks for max */
+    wn_config_t client_cfg; wn_config_default(&client_cfg);
+    client_cfg.channel_count = WN_MAX_CHANNELS; /* client asks for max */
 
-    nl_address_t bind_addr = addr("127.0.0.1", H2_CLUSTER_PORT);
-    nl_event_t ev;
-    nl_endpoint_t *server = NULL, *client = NULL;
-    ASSERT_EQ(nl_server_create(&bind_addr, &server_cfg, &server), NL_OK);
-    ASSERT_EQ(nl_client_create(&client_cfg, &client), NL_OK);
-    nl_peer_id_t client_peer;
-    ASSERT_EQ(nl_connect(client, &bind_addr, &client_peer), NL_OK);
-    ASSERT_TRUE(wait_for_event(client, NL_EVENT_CONNECTED, &ev, 5000));
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_CONNECTED, &ev, 5000));
-    nl_peer_id_t server_peer = ev.peer;
+    wn_address_t bind_addr = addr("127.0.0.1", H2_CLUSTER_PORT);
+    wn_event_t ev;
+    wn_endpoint_t *server = NULL, *client = NULL;
+    ASSERT_EQ(wn_server_create(&bind_addr, &server_cfg, &server), WN_OK);
+    ASSERT_EQ(wn_client_create(&client_cfg, &client), WN_OK);
+    wn_peer_id_t client_peer;
+    ASSERT_EQ(wn_connect(client, &bind_addr, &client_peer), WN_OK);
+    ASSERT_TRUE(wait_for_event(client, WN_EVENT_CONNECTED, &ev, 5000));
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_CONNECTED, &ev, 5000));
+    wn_peer_id_t server_peer = ev.peer;
 
     /* Channel 1 (inside the server's clamp): normal operation. */
     const char *in_clamp = "within";
-    ASSERT_EQ(nl_send(client, client_peer, 1, NL_UNRELIABLE,
-                      (const uint8_t *)in_clamp, strlen(in_clamp)), NL_OK);
-    ASSERT_TRUE(wait_for_event(server, NL_EVENT_DATA, &ev, 5000));
+    ASSERT_EQ(wn_send(client, client_peer, 1, WN_UNRELIABLE,
+                      (const uint8_t *)in_clamp, strlen(in_clamp)), WN_OK);
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_DATA, &ev, 5000));
     ASSERT_EQ(ev.channel, 1);
     ASSERT_MEM_EQ(ev.data, in_clamp, strlen(in_clamp));
 
@@ -1501,26 +1501,26 @@ TEST(test_server_clamps_negotiated_channel_count) {
      * client's negotiated request of 32): the server-side connection was
      * built with the clamped count and must not have buffers for it. */
     const char *out_of_clamp = "beyond";
-    ASSERT_EQ(nl_send(client, client_peer, 3, NL_UNRELIABLE,
-                      (const uint8_t *)out_of_clamp, strlen(out_of_clamp)), NL_OK);
+    ASSERT_EQ(wn_send(client, client_peer, 3, WN_UNRELIABLE,
+                      (const uint8_t *)out_of_clamp, strlen(out_of_clamp)), WN_OK);
     /* Drain briefly and confirm nothing for channel 3 ever lands. */
     for (int i = 0; i < 30; i++) {
-        if (!nl_poll_event(server, &ev, 20)) continue;
-        ASSERT_TRUE(ev.event_type != NL_EVENT_DATA || ev.channel < 2);
+        if (!wn_poll_event(server, &ev, 20)) continue;
+        ASSERT_TRUE(ev.event_type != WN_EVENT_DATA || ev.channel < 2);
     }
     /* No late event: after the drain window, poll once more to confirm
      * the queue is empty. */
-    ASSERT_TRUE(!nl_poll_event(server, &ev, 500));
+    ASSERT_TRUE(!wn_poll_event(server, &ev, 500));
 
     /* Reverse direction on channel 1 still works from the (clamped)
      * server, proving the connection stayed healthy. */
-    ASSERT_EQ(nl_send(server, server_peer, 1, NL_UNRELIABLE,
-                      (const uint8_t *)in_clamp, strlen(in_clamp)), NL_OK);
-    ASSERT_TRUE(wait_for_event(client, NL_EVENT_DATA, &ev, 5000));
+    ASSERT_EQ(wn_send(server, server_peer, 1, WN_UNRELIABLE,
+                      (const uint8_t *)in_clamp, strlen(in_clamp)), WN_OK);
+    ASSERT_TRUE(wait_for_event(client, WN_EVENT_DATA, &ev, 5000));
     ASSERT_EQ(ev.channel, 1);
 
-    nl_endpoint_destroy(client);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
 }
 
 /* Pending-table pressure must not steal a live handshake's slot: M1 (the
@@ -1531,10 +1531,10 @@ TEST(test_server_clamps_negotiated_channel_count) {
  * Before the fix, plain created_ms LRU evicted exactly the pre-flood
  * handshake. */
 TEST(test_pending_eviction_protects_live_handshake) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    nl_endpoint_t *server = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34974);
-    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+    wn_config_t cfg; wn_config_default(&cfg);
+    wn_endpoint_t *server = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34974);
+    ASSERT_EQ(wn_server_create(&bind_addr, &cfg, &server), WN_OK);
 
     struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
@@ -1549,7 +1549,7 @@ TEST(test_pending_eviction_protects_live_handshake) {
     ASSERT_TRUE(raw_a >= 0);
     struct timeval tv_a = { .tv_sec = 0, .tv_usec = 150000 };
     setsockopt(raw_a, SOL_SOCKET, SO_RCVTIMEO, &tv_a, sizeof(tv_a));
-    uint8_t req_a[NL_CONNECT_REQUEST_SIZE];
+    uint8_t req_a[WN_CONNECT_REQUEST_SIZE];
     build_connect_request(req_a, 0x1A2B0001ULL, 200);
     for (int k = 0; k < 2; k++) {
         ASSERT_TRUE(sendto(raw_a, req_a, sizeof(req_a), 0,
@@ -1560,7 +1560,7 @@ TEST(test_pending_eviction_protects_live_handshake) {
     for (int k = 0; k < 2 && got_a < 1; k++) {
         uint8_t buf[256];
         ssize_t n = recv(raw_a, buf, sizeof(buf), 0);
-        if (n >= NL_CONNECT_CHALLENGE_SIZE && buf[0] == NL_PKT_CONNECT_CHALLENGE) {
+        if (n >= WN_CONNECT_CHALLENGE_SIZE && buf[0] == WN_PKT_CONNECT_CHALLENGE) {
             memcpy(nonce_a, buf + 1 + 32, 16);
             got_a = 1;
         }
@@ -1576,7 +1576,7 @@ TEST(test_pending_eviction_protects_live_handshake) {
      * window (130 datagrams used). */
     int flood_raw = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     ASSERT_TRUE(flood_raw >= 0);
-    uint8_t req_f[NL_CONNECT_REQUEST_SIZE];
+    uint8_t req_f[WN_CONNECT_REQUEST_SIZE];
     for (int i = 0; i < 128; i++) {
         build_connect_request(req_f, 0xFFF00000ULL + (uint64_t)i, (uint8_t)(i + 1));
         ASSERT_TRUE(sendto(flood_raw, req_f, sizeof(req_f), 0,
@@ -1594,14 +1594,14 @@ TEST(test_pending_eviction_protects_live_handshake) {
     ASSERT_TRUE(raw_f >= 0);
     struct timeval tval_f = { .tv_sec = 2, .tv_usec = 0 };
     setsockopt(raw_f, SOL_SOCKET, SO_RCVTIMEO, &tval_f, sizeof(tval_f));
-    uint8_t req_c[NL_CONNECT_REQUEST_SIZE];
+    uint8_t req_c[WN_CONNECT_REQUEST_SIZE];
     build_connect_request(req_c, 0x2CEF0001ULL, 77);
     ASSERT_TRUE(sendto(raw_f, req_c, sizeof(req_c), 0,
                        (struct sockaddr *)&server_addr, sizeof(server_addr)) >= 0);
     uint8_t cbuf[256];
     ssize_t cn = recv(raw_f, cbuf, sizeof(cbuf), 0);
-    ASSERT_TRUE(cn >= NL_CONNECT_CHALLENGE_SIZE);
-    ASSERT_EQ(cbuf[0], NL_PKT_CONNECT_CHALLENGE);
+    ASSERT_TRUE(cn >= WN_CONNECT_CHALLENGE_SIZE);
+    ASSERT_EQ(cbuf[0], WN_PKT_CONNECT_CHALLENGE);
 
     /* The punchline: the live handshake's CHALLENGE keeps being
      * retransmitted (server_nonce unchanged) through the flood -- with
@@ -1616,7 +1616,7 @@ TEST(test_pending_eviction_protects_live_handshake) {
         if ((uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec > deadline) break;
         uint8_t abuf[256];
         ssize_t n = recv(raw_a, abuf, sizeof(abuf), 0);
-        if (n >= NL_CONNECT_CHALLENGE_SIZE && abuf[0] == NL_PKT_CONNECT_CHALLENGE &&
+        if (n >= WN_CONNECT_CHALLENGE_SIZE && abuf[0] == WN_PKT_CONNECT_CHALLENGE &&
             memcmp(abuf + 1 + 32, nonce_a, 16) == 0) {
             a_retx++;
         }
@@ -1626,7 +1626,7 @@ TEST(test_pending_eviction_protects_live_handshake) {
     close(raw_a);
     close(flood_raw);
     close(raw_f);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(server);
 }
 
 
@@ -1652,7 +1652,7 @@ static struct sockaddr_in loopback_addr(uint16_t port) {
 static void flood_handshake_budget(uint16_t port, int settle_ms) {
     int junk = raw_udp_socket(50);
     struct sockaddr_in dst = loopback_addr(port);
-    uint8_t req[NL_CONNECT_REQUEST_SIZE];
+    uint8_t req[WN_CONNECT_REQUEST_SIZE];
     for (int i = 0; i < 400; i++) {
         build_connect_request(req, 0xF100000ull + (uint64_t)i, (uint8_t)(i + 3));
         sendto(junk, req, sizeof(req), 0, (struct sockaddr *)&dst, sizeof(dst));
@@ -1661,15 +1661,15 @@ static void flood_handshake_budget(uint16_t port, int settle_ms) {
     usleep((useconds_t)settle_ms * 1000); /* let the server's I/O thread chew through the burst */
 }
 
-/* A client-chosen connection id of 0 is NL_INVALID_PEER: it must never become a peer. */
+/* A client-chosen connection id of 0 is WN_INVALID_PEER: it must never become a peer. */
 TEST(test_server_ignores_request_with_zero_connection_id) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    nl_endpoint_t *server = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34830);
-    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+    wn_config_t cfg; wn_config_default(&cfg);
+    wn_endpoint_t *server = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34830);
+    ASSERT_EQ(wn_server_create(&bind_addr, &cfg, &server), WN_OK);
     int raw = raw_udp_socket(400);
     struct sockaddr_in dst = loopback_addr(34830);
-    uint8_t req[NL_CONNECT_REQUEST_SIZE], resp[256];
+    uint8_t req[WN_CONNECT_REQUEST_SIZE], resp[256];
 
     build_connect_request(req, 0, 1);
     ASSERT_TRUE(sendto(raw, req, sizeof(req), 0, (struct sockaddr *)&dst, sizeof(dst)) >= 0);
@@ -1678,33 +1678,33 @@ TEST(test_server_ignores_request_with_zero_connection_id) {
     build_connect_request(req, 0xAAAA0003, 2);
     ASSERT_TRUE(sendto(raw, req, sizeof(req), 0, (struct sockaddr *)&dst, sizeof(dst)) >= 0);
     ssize_t n = recv(raw, resp, sizeof(resp), 0);
-    ASSERT_TRUE(n >= (ssize_t)NL_CONNECT_CHALLENGE_SIZE);
-    ASSERT_EQ(resp[0], NL_PKT_CONNECT_CHALLENGE);
+    ASSERT_TRUE(n >= (ssize_t)WN_CONNECT_CHALLENGE_SIZE);
+    ASSERT_EQ(resp[0], WN_PKT_CONNECT_CHALLENGE);
 
     close(raw);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(server);
 }
 
 /* A client whose REQUEST was already admitted must still get its CHALLENGE
  * retransmitted while someone else is burning the shared handshake budget. */
 TEST(test_request_retransmit_is_answered_while_budget_is_exhausted) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    nl_endpoint_t *server = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34831);
-    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+    wn_config_t cfg; wn_config_default(&cfg);
+    wn_endpoint_t *server = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34831);
+    ASSERT_EQ(wn_server_create(&bind_addr, &cfg, &server), WN_OK);
     int raw = raw_udp_socket(800);
     struct sockaddr_in dst = loopback_addr(34831);
-    uint8_t req[NL_CONNECT_REQUEST_SIZE], resp[256];
+    uint8_t req[WN_CONNECT_REQUEST_SIZE], resp[256];
 
     build_connect_request(req, 0xBEEF0001, 9);
     ASSERT_TRUE(sendto(raw, req, sizeof(req), 0, (struct sockaddr *)&dst, sizeof(dst)) >= 0);
-    ASSERT_TRUE(recv(raw, resp, sizeof(resp), 0) >= (ssize_t)NL_CONNECT_CHALLENGE_SIZE);
+    ASSERT_TRUE(recv(raw, resp, sizeof(resp), 0) >= (ssize_t)WN_CONNECT_CHALLENGE_SIZE);
     /* The client's first retry (what a live client does within 250 ms). It
      * marks the entry as a live handshake, which is what keeps a later flood
      * from evicting it. */
     usleep(120 * 1000);
     ASSERT_TRUE(sendto(raw, req, sizeof(req), 0, (struct sockaddr *)&dst, sizeof(dst)) >= 0);
-    ASSERT_TRUE(recv(raw, resp, sizeof(resp), 0) >= (ssize_t)NL_CONNECT_CHALLENGE_SIZE);
+    ASSERT_TRUE(recv(raw, resp, sizeof(resp), 0) >= (ssize_t)WN_CONNECT_CHALLENGE_SIZE);
 
     flood_handshake_budget(34831, 100);
 
@@ -1717,53 +1717,53 @@ TEST(test_request_retransmit_is_answered_while_budget_is_exhausted) {
     while (recv(raw, resp, sizeof(resp), MSG_DONTWAIT) > 0) { /* drop anything already queued */ }
     ASSERT_TRUE(sendto(raw, req, sizeof(req), 0, (struct sockaddr *)&dst, sizeof(dst)) >= 0);
     ssize_t n = recv(raw, resp, sizeof(resp), 0);
-    ASSERT_TRUE(n >= (ssize_t)NL_CONNECT_CHALLENGE_SIZE);
-    ASSERT_EQ(resp[0], NL_PKT_CONNECT_CHALLENGE);
+    ASSERT_TRUE(n >= (ssize_t)WN_CONNECT_CHALLENGE_SIZE);
+    ASSERT_EQ(resp[0], WN_PKT_CONNECT_CHALLENGE);
 
     close(raw);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(server);
 }
 
 /* A RESPONSE that echoes a genuine cookie is bounded by the pending entry it
  * consumes, so it must complete the handshake even when the budget is spent. */
 TEST(test_valid_response_completes_while_budget_is_exhausted) {
-    nl_config_t cfg; nl_config_default(&cfg);
-    nl_endpoint_t *server = NULL;
-    nl_address_t bind_addr = addr("127.0.0.1", 34832);
-    ASSERT_EQ(nl_server_create(&bind_addr, &cfg, &server), NL_OK);
+    wn_config_t cfg; wn_config_default(&cfg);
+    wn_endpoint_t *server = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34832);
+    ASSERT_EQ(wn_server_create(&bind_addr, &cfg, &server), WN_OK);
     int raw = raw_udp_socket(800);
     struct sockaddr_in dst = loopback_addr(34832);
-    uint8_t req[NL_CONNECT_REQUEST_SIZE], resp[256];
+    uint8_t req[WN_CONNECT_REQUEST_SIZE], resp[256];
 
     build_connect_request(req, 0xBEEF0002, 5);
     ASSERT_TRUE(sendto(raw, req, sizeof(req), 0, (struct sockaddr *)&dst, sizeof(dst)) >= 0);
-    ASSERT_TRUE(recv(raw, resp, sizeof(resp), 0) >= (ssize_t)NL_CONNECT_CHALLENGE_SIZE);
-    ASSERT_EQ(resp[0], NL_PKT_CONNECT_CHALLENGE);
+    ASSERT_TRUE(recv(raw, resp, sizeof(resp), 0) >= (ssize_t)WN_CONNECT_CHALLENGE_SIZE);
+    ASSERT_EQ(resp[0], WN_PKT_CONNECT_CHALLENGE);
     uint8_t cookie[16];
     memcpy(cookie, resp + 1 + 32 + 16, 16);
     /* One retry first, as a live client would, so the flood cannot evict the entry. */
     usleep(120 * 1000);
     ASSERT_TRUE(sendto(raw, req, sizeof(req), 0, (struct sockaddr *)&dst, sizeof(dst)) >= 0);
-    ASSERT_TRUE(recv(raw, resp, sizeof(resp), 0) >= (ssize_t)NL_CONNECT_CHALLENGE_SIZE);
+    ASSERT_TRUE(recv(raw, resp, sizeof(resp), 0) >= (ssize_t)WN_CONNECT_CHALLENGE_SIZE);
 
     flood_handshake_budget(34832, 200);
 
-    uint8_t rsp[NL_CONNECT_RESPONSE_SIZE];
-    rsp[0] = NL_PKT_CONNECT_RESPONSE;
+    uint8_t rsp[WN_CONNECT_RESPONSE_SIZE];
+    rsp[0] = WN_PKT_CONNECT_RESPONSE;
     memcpy(rsp + 1, cookie, 16);
     memcpy(rsp + 17, req + 16, 32);  /* the client pubkey from the REQUEST */
     memcpy(rsp + 49, req + 48, 16);  /* the client nonce from the REQUEST */
     ASSERT_TRUE(sendto(raw, rsp, sizeof(rsp), 0, (struct sockaddr *)&dst, sizeof(dst)) >= 0);
 
-    nl_event_t ev;
+    wn_event_t ev;
     bool connected = false;
     for (int i = 0; i < 20 && !connected; i++) {
-        if (nl_poll_event(server, &ev, 100) && ev.event_type == NL_EVENT_CONNECTED) connected = true;
+        if (wn_poll_event(server, &ev, 100) && ev.event_type == WN_EVENT_CONNECTED) connected = true;
     }
     ASSERT_TRUE(connected);
 
     close(raw);
-    nl_endpoint_destroy(server);
+    wn_endpoint_destroy(server);
 }
 
 int main(void) {

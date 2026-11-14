@@ -3,33 +3,33 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define NL_DEFAULT_RTT_MS 200
-#define NL_MIN_RTO_MS 100
-#define NL_MAX_RTO_MS 10000
-#define NL_MAX_RETRIES 15
-#define NL_ENCRYPTED_PACKET_SCRATCH (NL_MAX_PACKET_SIZE + NL_ENC_HEADER_SIZE + NL_GCM_TAG_SIZE + 64)
+#define WN_DEFAULT_RTT_MS 200
+#define WN_MIN_RTO_MS 100
+#define WN_MAX_RTO_MS 10000
+#define WN_MAX_RETRIES 15
+#define WN_ENCRYPTED_PACKET_SCRATCH (WN_MAX_PACKET_SIZE + WN_ENC_HEADER_SIZE + WN_GCM_TAG_SIZE + 64)
 /* How many times (including the initial send) the server will put
  * CONNECT_ACCEPTED on the wire before giving up on the client hearing it.
- * Combined with NL_HANDSHAKE_RETRY_MS below this covers multi-second
+ * Combined with WN_HANDSHAKE_RETRY_MS below this covers multi-second
  * loss windows without unbounded resend if the client is gone. */
-#define NL_ACCEPT_RETRIES 8
-#define NL_HANDSHAKE_RETRY_MS 250
+#define WN_ACCEPT_RETRIES 8
+#define WN_HANDSHAKE_RETRY_MS 250
 
-/* Enforce the invariant documented on NL_ACK_WINDOW_BITS at compile time:
+/* Enforce the invariant documented on WN_ACK_WINDOW_BITS at compile time:
  * letting the congestion window exceed the ack window is a silent
  * permanent-data-loss bug, not a tuning mistake. */
-_Static_assert(NL_CWND_MAX_PACKETS <= NL_ACK_WINDOW_BITS,
+_Static_assert(WN_CWND_MAX_PACKETS <= WN_ACK_WINDOW_BITS,
                "cwnd must not exceed the ack window: unacked sequences beyond "
                "it can never be named by any ack");
-_Static_assert(NL_SSTHRESH_INITIAL_PACKETS <= NL_ACK_WINDOW_BITS,
+_Static_assert(WN_SSTHRESH_INITIAL_PACKETS <= WN_ACK_WINDOW_BITS,
                "ssthresh must not exceed the ack window (see above)");
 
 /* Jacobson/Karels smoothed RTT + RTTVAR update (the same algorithm TCP's
  * RTO estimation uses, RFC 6298), fed only by clean samples -- see
- * seqbuf.h's nl_send_ring_ack() doc comment on why retransmitted and
+ * seqbuf.h's wn_send_ring_ack() doc comment on why retransmitted and
  * bitfield-only-acked packets are never used as samples (Karn's
  * algorithm). alpha=1/8, beta=1/4 are the RFC's standard gains. */
-static void update_rtt(nl_connection_t *conn, uint32_t sample_ms) {
+static void update_rtt(wn_connection_t *conn, uint32_t sample_ms) {
     double sample = (double)sample_ms;
     if (!conn->rtt_initialized) {
         conn->srtt_ms = sample;
@@ -42,8 +42,8 @@ static void update_rtt(nl_connection_t *conn, uint32_t sample_ms) {
         conn->srtt_ms += 0.125 * diff;
     }
     double rto = conn->srtt_ms + 4.0 * conn->rttvar_ms;
-    if (rto < NL_MIN_RTO_MS) rto = NL_MIN_RTO_MS;
-    if (rto > NL_MAX_RTO_MS) rto = NL_MAX_RTO_MS;
+    if (rto < WN_MIN_RTO_MS) rto = WN_MIN_RTO_MS;
+    if (rto > WN_MAX_RTO_MS) rto = WN_MAX_RTO_MS;
     conn->rto_ms = (uint32_t)rto;
     conn->rtt_ms = (uint32_t)conn->srtt_ms;
 }
@@ -57,20 +57,20 @@ static void update_rtt(nl_connection_t *conn, uint32_t sample_ms) {
  * unacked sequence is: counting packets understates the window exactly when
  * it matters (early packets lost, later ones acked), letting the span grow
  * past what any ack can reach and stranding the oldest packet forever. */
-static uint32_t reliable_in_flight(nl_connection_t *conn) {
+static uint32_t reliable_in_flight(wn_connection_t *conn) {
     uint32_t n = 0;
     for (uint8_t c = 0; c < conn->channel_count; c++) {
-        for (int d = NL_RELIABLE_UNORDERED; d <= NL_RELIABLE_ORDERED; d++) {
-            nl_lane_t *lane = &conn->channels[c].lanes[d];
+        for (int d = WN_RELIABLE_UNORDERED; d <= WN_RELIABLE_ORDERED; d++) {
+            wn_lane_t *lane = &conn->channels[c].lanes[d];
             if (!lane->send_ring_init) continue;
-            uint16_t oldest = nl_send_ring_oldest_unacked(&lane->send_ring);
+            uint16_t oldest = wn_send_ring_oldest_unacked(&lane->send_ring);
             n += (uint32_t)(uint16_t)(lane->send_ring.next_sequence - oldest);
         }
     }
     return n;
 }
 
-static void cc_on_acks(nl_connection_t *conn, uint32_t newly_acked) {
+static void cc_on_acks(wn_connection_t *conn, uint32_t newly_acked) {
     for (uint32_t i = 0; i < newly_acked; i++) {
         if (conn->cwnd < conn->ssthresh) {
             conn->cwnd++; /* slow start: +1 per ack */
@@ -79,10 +79,10 @@ static void cc_on_acks(nl_connection_t *conn, uint32_t newly_acked) {
             conn->cwnd_ack_accum++;
             if (conn->cwnd_ack_accum >= conn->cwnd) {
                 conn->cwnd_ack_accum = 0;
-                if (conn->cwnd < NL_CWND_MAX_PACKETS) conn->cwnd++;
+                if (conn->cwnd < WN_CWND_MAX_PACKETS) conn->cwnd++;
             }
         }
-        if (conn->cwnd > NL_CWND_MAX_PACKETS) conn->cwnd = NL_CWND_MAX_PACKETS;
+        if (conn->cwnd > WN_CWND_MAX_PACKETS) conn->cwnd = WN_CWND_MAX_PACKETS;
     }
 }
 
@@ -92,7 +92,7 @@ static void cc_on_acks(nl_connection_t *conn, uint32_t newly_acked) {
  * congestion event (one window of data, several holes) and is ignored, so a
  * burst of losses halves the window once instead of once per detection. An
  * RTO always applies: it means the ack clock stopped, which is worse. */
-static void cc_on_loss(nl_connection_t *conn, bool fast, uint64_t now_ms) {
+static void cc_on_loss(wn_connection_t *conn, bool fast, uint64_t now_ms) {
     if (fast && conn->loss_cut_valid && now_ms >= conn->last_loss_cut_ms &&
         now_ms - conn->last_loss_cut_ms < (conn->rtt_ms ? conn->rtt_ms : 1)) {
         return;
@@ -104,12 +104,12 @@ static void cc_on_loss(nl_connection_t *conn, bool fast, uint64_t now_ms) {
     conn->ssthresh = half;
     conn->cwnd_ack_accum = 0;
     conn->cwnd = fast ? half : 1;
-    if (conn->cwnd > NL_CWND_MAX_PACKETS) conn->cwnd = NL_CWND_MAX_PACKETS;
+    if (conn->cwnd > WN_CWND_MAX_PACKETS) conn->cwnd = WN_CWND_MAX_PACKETS;
 }
 
 /* ---- rate limiting (token bucket over payload bytes) ---- */
 
-static void rate_refill(nl_connection_t *conn, uint64_t now_ms) {
+static void rate_refill(wn_connection_t *conn, uint64_t now_ms) {
     if (conn->rate_bps == 0) return;
     if (now_ms < conn->rate_last_refill_ms) conn->rate_last_refill_ms = now_ms;
     double elapsed_s = (double)(now_ms - conn->rate_last_refill_ms) / 1000.0;
@@ -123,10 +123,10 @@ static void rate_refill(nl_connection_t *conn, uint64_t now_ms) {
 
 /* ---- deferred send queue (priority-sorted) ---- */
 
-static void deferred_free_all(nl_connection_t *conn) {
-    nl_deferred_msg_t *m = conn->deferred_head;
+static void deferred_free_all(wn_connection_t *conn) {
+    wn_deferred_msg_t *m = conn->deferred_head;
     while (m) {
-        nl_deferred_msg_t *next = m->next;
+        wn_deferred_msg_t *next = m->next;
         free(m->data);
         free(m);
         m = next;
@@ -141,14 +141,14 @@ static void deferred_free_all(nl_connection_t *conn) {
  * A partial-send continuation parked at the head is never displaced --
  * later messages queue behind it so RELIABLE_ORDERED fragments on its
  * lane can't interleave with another message's. */
-static bool deferred_push(nl_connection_t *conn, uint8_t channel, nl_delivery_t delivery,
+static bool deferred_push(wn_connection_t *conn, uint8_t channel, wn_delivery_t delivery,
                           uint8_t priority, const uint8_t *data, size_t len,
                           bool continuation, uint16_t frag_start, uint16_t message_id) {
-    if (conn->deferred_count >= NL_DEFERRED_MAX_MSGS) return false;
-    if (conn->deferred_bytes + len > NL_DEFERRED_MAX_BYTES) return false;
-    if (len > NL_MAX_MESSAGE_SIZE) return false;
+    if (conn->deferred_count >= WN_DEFERRED_MAX_MSGS) return false;
+    if (conn->deferred_bytes + len > WN_DEFERRED_MAX_BYTES) return false;
+    if (len > WN_MAX_MESSAGE_SIZE) return false;
 
-    nl_deferred_msg_t *m = (nl_deferred_msg_t *)calloc(1, sizeof(*m));
+    wn_deferred_msg_t *m = (wn_deferred_msg_t *)calloc(1, sizeof(*m));
     if (!m) return false;
     m->data = (uint8_t *)malloc(len ? len : 1);
     if (!m->data) { free(m); return false; }
@@ -164,20 +164,20 @@ static bool deferred_push(nl_connection_t *conn, uint8_t channel, nl_delivery_t 
 
     /* Descending priority, stable within equal priority. A message already
      * being streamed (continuation) stays at the head. */
-    nl_deferred_msg_t **link = &conn->deferred_head;
+    wn_deferred_msg_t **link = &conn->deferred_head;
     if (*link && (*link)->continuation) link = &(*link)->next;
     while (*link && (*link)->priority >= priority) link = &(*link)->next;
     /* ...but priority must never reorder one RELIABLE_ORDERED stream: sequence
      * numbers are assigned at emit time, so jumping an earlier message of the
      * same channel would swap what the receiver delivers. Priority still
      * applies across channels and across unordered traffic. */
-    if (delivery == NL_RELIABLE_ORDERED) {
-        nl_deferred_msg_t **last_same = NULL;
-        for (nl_deferred_msg_t **l = &conn->deferred_head; *l; l = &(*l)->next) {
-            if ((*l)->channel == channel && (*l)->delivery == (uint8_t)NL_RELIABLE_ORDERED) last_same = l;
+    if (delivery == WN_RELIABLE_ORDERED) {
+        wn_deferred_msg_t **last_same = NULL;
+        for (wn_deferred_msg_t **l = &conn->deferred_head; *l; l = &(*l)->next) {
+            if ((*l)->channel == channel && (*l)->delivery == (uint8_t)WN_RELIABLE_ORDERED) last_same = l;
         }
         if (last_same) {
-            for (nl_deferred_msg_t **l = link; *l; l = &(*l)->next) {
+            for (wn_deferred_msg_t **l = link; *l; l = &(*l)->next) {
                 if (l == last_same) { link = &(*l)->next; break; }
             }
         }
@@ -191,26 +191,26 @@ static bool deferred_push(nl_connection_t *conn, uint8_t channel, nl_delivery_t 
 
 /* Test-only shims exposing the deferred-queue internals to
  * tests/test_connection.c. The queue's ordering invariants are documented on
- * nl_deferred_msg_t but are internal state, so they can only be asserted
+ * wn_deferred_msg_t but are internal state, so they can only be asserted
  * from a test that links connection.c directly. Not declared in a header:
  * nothing outside the tests should be using them. */
-nl_connection_t *nl_connection_new_for_test(void) {
+wn_connection_t *wn_connection_new_for_test(void) {
     struct sockaddr_storage addr;
     memset(&addr, 0, sizeof(addr));
     uint8_t a[32] = {0}, b[32] = {0};
-    return nl_connection_create(1, &addr, sizeof(addr), true, 4, a, b, a, b,
+    return wn_connection_create(1, &addr, sizeof(addr), true, 4, a, b, a, b,
                                10000, 1000, 0);
 }
 
-bool deferred_push_for_test(nl_connection_t *conn, uint8_t channel, nl_delivery_t delivery,
+bool deferred_push_for_test(wn_connection_t *conn, uint8_t channel, wn_delivery_t delivery,
                             uint8_t priority, const uint8_t *data, size_t len,
                             bool continuation, uint16_t frag_start, uint16_t message_id) {
     return deferred_push(conn, channel, delivery, priority, data, len,
                          continuation, frag_start, message_id);
 }
 
-static nl_deferred_msg_t *deferred_pop(nl_connection_t *conn) {
-    nl_deferred_msg_t *m = conn->deferred_head;
+static wn_deferred_msg_t *deferred_pop(wn_connection_t *conn) {
+    wn_deferred_msg_t *m = conn->deferred_head;
     if (!m) return NULL;
     conn->deferred_head = m->next;
     conn->deferred_count--;
@@ -219,57 +219,57 @@ static nl_deferred_msg_t *deferred_pop(nl_connection_t *conn) {
     return m;
 }
 
-nl_connection_t *nl_connection_create(nl_peer_id_t id, const struct sockaddr_storage *addr, socklen_t addr_len,
+wn_connection_t *wn_connection_create(wn_peer_id_t id, const struct sockaddr_storage *addr, socklen_t addr_len,
                                        bool is_client_side, uint8_t channel_count,
-                                       const uint8_t send_key[NL_KEY_SIZE], const uint8_t recv_key[NL_KEY_SIZE],
+                                       const uint8_t send_key[WN_KEY_SIZE], const uint8_t recv_key[WN_KEY_SIZE],
                                        const uint8_t send_salt[12], const uint8_t recv_salt[12],
                                        uint32_t connection_timeout_ms, uint32_t keepalive_interval_ms,
                                        uint64_t now_ms) {
-    nl_connection_t *conn = (nl_connection_t *)calloc(1, sizeof(nl_connection_t));
+    wn_connection_t *conn = (wn_connection_t *)calloc(1, sizeof(wn_connection_t));
     if (!conn) return NULL;
 
     conn->id = id;
     memcpy(&conn->addr, addr, sizeof(*addr));
     conn->addr_len = addr_len;
-    conn->state = NL_CONN_CONNECTED;
+    conn->state = WN_CONN_CONNECTED;
     conn->is_client_side = is_client_side;
 
-    memcpy(conn->send_key, send_key, NL_KEY_SIZE);
-    memcpy(conn->recv_key, recv_key, NL_KEY_SIZE);
+    memcpy(conn->send_key, send_key, WN_KEY_SIZE);
+    memcpy(conn->recv_key, recv_key, WN_KEY_SIZE);
     memcpy(conn->send_salt, send_salt, 12);
     memcpy(conn->recv_salt, recv_salt, 12);
     conn->send_counter = 0;
-    nl_replay_window_init(&conn->recv_replay);
+    wn_replay_window_init(&conn->recv_replay);
 
     conn->channel_count = channel_count;
-    conn->channels = (nl_channel_t *)calloc(channel_count, sizeof(nl_channel_t));
+    conn->channels = (wn_channel_t *)calloc(channel_count, sizeof(wn_channel_t));
     if (!conn->channels) { free(conn); return NULL; }
     for (uint8_t i = 0; i < channel_count; i++) {
-        nl_channel_init(&conn->channels[i]);
+        wn_channel_init(&conn->channels[i]);
         /* Bound this connection's attacker-pinnable reassembly memory:
          * each lane's fragment tracker accepts at most
-         * NL_REASSEMBLY_BYTE_BUDGET_DEFAULT received bytes in flight,
+         * WN_REASSEMBLY_BYTE_BUDGET_DEFAULT received bytes in flight,
          * so the connection's worst case is channels x lanes x budget
          * rather than unbounded. */
-        nl_channel_set_reassembly_budget(&conn->channels[i],
-                                         NL_REASSEMBLY_BYTE_BUDGET_DEFAULT);
+        wn_channel_set_reassembly_budget(&conn->channels[i],
+                                         WN_REASSEMBLY_BYTE_BUDGET_DEFAULT);
     }
 
     conn->last_recv_time_ms = now_ms;
     conn->last_send_time_ms = now_ms;
-    conn->rtt_ms = NL_DEFAULT_RTT_MS;
-    conn->rto_ms = NL_DEFAULT_RTT_MS * 2;
-    if (conn->rto_ms < NL_MIN_RTO_MS) conn->rto_ms = NL_MIN_RTO_MS;
+    conn->rtt_ms = WN_DEFAULT_RTT_MS;
+    conn->rto_ms = WN_DEFAULT_RTT_MS * 2;
+    if (conn->rto_ms < WN_MIN_RTO_MS) conn->rto_ms = WN_MIN_RTO_MS;
     conn->accept_sent_ms = 0;
     conn->accept_retries_left = 0;
 
     conn->connection_timeout_ms = connection_timeout_ms;
     conn->keepalive_interval_ms = keepalive_interval_ms;
 
-    conn->cwnd = NL_CWND_INITIAL_PACKETS;
-    conn->ssthresh = NL_SSTHRESH_INITIAL_PACKETS;
+    conn->cwnd = WN_CWND_INITIAL_PACKETS;
+    conn->ssthresh = WN_SSTHRESH_INITIAL_PACKETS;
     conn->cwnd_ack_accum = 0;
-    conn->peer_rwnd = (uint16_t)NL_RECV_WINDOW_DEFAULT;
+    conn->peer_rwnd = (uint16_t)WN_RECV_WINDOW_DEFAULT;
     /* Unknown, not "32768": the peer has advertised nothing yet, and
      * seeding capacity with the default made send_window_frags()'s
      * "can this ever fit in a full window?" test answer wrongly for a
@@ -279,9 +279,9 @@ nl_connection_t *nl_connection_create(nl_peer_id_t id, const struct sockaddr_sto
      * sends down the stream-fragment-by-fragment path instead. */
     conn->peer_rwnd_capacity = 0;
     conn->peer_window_in_flight = 0;
-    conn->recv_window_size = NL_RECV_WINDOW_DEFAULT;
+    conn->recv_window_size = WN_RECV_WINDOW_DEFAULT;
     conn->recv_window_used = 0;
-    conn->last_adv_sent = nl_connection_adv_window(conn);
+    conn->last_adv_sent = wn_connection_adv_window(conn);
     conn->rate_bps = 0;
     conn->rate_tokens = 0.0;
     conn->rate_last_refill_ms = now_ms;
@@ -299,35 +299,35 @@ nl_connection_t *nl_connection_create(nl_peer_id_t id, const struct sockaddr_sto
     return conn;
 }
 
-void nl_connection_destroy(nl_connection_t *conn) {
+void wn_connection_destroy(wn_connection_t *conn) {
     if (!conn) return;
-    for (uint8_t i = 0; i < conn->channel_count; i++) nl_channel_free(&conn->channels[i]);
+    for (uint8_t i = 0; i < conn->channel_count; i++) wn_channel_free(&conn->channels[i]);
     free(conn->channels);
     deferred_free_all(conn);
     pthread_mutex_destroy(&conn->lock);
     /* Best-effort zeroing of key material before freeing. */
-    nl_crypto_wipe(conn->send_key, sizeof(conn->send_key));
-    nl_crypto_wipe(conn->recv_key, sizeof(conn->recv_key));
+    wn_crypto_wipe(conn->send_key, sizeof(conn->send_key));
+    wn_crypto_wipe(conn->recv_key, sizeof(conn->recv_key));
     free(conn);
 }
 
 /* ---- encryption plumbing (caller must hold conn->lock) ---- */
 
-static void encrypt_and_emit(nl_connection_t *conn, uint8_t type, const uint8_t *plaintext, size_t pt_len,
-                              bool is_retransmit, const nl_conn_callbacks_t *cb) {
-    uint8_t packet[NL_ENCRYPTED_PACKET_SCRATCH];
+static void encrypt_and_emit(wn_connection_t *conn, uint8_t type, const uint8_t *plaintext, size_t pt_len,
+                              bool is_retransmit, const wn_conn_callbacks_t *cb) {
+    uint8_t packet[WN_ENCRYPTED_PACKET_SCRATCH];
     size_t off = 0;
     packet[off++] = type;
-    nl_put_u64(packet + off, conn->id); off += 8;
+    wn_put_u64(packet + off, conn->id); off += 8;
     uint64_t counter = conn->send_counter++;
-    nl_put_u64(packet + off, counter); off += 8;
+    wn_put_u64(packet + off, counter); off += 8;
 
     uint8_t nonce[12];
-    nl_nonce_build(conn->send_salt, counter, nonce);
+    wn_nonce_build(conn->send_salt, counter, nonce);
 
     uint8_t tag[16];
     /* AAD is exactly the cleartext header just written (type + connection_id + nonce_counter). */
-    if (!nl_crypto_aead_encrypt(conn->send_key, nonce, packet, off, plaintext, pt_len, packet + off, tag)) {
+    if (!wn_crypto_aead_encrypt(conn->send_key, nonce, packet, off, plaintext, pt_len, packet + off, tag)) {
         return; /* encryption failure: fail closed, drop the packet rather than send unprotected data */
     }
     off += pt_len;
@@ -342,84 +342,84 @@ static void encrypt_and_emit(nl_connection_t *conn, uint8_t type, const uint8_t 
 }
 
 typedef struct {
-    nl_connection_t *conn;
-    const nl_conn_callbacks_t *cb;
+    wn_connection_t *conn;
+    const wn_conn_callbacks_t *cb;
 } emit_ctx_t;
 
 static void on_channel_emit(void *ctx, const uint8_t *wire_payload, uint16_t len) {
     emit_ctx_t *e = (emit_ctx_t *)ctx;
-    encrypt_and_emit(e->conn, NL_PKT_DATA, wire_payload, len, /*is_retransmit*/ false, e->cb);
+    encrypt_and_emit(e->conn, WN_PKT_DATA, wire_payload, len, /*is_retransmit*/ false, e->cb);
 }
 
 typedef struct {
-    nl_connection_t *conn;
-    const nl_conn_callbacks_t *cb;
+    wn_connection_t *conn;
+    const wn_conn_callbacks_t *cb;
 } retransmit_ctx_t;
 
-/* Shared by both RTO-triggered retransmission (nl_connection_tick) and
- * receive-triggered fast retransmit (nl_connection_on_packet's DATA
+/* Shared by both RTO-triggered retransmission (wn_connection_tick) and
+ * receive-triggered fast retransmit (wn_connection_on_packet's DATA
  * case) -- both reconstruct-and-resend a specific unacked sequence, and
  * both count as a retransmit for stats purposes. */
 static void on_channel_retransmit(void *ctx, const uint8_t *wire_payload, uint16_t len) {
     retransmit_ctx_t *r = (retransmit_ctx_t *)ctx;
-    encrypt_and_emit(r->conn, NL_PKT_DATA, wire_payload, len, /*is_retransmit*/ true, r->cb);
+    encrypt_and_emit(r->conn, WN_PKT_DATA, wire_payload, len, /*is_retransmit*/ true, r->cb);
 }
 
 /* ---- send gating + deferred flush (caller must hold conn->lock) ---- */
 
 typedef struct {
-    nl_connection_t *conn;
+    wn_connection_t *conn;
     uint8_t channel;
-    nl_delivery_t delivery;
+    wn_delivery_t delivery;
     const uint8_t *data;
     size_t len;
     uint64_t now_ms;
-    const nl_conn_callbacks_t *cb;
+    const wn_conn_callbacks_t *cb;
     uint16_t frag_count;
     uint16_t frag_start;
     uint16_t message_id; /* set for continuations; ignored when frag_start==0 */
 } send_attempt_t;
 
 typedef struct {
-    nl_result_t result;
+    wn_result_t result;
     uint16_t sent_frags;
     uint16_t message_id;
     uint32_t bytes_sent;
 } send_outcome_t;
 
-static bool is_reliable_mode(nl_delivery_t d) {
-    return d == NL_RELIABLE_UNORDERED || d == NL_RELIABLE_ORDERED;
+static bool is_reliable_mode(wn_delivery_t d) {
+    return d == WN_RELIABLE_UNORDERED || d == WN_RELIABLE_ORDERED;
 }
 
 static uint16_t frag_count_for(size_t len) {
-    if (len <= NL_FRAGMENT_CHUNK_SIZE) return 1;
-    return nl_fragment_count_needed(len); /* 0 if len exceeds NL_MAX_MESSAGE_SIZE */
+    if (len <= WN_FRAGMENT_CHUNK_SIZE) return 1;
+    return wn_fragment_count_needed(len); /* 0 if len exceeds WN_MAX_MESSAGE_SIZE */
 }
 
 /* Payload bytes carried by fragments [from_frag, frag_count). */
 static uint32_t frag_bytes_from(size_t len, uint16_t frag_count, uint16_t from_frag) {
     if (from_frag >= frag_count) return 0;
     if (frag_count <= 1) return (uint32_t)len;
-    size_t before = (size_t)from_frag * NL_FRAGMENT_CHUNK_SIZE;
+    size_t before = (size_t)from_frag * WN_FRAGMENT_CHUNK_SIZE;
     if (before > len) before = len;
     return (uint32_t)(len - before);
 }
 
 static uint16_t frag_chunk_len(size_t len, uint16_t frag_count, uint16_t i) {
     if (frag_count <= 1) return (uint16_t)len;
-    size_t off = (size_t)i * NL_FRAGMENT_CHUNK_SIZE;
+    size_t off = (size_t)i * WN_FRAGMENT_CHUNK_SIZE;
     size_t rem = len - off;
-    if (rem > NL_FRAGMENT_CHUNK_SIZE) rem = NL_FRAGMENT_CHUNK_SIZE;
+    if (rem > WN_FRAGMENT_CHUNK_SIZE) rem = WN_FRAGMENT_CHUNK_SIZE;
     return (uint16_t)rem;
 }
 
 /* How many fragments from a->frag_start may leave now? 0 = fully blocked.
  * Combines: congestion window + send-ring room (reliable only), the peer's
- * receive window (both modes -- see the rwnd rule on nl_connection_t), and
+ * receive window (both modes -- see the rwnd rule on wn_connection_t), and
  * the sender rate limiter. Never consumes rate tokens: do_channel_send
  * consumes only what actually gets emitted, so a failed check can't steal
  * budget. */
-static uint16_t send_window_frags(nl_connection_t *conn, const send_attempt_t *a) {
+static uint16_t send_window_frags(wn_connection_t *conn, const send_attempt_t *a) {
     if (a->frag_start >= a->frag_count) return 0;
     uint32_t maxf = (uint32_t)(a->frag_count - a->frag_start);
 
@@ -427,11 +427,11 @@ static uint16_t send_window_frags(nl_connection_t *conn, const send_attempt_t *a
         uint32_t in_flight = reliable_in_flight(conn);
         if (in_flight >= conn->cwnd) return 0;
         uint32_t room = conn->cwnd - in_flight;
-        if (room > NL_SEQ_RING_SIZE) room = NL_SEQ_RING_SIZE;
-        nl_lane_t *lane = &conn->channels[a->channel].lanes[a->delivery];
+        if (room > WN_SEQ_RING_SIZE) room = WN_SEQ_RING_SIZE;
+        wn_lane_t *lane = &conn->channels[a->channel].lanes[a->delivery];
         if (lane->send_ring_init) {
-            if (lane->send_ring.unacked_count >= NL_SEQ_RING_SIZE) return 0;
-            uint32_t ring_room = (uint32_t)NL_SEQ_RING_SIZE - lane->send_ring.unacked_count;
+            if (lane->send_ring.unacked_count >= WN_SEQ_RING_SIZE) return 0;
+            uint32_t ring_room = (uint32_t)WN_SEQ_RING_SIZE - lane->send_ring.unacked_count;
             if (room > ring_room) room = ring_room;
         }
         if (maxf > room) maxf = room;
@@ -485,24 +485,24 @@ static uint16_t send_window_frags(nl_connection_t *conn, const send_attempt_t *a
     return (uint16_t)maxf;
 }
 
-static void rate_consume(nl_connection_t *conn, size_t bytes) {
+static void rate_consume(wn_connection_t *conn, size_t bytes) {
     if (conn->rate_bps != 0) conn->rate_tokens -= (double)bytes;
 }
 
 /* Emit up to `max_frags` fragments starting at a->frag_start and account
  * rate/peer-window usage for what actually went out. */
-static send_outcome_t do_channel_send(nl_connection_t *conn, const send_attempt_t *a,
+static send_outcome_t do_channel_send(wn_connection_t *conn, const send_attempt_t *a,
                                       uint16_t max_frags) {
-    send_outcome_t out = { NL_ERR_INTERNAL, 0, a->message_id, 0 };
+    send_outcome_t out = { WN_ERR_INTERNAL, 0, a->message_id, 0 };
     emit_ctx_t ectx = { conn, a->cb };
-    uint16_t rwnd = nl_connection_adv_window(conn);
+    uint16_t rwnd = wn_connection_adv_window(conn);
     conn->last_adv_sent = rwnd;
     uint16_t frag_count = 0;
-    out.result = nl_channel_send_range(&conn->channels[a->channel], a->now_ms, a->channel,
+    out.result = wn_channel_send_range(&conn->channels[a->channel], a->now_ms, a->channel,
                                        a->delivery, a->data, a->len, rwnd,
                                        a->frag_start, max_frags, &out.message_id,
                                        on_channel_emit, &ectx, &out.sent_frags, &frag_count);
-    if (out.result != NL_OK) return out;
+    if (out.result != WN_OK) return out;
     out.bytes_sent = frag_bytes_from(a->len, a->frag_count, a->frag_start)
                      - frag_bytes_from(a->len, a->frag_count,
                                        (uint16_t)(a->frag_start + out.sent_frags));
@@ -517,13 +517,13 @@ static send_outcome_t do_channel_send(nl_connection_t *conn, const send_attempt_
  * priority order is never violated by a lower-priority tail sneaking past
  * a blocked head. A partially-sent head becomes a continuation and stays
  * at the head until its last fragment goes out. */
-static void flush_deferred(nl_connection_t *conn, uint64_t now_ms, const nl_conn_callbacks_t *cb) {
+static void flush_deferred(wn_connection_t *conn, uint64_t now_ms, const wn_conn_callbacks_t *cb) {
     while (conn->deferred_head) {
-        nl_deferred_msg_t *head = conn->deferred_head;
+        wn_deferred_msg_t *head = conn->deferred_head;
         send_attempt_t a = {
             .conn = conn,
             .channel = head->channel,
-            .delivery = (nl_delivery_t)head->delivery,
+            .delivery = (wn_delivery_t)head->delivery,
             .data = head->data,
             .len = head->len,
             .now_ms = now_ms,
@@ -543,7 +543,7 @@ static void flush_deferred(nl_connection_t *conn, uint64_t now_ms, const nl_conn
         uint16_t maxf = send_window_frags(conn, &a);
         if (maxf == 0) break;
         send_outcome_t out = do_channel_send(conn, &a, maxf);
-        if (out.result != NL_OK) break; /* channel-level reject: leave head parked */
+        if (out.result != WN_OK) break; /* channel-level reject: leave head parked */
         if (out.sent_frags == 0) break; /* ring refused (unacked target slot): wait for acks */
         if ((uint32_t)a.frag_start + out.sent_frags >= a.frag_count) {
             deferred_pop(conn);
@@ -561,18 +561,18 @@ static void flush_deferred(nl_connection_t *conn, uint64_t now_ms, const nl_conn
     }
 }
 
-nl_result_t nl_connection_send(nl_connection_t *conn, uint8_t channel, nl_delivery_t delivery,
+wn_result_t wn_connection_send(wn_connection_t *conn, uint8_t channel, wn_delivery_t delivery,
                                 const uint8_t *data, size_t len, uint8_t priority,
-                                uint64_t now_ms, const nl_conn_callbacks_t *cb) {
-    if (channel >= conn->channel_count) return NL_ERR_CHANNEL_OUT_OF_RANGE;
-    if ((int)delivery < 0 || (int)delivery >= NL_LANES_PER_CHANNEL) return NL_ERR_INVALID_ARGUMENT;
-    if (len > 0 && !data) return NL_ERR_INVALID_ARGUMENT;
-    if (len > NL_MAX_MESSAGE_SIZE) return NL_ERR_MESSAGE_TOO_LARGE;
+                                uint64_t now_ms, const wn_conn_callbacks_t *cb) {
+    if (channel >= conn->channel_count) return WN_ERR_CHANNEL_OUT_OF_RANGE;
+    if ((int)delivery < 0 || (int)delivery >= WN_LANES_PER_CHANNEL) return WN_ERR_INVALID_ARGUMENT;
+    if (len > 0 && !data) return WN_ERR_INVALID_ARGUMENT;
+    if (len > WN_MAX_MESSAGE_SIZE) return WN_ERR_MESSAGE_TOO_LARGE;
 
     pthread_mutex_lock(&conn->lock);
-    if (conn->state != NL_CONN_CONNECTED) {
+    if (conn->state != WN_CONN_CONNECTED) {
         pthread_mutex_unlock(&conn->lock);
-        return NL_ERR_NOT_CONNECTED;
+        return WN_ERR_NOT_CONNECTED;
     }
 
     send_attempt_t a = {
@@ -582,7 +582,7 @@ nl_result_t nl_connection_send(nl_connection_t *conn, uint8_t channel, nl_delive
     };
     if (a.frag_count == 0) {
         pthread_mutex_unlock(&conn->lock);
-        return NL_ERR_MESSAGE_TOO_LARGE;
+        return WN_ERR_MESSAGE_TOO_LARGE;
     }
 
     /* Anything already parked must go out first: always enqueue behind it
@@ -592,11 +592,11 @@ nl_result_t nl_connection_send(nl_connection_t *conn, uint8_t channel, nl_delive
         if (!deferred_push(conn, channel, delivery, priority, data, len,
                            /*continuation*/ false, 0, 0)) {
             pthread_mutex_unlock(&conn->lock);
-            return NL_ERR_QUEUE_FULL;
+            return WN_ERR_QUEUE_FULL;
         }
         flush_deferred(conn, now_ms, cb);
         pthread_mutex_unlock(&conn->lock);
-        return NL_OK;
+        return WN_OK;
     }
 
     uint16_t maxf = send_window_frags(conn, &a);
@@ -604,13 +604,13 @@ nl_result_t nl_connection_send(nl_connection_t *conn, uint8_t channel, nl_delive
         /* A partial send needs somewhere to park its tail; verify queue
          * room up front rather than emit fragments we can't continue. */
         if (maxf < a.frag_count &&
-            (conn->deferred_count >= NL_DEFERRED_MAX_MSGS ||
-             conn->deferred_bytes + len > NL_DEFERRED_MAX_BYTES)) {
+            (conn->deferred_count >= WN_DEFERRED_MAX_MSGS ||
+             conn->deferred_bytes + len > WN_DEFERRED_MAX_BYTES)) {
             pthread_mutex_unlock(&conn->lock);
-            return NL_ERR_QUEUE_FULL;
+            return WN_ERR_QUEUE_FULL;
         }
         send_outcome_t out = do_channel_send(conn, &a, maxf);
-        if (out.result != NL_OK) {
+        if (out.result != WN_OK) {
             /* Permanent channel-level failure (bad size etc.) -- do not defer. */
             pthread_mutex_unlock(&conn->lock);
             return out.result;
@@ -623,38 +623,38 @@ nl_result_t nl_connection_send(nl_connection_t *conn, uint8_t channel, nl_delive
                           (uint16_t)(a.frag_start + out.sent_frags), out.message_id);
         }
         pthread_mutex_unlock(&conn->lock);
-        return NL_OK;
+        return WN_OK;
     }
 
     /* Window/rate closed: park until budget opens (tick/ack/rwnd update). */
     if (!deferred_push(conn, channel, delivery, priority, data, len,
                        /*continuation*/ false, 0, 0)) {
         pthread_mutex_unlock(&conn->lock);
-        return NL_ERR_QUEUE_FULL;
+        return WN_ERR_QUEUE_FULL;
     }
     pthread_mutex_unlock(&conn->lock);
-    return NL_OK;
+    return WN_OK;
 }
 
 typedef struct {
-    nl_peer_id_t peer;
-    const nl_conn_callbacks_t *cb;
-    nl_connection_t *conn;
+    wn_peer_id_t peer;
+    const wn_conn_callbacks_t *cb;
+    wn_connection_t *conn;
 } deliver_ctx_t;
 
-static void on_channel_deliver(void *ctx, uint8_t channel_id, nl_delivery_t delivery,
+static void on_channel_deliver(void *ctx, uint8_t channel_id, wn_delivery_t delivery,
                                 const uint8_t *data, uint32_t len) {
     deliver_ctx_t *d = (deliver_ctx_t *)ctx;
     bool queued = d->cb->on_data(d->cb->ctx, d->peer, channel_id, delivery, data, len);
     /* Flow control: bytes handed to the event queue occupy local window
-     * until nl_poll_event returns them to the app (nl_connection_consume_window).
+     * until wn_poll_event returns them to the app (wn_connection_consume_window).
      * Called from on_packet with conn->lock already held.
      * Charge the FULL length, with no clamp to recv_window_size: the release
-     * (nl_connection_consume_window) subtracts the full event length too, so
+     * (wn_connection_consume_window) subtracts the full event length too, so
      * clamping the charge while releasing in full frees more than was ever
      * charged and recv_window_used drifts below the real outstanding bytes.
      * The receiver then keeps advertising free window it doesn't have.
-     * nl_connection_adv_window() already reports 0 for any used >= size, so
+     * wn_connection_adv_window() already reports 0 for any used >= size, so
      * an over-count self-limits to "window closed" rather than corrupting the
      * arithmetic -- unlike a clamp, which corrupts it.
      *
@@ -662,66 +662,66 @@ static void on_channel_deliver(void *ctx, uint8_t channel_id, nl_delivery_t deli
      * (endpoint event-queue byte cap/OOM): skip the charge so the sender's
      * window is not permanently closed by a payload the receiver dropped. */
     if (!queued) return;
-    nl_connection_t *conn = d->conn;
+    wn_connection_t *conn = d->conn;
     conn->recv_window_used += len;
 }
 
-nl_result_t nl_connection_on_packet(nl_connection_t *conn, uint8_t type,
+wn_result_t wn_connection_on_packet(wn_connection_t *conn, uint8_t type,
                                      const uint8_t *enc_body, size_t enc_body_len,
-                                     uint64_t now_ms, const nl_conn_callbacks_t *cb) {
-    if (enc_body_len < 8 + 8 + NL_GCM_TAG_SIZE) return NL_ERR_PROTOCOL_MISMATCH;
+                                     uint64_t now_ms, const wn_conn_callbacks_t *cb) {
+    if (enc_body_len < 8 + 8 + WN_GCM_TAG_SIZE) return WN_ERR_PROTOCOL_MISMATCH;
 
-    uint64_t counter = nl_get_u64(enc_body + 8);
-    size_t ct_len = enc_body_len - 8 - 8 - NL_GCM_TAG_SIZE;
+    uint64_t counter = wn_get_u64(enc_body + 8);
+    size_t ct_len = enc_body_len - 8 - 8 - WN_GCM_TAG_SIZE;
     const uint8_t *ciphertext = enc_body + 16;
     const uint8_t *tag = enc_body + 16 + ct_len;
 
     pthread_mutex_lock(&conn->lock);
 
-    if (conn->state != NL_CONN_CONNECTED) {
+    if (conn->state != WN_CONN_CONNECTED) {
         pthread_mutex_unlock(&conn->lock);
-        return NL_ERR_NOT_CONNECTED;
+        return WN_ERR_NOT_CONNECTED;
     }
 
     /* Cheap non-mutating pre-check to avoid wasting CPU decrypting an
      * obvious replay. The window is only actually updated below, AFTER
      * authentication succeeds -- see the comment on
-     * nl_replay_window_would_accept() for why the ordering matters. */
-    if (!nl_replay_window_would_accept(&conn->recv_replay, counter)) {
+     * wn_replay_window_would_accept() for why the ordering matters. */
+    if (!wn_replay_window_would_accept(&conn->recv_replay, counter)) {
         conn->stats.duplicates_received++;
         pthread_mutex_unlock(&conn->lock);
-        return NL_ERR_PROTOCOL_MISMATCH;
+        return WN_ERR_PROTOCOL_MISMATCH;
     }
 
     uint8_t nonce[12];
-    nl_nonce_build(conn->recv_salt, counter, nonce);
+    wn_nonce_build(conn->recv_salt, counter, nonce);
 
     uint8_t aad[17];
     aad[0] = type;
     memcpy(aad + 1, enc_body, 16); /* connection_id(8) + nonce_counter(8) */
 
-    uint8_t plaintext[NL_MAX_PACKET_SIZE + NL_FRAGMENT_HEADER_SIZE + 64];
+    uint8_t plaintext[WN_MAX_PACKET_SIZE + WN_FRAGMENT_HEADER_SIZE + 64];
     if (ct_len > sizeof(plaintext)) {
         pthread_mutex_unlock(&conn->lock);
-        return NL_ERR_MESSAGE_TOO_LARGE;
+        return WN_ERR_MESSAGE_TOO_LARGE;
     }
-    if (!nl_crypto_aead_decrypt(conn->recv_key, nonce, aad, sizeof(aad), ciphertext, ct_len, tag, plaintext)) {
+    if (!wn_crypto_aead_decrypt(conn->recv_key, nonce, aad, sizeof(aad), ciphertext, ct_len, tag, plaintext)) {
         pthread_mutex_unlock(&conn->lock);
-        return NL_ERR_CRYPTO; /* bad tag: tampered, wrong key, or corrupted -- drop */
+        return WN_ERR_CRYPTO; /* bad tag: tampered, wrong key, or corrupted -- drop */
     }
 
     /* Authenticated: now it's safe to commit this counter to the replay window. */
-    if (!nl_replay_window_check(&conn->recv_replay, counter)) {
+    if (!wn_replay_window_check(&conn->recv_replay, counter)) {
         conn->stats.duplicates_received++;
         pthread_mutex_unlock(&conn->lock);
-        return NL_ERR_PROTOCOL_MISMATCH; /* lost a race with another thread's identical packet */
+        return WN_ERR_PROTOCOL_MISMATCH; /* lost a race with another thread's identical packet */
     }
 
     conn->last_recv_time_ms = now_ms;
     conn->stats.packets_received++;
     conn->stats.bytes_received += enc_body_len + 1; /* +1 for the type byte, passed separately */
 
-    nl_result_t result = NL_OK;
+    wn_result_t result = WN_OK;
     bool just_confirmed = false;
     bool became_disconnected = false;
     uint32_t total_newly_acked = 0;
@@ -729,26 +729,26 @@ nl_result_t nl_connection_on_packet(nl_connection_t *conn, uint8_t type,
     uint64_t retx_before = conn->stats.retransmits;
 
     switch (type) {
-        case NL_PKT_DATA: {
+        case WN_PKT_DATA: {
             deliver_ctx_t dctx = { conn->id, cb, conn };
             /* Route by the channel_id embedded in the plaintext (byte 0
              * of the DATA payload) into that channel's state. */
-            if (ct_len < NL_DATA_HEADER_SIZE) { result = NL_ERR_PROTOCOL_MISMATCH; break; }
+            if (ct_len < WN_DATA_HEADER_SIZE) { result = WN_ERR_PROTOCOL_MISMATCH; break; }
             uint8_t channel_id = plaintext[0];
-            if (channel_id >= conn->channel_count) { result = NL_ERR_CHANNEL_OUT_OF_RANGE; break; }
+            if (channel_id >= conn->channel_count) { result = WN_ERR_CHANNEL_OUT_OF_RANGE; break; }
             /* Validate delivery before the window update below: a malformed
              * value must return PROTOCOL_MISMATCH without touching
              * peer_rwnd (which would otherwise be overwritten with the
              * zero-initialized out-param). */
-            if (plaintext[1] >= NL_LANES_PER_CHANNEL) { result = NL_ERR_PROTOCOL_MISMATCH; break; }
+            if (plaintext[1] >= WN_LANES_PER_CHANNEL) { result = WN_ERR_PROTOCOL_MISMATCH; break; }
             retransmit_ctx_t rctx = { conn, cb };
             bool has_rtt_sample = false;
             uint32_t rtt_sample_ms = 0;
             uint32_t newly_acked = 0;
             uint16_t peer_rwnd = 0; /* header pre-checked above: always written */
-            uint16_t adv = nl_connection_adv_window(conn);
+            uint16_t adv = wn_connection_adv_window(conn);
 
-            nl_channel_on_receive(&conn->channels[channel_id], now_ms, plaintext, (uint16_t)ct_len,
+            wn_channel_on_receive(&conn->channels[channel_id], now_ms, plaintext, (uint16_t)ct_len,
                                    adv, on_channel_deliver, &dctx,
                                    on_channel_retransmit, &rctx,
                                    &has_rtt_sample, &rtt_sample_ms,
@@ -764,22 +764,22 @@ nl_result_t nl_connection_on_packet(nl_connection_t *conn, uint8_t type,
             if (conn->stats.retransmits > retx_before) fast_loss = true;
             break;
         }
-        case NL_PKT_ACK: {
+        case WN_PKT_ACK: {
             /* Standalone ack for lanes with no reverse DATA to piggyback
              * on (one-way traffic). Same effects as a piggybacked ack. */
-            if (ct_len < NL_ACK_PAYLOAD_SIZE) { result = NL_ERR_PROTOCOL_MISMATCH; break; }
+            if (ct_len < WN_ACK_PAYLOAD_SIZE) { result = WN_ERR_PROTOCOL_MISMATCH; break; }
             uint8_t channel_id = plaintext[0];
             uint8_t delivery_raw = plaintext[1];
-            if (channel_id >= conn->channel_count) { result = NL_ERR_CHANNEL_OUT_OF_RANGE; break; }
-            if (delivery_raw != NL_RELIABLE_UNORDERED && delivery_raw != NL_RELIABLE_ORDERED) {
-                result = NL_ERR_PROTOCOL_MISMATCH;
+            if (channel_id >= conn->channel_count) { result = WN_ERR_CHANNEL_OUT_OF_RANGE; break; }
+            if (delivery_raw != WN_RELIABLE_UNORDERED && delivery_raw != WN_RELIABLE_ORDERED) {
+                result = WN_ERR_PROTOCOL_MISMATCH;
                 break;
             }
-            uint16_t ack = nl_get_u16(plaintext + 2);
-            nl_ack_bits_t ack_bits = nl_get_u64(plaintext + 4);
+            uint16_t ack = wn_get_u16(plaintext + 2);
+            wn_ack_bits_t ack_bits = wn_get_u64(plaintext + 4);
             uint8_t ack_valid = plaintext[12];
-            if (ack_valid > 1) { result = NL_ERR_PROTOCOL_MISMATCH; break; }
-            uint16_t peer_rwnd = nl_get_u16(plaintext + 13);
+            if (ack_valid > 1) { result = WN_ERR_PROTOCOL_MISMATCH; break; }
+            uint16_t peer_rwnd = wn_get_u16(plaintext + 13);
             if (peer_rwnd > conn->peer_rwnd_capacity) conn->peer_rwnd_capacity = peer_rwnd;
             conn->peer_rwnd = peer_rwnd;
             conn->peer_window_in_flight = 0;
@@ -788,9 +788,9 @@ nl_result_t nl_connection_on_packet(nl_connection_t *conn, uint8_t type,
             bool has_rtt_sample = false;
             uint32_t rtt_sample_ms = 0;
             uint32_t newly_acked = 0;
-            uint16_t adv = nl_connection_adv_window(conn);
-            nl_channel_apply_ack(&conn->channels[channel_id], now_ms, channel_id,
-                                 (nl_delivery_t)delivery_raw, ack_valid != 0, ack, ack_bits, adv,
+            uint16_t adv = wn_connection_adv_window(conn);
+            wn_channel_apply_ack(&conn->channels[channel_id], now_ms, channel_id,
+                                 (wn_delivery_t)delivery_raw, ack_valid != 0, ack, ack_bits, adv,
                                  on_channel_retransmit, &rctx,
                                  &has_rtt_sample, &rtt_sample_ms, &newly_acked);
             total_newly_acked += newly_acked;
@@ -798,18 +798,18 @@ nl_result_t nl_connection_on_packet(nl_connection_t *conn, uint8_t type,
             if (conn->stats.retransmits > retx_before) fast_loss = true;
             break;
         }
-        case NL_PKT_KEEPALIVE:
+        case WN_PKT_KEEPALIVE:
             /* Keeps the connection from idling out. A payload of two bytes
              * carries the peer's current window, which repairs a lost
              * window update (older peers send none). */
             if (ct_len >= 2) {
-                uint16_t peer_rwnd = nl_get_u16(plaintext);
+                uint16_t peer_rwnd = wn_get_u16(plaintext);
                 if (peer_rwnd > conn->peer_rwnd_capacity) conn->peer_rwnd_capacity = peer_rwnd;
                 conn->peer_rwnd = peer_rwnd;
                 conn->peer_window_in_flight = 0;
             }
             break;
-        case NL_PKT_CONNECT_ACCEPTED:
+        case WN_PKT_CONNECT_ACCEPTED:
             /* Client-side handshake confirmation. Harmless no-op if this
              * ever reaches a server-side connection object (servers never
              * receive this type from a well-behaved peer; it's simply
@@ -819,12 +819,12 @@ nl_result_t nl_connection_on_packet(nl_connection_t *conn, uint8_t type,
                 just_confirmed = true;
             }
             break;
-        case NL_PKT_DISCONNECT:
-            conn->state = NL_CONN_DISCONNECTED;
+        case WN_PKT_DISCONNECT:
+            conn->state = WN_CONN_DISCONNECTED;
             became_disconnected = true;
             break;
         default:
-            result = NL_ERR_PROTOCOL_MISMATCH;
+            result = WN_ERR_PROTOCOL_MISMATCH;
             break;
     }
 
@@ -840,31 +840,31 @@ nl_result_t nl_connection_on_packet(nl_connection_t *conn, uint8_t type,
         cb->on_connected(cb->ctx, conn->id);
     }
     if (became_disconnected) {
-        cb->on_disconnected(cb->ctx, conn->id, NL_OK); /* peer-initiated graceful close */
+        cb->on_disconnected(cb->ctx, conn->id, WN_OK); /* peer-initiated graceful close */
     }
 
     return result;
 }
 
-/* Caller must hold conn->lock. Emits one NL_PKT_ACK per lane that has
+/* Caller must hold conn->lock. Emits one WN_PKT_ACK per lane that has
  * received reliable data since its last piggybacked/standalone ack. */
-static void flush_acks_locked(nl_connection_t *conn, const nl_conn_callbacks_t *cb) {
-    uint16_t adv = nl_connection_adv_window(conn);
+static void flush_acks_locked(wn_connection_t *conn, const wn_conn_callbacks_t *cb) {
+    uint16_t adv = wn_connection_adv_window(conn);
     for (uint8_t c = 0; c < conn->channel_count; c++) {
-        for (int d = NL_RELIABLE_UNORDERED; d <= NL_RELIABLE_ORDERED; d++) {
-            nl_lane_t *lane = &conn->channels[c].lanes[d];
+        for (int d = WN_RELIABLE_UNORDERED; d <= WN_RELIABLE_ORDERED; d++) {
+            wn_lane_t *lane = &conn->channels[c].lanes[d];
             if (!lane->ack_dirty || !lane->recv_dedupe_init) continue;
             uint16_t ack;
-            nl_ack_bits_t ack_bits;
-            nl_recv_dedupe_build_ack(&lane->recv_dedupe, &ack, &ack_bits);
-            uint8_t payload[NL_ACK_PAYLOAD_SIZE];
+            wn_ack_bits_t ack_bits;
+            wn_recv_dedupe_build_ack(&lane->recv_dedupe, &ack, &ack_bits);
+            uint8_t payload[WN_ACK_PAYLOAD_SIZE];
             payload[0] = c;
             payload[1] = (uint8_t)d;
-            nl_put_u16(payload + 2, ack);
-            nl_put_u64(payload + 4, ack_bits);
+            wn_put_u16(payload + 2, ack);
+            wn_put_u64(payload + 4, ack_bits);
             payload[12] = 1; /* ack_valid: this packet carries a real ack */
-            nl_put_u16(payload + 13, adv);
-            encrypt_and_emit(conn, NL_PKT_ACK, payload, NL_ACK_PAYLOAD_SIZE, /*is_retransmit*/ false, cb);
+            wn_put_u16(payload + 13, adv);
+            encrypt_and_emit(conn, WN_PKT_ACK, payload, WN_ACK_PAYLOAD_SIZE, /*is_retransmit*/ false, cb);
             conn->last_adv_sent = adv;
             lane->ack_dirty = false;
         }
@@ -872,7 +872,7 @@ static void flush_acks_locked(nl_connection_t *conn, const nl_conn_callbacks_t *
 }
 
 /* Smallest window growth worth a packet: one fragment's worth of room. */
-#define NL_WINDOW_UPDATE_MIN_GROWTH NL_FRAGMENT_CHUNK_SIZE
+#define WN_WINDOW_UPDATE_MIN_GROWTH WN_FRAGMENT_CHUNK_SIZE
 
 /* Caller must hold conn->lock. When the app has drained enough since we last
  * advertised our window, tell the peer with an ack that carries no
@@ -881,38 +881,38 @@ static void flush_acks_locked(nl_connection_t *conn, const nl_conn_callbacks_t *
  * DATA of its own to send. The update is best effort: the idle keepalive
  * repeats the current window, so a lost update delays the sender by at most
  * one keepalive interval. */
-static void maybe_send_window_update_locked(nl_connection_t *conn, const nl_conn_callbacks_t *cb) {
-    uint16_t adv = nl_connection_adv_window(conn);
+static void maybe_send_window_update_locked(wn_connection_t *conn, const wn_conn_callbacks_t *cb) {
+    uint16_t adv = wn_connection_adv_window(conn);
     if (adv <= conn->last_adv_sent) return;
-    if ((uint32_t)(adv - conn->last_adv_sent) < NL_WINDOW_UPDATE_MIN_GROWTH) return;
-    uint8_t payload[NL_ACK_PAYLOAD_SIZE] = {0};
+    if ((uint32_t)(adv - conn->last_adv_sent) < WN_WINDOW_UPDATE_MIN_GROWTH) return;
+    uint8_t payload[WN_ACK_PAYLOAD_SIZE] = {0};
     payload[0] = 0;                       /* channel 0 always exists */
-    payload[1] = (uint8_t)NL_RELIABLE_UNORDERED;
+    payload[1] = (uint8_t)WN_RELIABLE_UNORDERED;
     payload[12] = 0;                      /* ack_valid: window only */
-    nl_put_u16(payload + 13, adv);
-    encrypt_and_emit(conn, NL_PKT_ACK, payload, NL_ACK_PAYLOAD_SIZE, /*is_retransmit*/ false, cb);
+    wn_put_u16(payload + 13, adv);
+    encrypt_and_emit(conn, WN_PKT_ACK, payload, WN_ACK_PAYLOAD_SIZE, /*is_retransmit*/ false, cb);
     conn->last_adv_sent = adv;
 }
 
-void nl_connection_flush_acks(nl_connection_t *conn, uint64_t now_ms, const nl_conn_callbacks_t *cb) {
+void wn_connection_flush_acks(wn_connection_t *conn, uint64_t now_ms, const wn_conn_callbacks_t *cb) {
     (void)now_ms;
     pthread_mutex_lock(&conn->lock);
-    if (conn->state == NL_CONN_CONNECTED) flush_acks_locked(conn, cb);
+    if (conn->state == WN_CONN_CONNECTED) flush_acks_locked(conn, cb);
     pthread_mutex_unlock(&conn->lock);
 }
 
-void nl_connection_tick(nl_connection_t *conn, uint64_t now_ms, const nl_conn_callbacks_t *cb) {
+void wn_connection_tick(wn_connection_t *conn, uint64_t now_ms, const wn_conn_callbacks_t *cb) {
     pthread_mutex_lock(&conn->lock);
-    if (conn->state != NL_CONN_CONNECTED) {
+    if (conn->state != WN_CONN_CONNECTED) {
         pthread_mutex_unlock(&conn->lock);
         return;
     }
 
     /* Idle timeout. */
     if (now_ms - conn->last_recv_time_ms > conn->connection_timeout_ms) {
-        conn->state = NL_CONN_DISCONNECTED;
+        conn->state = WN_CONN_DISCONNECTED;
         pthread_mutex_unlock(&conn->lock);
-        cb->on_disconnected(cb->ctx, conn->id, NL_ERR_TIMEOUT);
+        cb->on_disconnected(cb->ctx, conn->id, WN_ERR_TIMEOUT);
         return;
     }
 
@@ -926,9 +926,9 @@ void nl_connection_tick(nl_connection_t *conn, uint64_t now_ms, const nl_conn_ca
      * round-tripped, so further ACCEPTED retries are pointless. */
     if (!conn->is_client_side && conn->accept_retries_left > 0 &&
         conn->last_recv_time_ms <= conn->accept_sent_ms) {
-        if (now_ms - conn->accept_sent_ms >= NL_HANDSHAKE_RETRY_MS) {
+        if (now_ms - conn->accept_sent_ms >= WN_HANDSHAKE_RETRY_MS) {
             uint8_t empty[1] = {0};
-            encrypt_and_emit(conn, NL_PKT_CONNECT_ACCEPTED, empty, 0, /*is_retransmit*/ false, cb);
+            encrypt_and_emit(conn, WN_PKT_CONNECT_ACCEPTED, empty, 0, /*is_retransmit*/ false, cb);
             conn->accept_sent_ms = now_ms;
             conn->accept_retries_left--;
         }
@@ -938,10 +938,10 @@ void nl_connection_tick(nl_connection_t *conn, uint64_t now_ms, const nl_conn_ca
     retransmit_ctx_t rctx = { conn, cb };
     bool any_gave_up = false;
     uint64_t retx_before = conn->stats.retransmits;
-    uint16_t adv = nl_connection_adv_window(conn);
+    uint16_t adv = wn_connection_adv_window(conn);
     for (uint8_t c = 0; c < conn->channel_count; c++) {
         bool give_up = false;
-        nl_channel_tick(&conn->channels[c], c, now_ms, conn->rto_ms, NL_MAX_RETRIES, adv,
+        wn_channel_tick(&conn->channels[c], c, now_ms, conn->rto_ms, WN_MAX_RETRIES, adv,
                          on_channel_retransmit, &rctx, &give_up);
         any_gave_up = any_gave_up || give_up;
     }
@@ -966,38 +966,38 @@ void nl_connection_tick(nl_connection_t *conn, uint64_t now_ms, const nl_conn_ca
         /* The payload is the local window (u16). Old peers ignore keepalive
          * payloads, and a keepalive without one is still accepted below. */
         uint8_t ka[2];
-        uint16_t ka_adv = nl_connection_adv_window(conn);
-        nl_put_u16(ka, ka_adv);
-        encrypt_and_emit(conn, NL_PKT_KEEPALIVE, ka, sizeof(ka), /*is_retransmit*/ false, cb);
+        uint16_t ka_adv = wn_connection_adv_window(conn);
+        wn_put_u16(ka, ka_adv);
+        encrypt_and_emit(conn, WN_PKT_KEEPALIVE, ka, sizeof(ka), /*is_retransmit*/ false, cb);
         conn->last_adv_sent = ka_adv;
         conn->last_send_time_ms = now_ms;
     }
 
     bool give_up_disconnect = any_gave_up;
-    if (give_up_disconnect) conn->state = NL_CONN_DISCONNECTED;
+    if (give_up_disconnect) conn->state = WN_CONN_DISCONNECTED;
     pthread_mutex_unlock(&conn->lock);
 
     if (give_up_disconnect) {
-        cb->on_disconnected(cb->ctx, conn->id, NL_ERR_TIMEOUT);
+        cb->on_disconnected(cb->ctx, conn->id, WN_ERR_TIMEOUT);
     }
 }
 
-void nl_connection_send_disconnect(nl_connection_t *conn, uint64_t now_ms, const nl_conn_callbacks_t *cb) {
+void wn_connection_send_disconnect(wn_connection_t *conn, uint64_t now_ms, const wn_conn_callbacks_t *cb) {
     pthread_mutex_lock(&conn->lock);
-    if (conn->state == NL_CONN_CONNECTED) {
+    if (conn->state == WN_CONN_CONNECTED) {
         uint8_t empty[1] = {0};
-        encrypt_and_emit(conn, NL_PKT_DISCONNECT, empty, 0, /*is_retransmit*/ false, cb);
-        conn->state = NL_CONN_DISCONNECTED;
+        encrypt_and_emit(conn, WN_PKT_DISCONNECT, empty, 0, /*is_retransmit*/ false, cb);
+        conn->state = WN_CONN_DISCONNECTED;
         conn->last_send_time_ms = now_ms;
     }
     pthread_mutex_unlock(&conn->lock);
 }
 
-void nl_connection_send_handshake_complete(nl_connection_t *conn, uint64_t now_ms,
-                                            bool is_retry, const nl_conn_callbacks_t *cb) {
+void wn_connection_send_handshake_complete(wn_connection_t *conn, uint64_t now_ms,
+                                            bool is_retry, const wn_conn_callbacks_t *cb) {
     pthread_mutex_lock(&conn->lock);
     uint8_t empty[1] = {0};
-    encrypt_and_emit(conn, NL_PKT_CONNECT_ACCEPTED, empty, 0, /*is_retransmit*/ false, cb);
+    encrypt_and_emit(conn, WN_PKT_CONNECT_ACCEPTED, empty, 0, /*is_retransmit*/ false, cb);
     if (is_retry) {
         /* Tick-driven resend: refresh the timer, leave the remaining budget
          * alone (it was armed by the initial send). */
@@ -1005,19 +1005,19 @@ void nl_connection_send_handshake_complete(nl_connection_t *conn, uint64_t now_m
     } else {
         /* Initial send arms the retransmission budget. */
         conn->accept_sent_ms = now_ms;
-        conn->accept_retries_left = NL_ACCEPT_RETRIES;
+        conn->accept_retries_left = WN_ACCEPT_RETRIES;
     }
     pthread_mutex_unlock(&conn->lock);
 }
 
-uint32_t nl_connection_rtt_ms(nl_connection_t *conn) {
+uint32_t wn_connection_rtt_ms(wn_connection_t *conn) {
     pthread_mutex_lock(&conn->lock);
     uint32_t rtt = conn->rtt_ms;
     pthread_mutex_unlock(&conn->lock);
     return rtt;
 }
 
-void nl_connection_get_stats(nl_connection_t *conn, nl_connection_stats_t *out) {
+void wn_connection_get_stats(wn_connection_t *conn, wn_connection_stats_t *out) {
     pthread_mutex_lock(&conn->lock);
     *out = conn->stats;
     out->rtt_ms = conn->rtt_ms;
@@ -1026,23 +1026,23 @@ void nl_connection_get_stats(nl_connection_t *conn, nl_connection_stats_t *out) 
     pthread_mutex_unlock(&conn->lock);
 }
 
-uint32_t nl_connection_capabilities(nl_connection_t *conn) {
+uint32_t wn_connection_capabilities(wn_connection_t *conn) {
     pthread_mutex_lock(&conn->lock);
     uint32_t caps = conn->capabilities;
     pthread_mutex_unlock(&conn->lock);
     return caps;
 }
 
-uint16_t nl_connection_adv_window(nl_connection_t *conn) {
+uint16_t wn_connection_adv_window(wn_connection_t *conn) {
     /* Assumes conn->lock is held (or the connection is not yet published):
      * every mutator of recv_window_used runs under that lock. */
     if (conn->recv_window_used >= conn->recv_window_size) return 0;
     uint32_t avail = conn->recv_window_size - conn->recv_window_used;
-    if (avail > NL_RECV_WINDOW_MAX) avail = NL_RECV_WINDOW_MAX;
+    if (avail > WN_RECV_WINDOW_MAX) avail = WN_RECV_WINDOW_MAX;
     return (uint16_t)avail;
 }
 
-void nl_connection_consume_window(nl_connection_t *conn, uint32_t bytes) {
+void wn_connection_consume_window(wn_connection_t *conn, uint32_t bytes) {
     if (!conn) return;
     pthread_mutex_lock(&conn->lock);
     if (bytes >= conn->recv_window_used) conn->recv_window_used = 0;

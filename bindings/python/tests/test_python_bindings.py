@@ -1,10 +1,10 @@
 """
-Tests for the netlink Python bindings. Runs a real server and client, both
+Tests for the weft-net Python bindings. Runs a real server and client, both
 through the ctypes bindings, talking over actual loopback UDP sockets --
 this is the same wire protocol a C, Go, or Rust peer would use.
 
-Run with: NETLINK_LIBRARY_PATH=/path/to/libnetlink.so pytest test_python_bindings.py
-(or just `pytest` if libnetlink.so is discoverable at the default build path).
+Run with: WEFT_NET_LIBRARY_PATH=/path/to/libweft_net.so pytest test_python_bindings.py
+(or just `pytest` if libweft_net.so is discoverable at the default build path).
 """
 import ctypes
 import os
@@ -13,7 +13,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import netlink
+import weft_net
 
 PORT_COUNTER = [34900]
 
@@ -33,8 +33,8 @@ def wait_for(client_or_server, event_type, timeout=3.0):
 
 
 def test_version_matches_package():
-    assert netlink.__version__ == "1.3.0"
-    assert netlink.version() == netlink.__version__
+    assert weft_net.__version__ == "1.3.0"
+    assert weft_net.version() == weft_net.__version__
 
 
 def test_abi_struct_sizes_match_c():
@@ -42,13 +42,13 @@ def test_abi_struct_sizes_match_c():
     (the C header can't be included from Python). If C grows a field and the
     mirror doesn't, both sides still compile and the mismatch only shows up
     as memory corruption -- which is exactly what happened in 1.0.0, where
-    three nl_config_t fields were missing from this mirror and
-    nl_config_default wrote past the end of it.
+    three wn_config_t fields were missing from this mirror and
+    wn_config_default wrote past the end of it.
 
-    The C side now has _Static_asserts on the same numbers (NL_ABI_ASSERT in
-    include/netlink.h); these are the mirror side of that guard.
+    The C side now has _Static_asserts on the same numbers (WN_ABI_ASSERT in
+    include/weft_net.h); these are the mirror side of that guard.
     """
-    # Mirrored 64-bit ABI sizes; see NL_ABI_ASSERT in include/netlink.h.
+    # Mirrored 64-bit ABI sizes; see WN_ABI_ASSERT in include/weft_net.h.
     expected = {
         "_Config": 56,
         "_Event": 192,
@@ -56,7 +56,7 @@ def test_abi_struct_sizes_match_c():
         "_Address": 72,
     }
     for name, size in expected.items():
-        actual = ctypes.sizeof(getattr(netlink, name))
+        actual = ctypes.sizeof(getattr(weft_net, name))
         assert actual == size, (
             f"{name} mirror is {actual} bytes, C expects {size} -- the C struct "
             "gained/lost a field and this mirror wasn't updated"
@@ -65,13 +65,13 @@ def test_abi_struct_sizes_match_c():
 
 def test_config_default_matches_c_defaults():
     """Belt and braces for the ABI guard: if the mirror's field ORDER drifted
-    from C's, the sizes could still agree while nl_config_default wrote the
+    from C's, the sizes could still agree while wn_config_default wrote the
     right values into the wrong offsets. Reading the defaults back through
     the mirror catches that too.
     """
-    cfg = netlink._Config()
-    netlink._lib.nl_config_default(ctypes.byref(cfg))
-    assert cfg.transport == netlink.Transport.UDP
+    cfg = weft_net._Config()
+    weft_net._lib.wn_config_default(ctypes.byref(cfg))
+    assert cfg.transport == weft_net.Transport.UDP
     assert cfg.channel_count == 4
     assert cfg.max_connections == 64
     assert cfg.connection_timeout_ms == 10000
@@ -88,23 +88,23 @@ def test_config_default_matches_c_defaults():
 
 def test_connect_and_echo():
     port = next_port()
-    server = netlink.Server("127.0.0.1", port)
-    client = netlink.Client()
+    server = weft_net.Server("127.0.0.1", port)
+    client = weft_net.Client()
     try:
         peer = client.connect("127.0.0.1", port)
-        client_ev = wait_for(client, netlink.EventType.CONNECTED)
+        client_ev = wait_for(client, weft_net.EventType.CONNECTED)
         assert client_ev.peer == peer
 
-        server_ev = wait_for(server, netlink.EventType.CONNECTED)
+        server_ev = wait_for(server, weft_net.EventType.CONNECTED)
         server_peer = server_ev.peer
 
-        client.send(peer, channel=0, data=b"hello world", delivery=netlink.Delivery.RELIABLE_ORDERED)
-        data_ev = wait_for(server, netlink.EventType.DATA)
+        client.send(peer, channel=0, data=b"hello world", delivery=weft_net.Delivery.RELIABLE_ORDERED)
+        data_ev = wait_for(server, weft_net.EventType.DATA)
         assert data_ev.data == b"hello world"
         assert data_ev.channel == 0
 
-        server.send(server_peer, channel=0, data=b"hi back", delivery=netlink.Delivery.RELIABLE_ORDERED)
-        reply_ev = wait_for(client, netlink.EventType.DATA)
+        server.send(server_peer, channel=0, data=b"hi back", delivery=weft_net.Delivery.RELIABLE_ORDERED)
+        reply_ev = wait_for(client, weft_net.EventType.DATA)
         assert reply_ev.data == b"hi back"
     finally:
         client.close()
@@ -113,23 +113,23 @@ def test_connect_and_echo():
 
 def test_all_delivery_modes():
     port = next_port()
-    server = netlink.Server("127.0.0.1", port)
-    client = netlink.Client()
+    server = weft_net.Server("127.0.0.1", port)
+    client = weft_net.Client()
     try:
         peer = client.connect("127.0.0.1", port)
-        wait_for(client, netlink.EventType.CONNECTED)
-        wait_for(server, netlink.EventType.CONNECTED)
+        wait_for(client, weft_net.EventType.CONNECTED)
+        wait_for(server, weft_net.EventType.CONNECTED)
 
         modes = [
-            netlink.Delivery.UNRELIABLE,
-            netlink.Delivery.UNRELIABLE_SEQUENCED,
-            netlink.Delivery.RELIABLE_UNORDERED,
-            netlink.Delivery.RELIABLE_ORDERED,
+            weft_net.Delivery.UNRELIABLE,
+            weft_net.Delivery.UNRELIABLE_SEQUENCED,
+            weft_net.Delivery.RELIABLE_UNORDERED,
+            weft_net.Delivery.RELIABLE_ORDERED,
         ]
         for i, mode in enumerate(modes):
             payload = f"mode-{i}".encode()
             client.send(peer, channel=i, data=payload, delivery=mode)
-            ev = wait_for(server, netlink.EventType.DATA)
+            ev = wait_for(server, weft_net.EventType.DATA)
             assert ev.channel == i
             assert ev.data == payload
     finally:
@@ -139,16 +139,16 @@ def test_all_delivery_modes():
 
 def test_fragmentation_large_message():
     port = next_port()
-    server = netlink.Server("127.0.0.1", port)
-    client = netlink.Client()
+    server = weft_net.Server("127.0.0.1", port)
+    client = weft_net.Client()
     try:
         peer = client.connect("127.0.0.1", port)
-        wait_for(client, netlink.EventType.CONNECTED)
-        wait_for(server, netlink.EventType.CONNECTED)
+        wait_for(client, weft_net.EventType.CONNECTED)
+        wait_for(server, weft_net.EventType.CONNECTED)
 
         big = bytes((i * 37 + 3) % 256 for i in range(5000))
-        client.send(peer, channel=0, data=big, delivery=netlink.Delivery.RELIABLE_ORDERED)
-        ev = wait_for(server, netlink.EventType.DATA, timeout=5.0)
+        client.send(peer, channel=0, data=big, delivery=weft_net.Delivery.RELIABLE_ORDERED)
+        ev = wait_for(server, weft_net.EventType.DATA, timeout=5.0)
         assert ev.data == big
     finally:
         client.close()
@@ -157,16 +157,16 @@ def test_fragmentation_large_message():
 
 def test_disconnect():
     port = next_port()
-    server = netlink.Server("127.0.0.1", port)
-    client = netlink.Client()
+    server = weft_net.Server("127.0.0.1", port)
+    client = weft_net.Client()
     try:
         peer = client.connect("127.0.0.1", port)
-        wait_for(client, netlink.EventType.CONNECTED)
-        wait_for(server, netlink.EventType.CONNECTED)
+        wait_for(client, weft_net.EventType.CONNECTED)
+        wait_for(server, weft_net.EventType.CONNECTED)
 
         client.disconnect(peer)
-        ev = wait_for(server, netlink.EventType.DISCONNECTED)
-        assert ev.disconnect_reason == 0  # NL_OK: graceful
+        ev = wait_for(server, weft_net.EventType.DISCONNECTED)
+        assert ev.disconnect_reason == 0  # WN_OK: graceful
     finally:
         client.close()
         server.close()
@@ -174,16 +174,16 @@ def test_disconnect():
 
 def test_server_full_denies_connection():
     port = next_port()
-    server = netlink.Server("127.0.0.1", port, netlink.Config(max_connections=1))
-    c1 = netlink.Client()
-    c2 = netlink.Client()
+    server = weft_net.Server("127.0.0.1", port, weft_net.Config(max_connections=1))
+    c1 = weft_net.Client()
+    c2 = weft_net.Client()
     try:
         p1 = c1.connect("127.0.0.1", port)
-        wait_for(c1, netlink.EventType.CONNECTED)
-        wait_for(server, netlink.EventType.CONNECTED)
+        wait_for(c1, weft_net.EventType.CONNECTED)
+        wait_for(server, weft_net.EventType.CONNECTED)
 
         c2.connect("127.0.0.1", port)
-        ev = wait_for(c2, netlink.EventType.CONNECT_FAILED)
+        ev = wait_for(c2, weft_net.EventType.CONNECT_FAILED)
         assert ev.disconnect_reason != 0
     finally:
         c1.close()
@@ -193,17 +193,17 @@ def test_server_full_denies_connection():
 
 def test_send_ex_priority_and_peer_stats():
     port = next_port()
-    server = netlink.Server("127.0.0.1", port)
-    client = netlink.Client()
+    server = weft_net.Server("127.0.0.1", port)
+    client = weft_net.Client()
     try:
         peer = client.connect("127.0.0.1", port)
-        wait_for(client, netlink.EventType.CONNECTED)
-        server_ev = wait_for(server, netlink.EventType.CONNECTED)
+        wait_for(client, weft_net.EventType.CONNECTED)
+        server_ev = wait_for(server, weft_net.EventType.CONNECTED)
 
         client.send_ex(peer, channel=0, data=b"urgent",
-                       delivery=netlink.Delivery.RELIABLE_ORDERED,
-                       priority=netlink.Priority.HIGH)
-        data_ev = wait_for(server, netlink.EventType.DATA)
+                       delivery=weft_net.Delivery.RELIABLE_ORDERED,
+                       priority=weft_net.Priority.HIGH)
+        data_ev = wait_for(server, weft_net.EventType.DATA)
         assert data_ev.data == b"urgent"
 
         stats = client.peer_stats(peer)
@@ -214,15 +214,15 @@ def test_send_ex_priority_and_peer_stats():
         # Wait for at least one DATA so the ack path has run, then check
         # the server-side stats too (ack piggyback or standalone).
         server.send(server_ev.peer, channel=0, data=b"ack-me",
-                    delivery=netlink.Delivery.RELIABLE_ORDERED)
-        wait_for(client, netlink.EventType.DATA)
+                    delivery=weft_net.Delivery.RELIABLE_ORDERED)
+        wait_for(client, weft_net.EventType.DATA)
         sstats = server.peer_stats(server_ev.peer)
         assert sstats is not None
         assert sstats.packets_received >= 1
 
         caps = client.peer_capabilities(peer)
         assert caps is not None
-        assert caps & netlink.CapFlowControl  # always negotiated on
+        assert caps & weft_net.CapFlowControl  # always negotiated on
 
         assert client.peer_stats(peer + 999) is None
         assert client.peer_capabilities(peer + 999) is None
@@ -233,26 +233,26 @@ def test_send_ex_priority_and_peer_stats():
 
 def test_peer_rtt_ms_and_peer_count():
     port = next_port()
-    server = netlink.Server("127.0.0.1", port)
-    client = netlink.Client()
+    server = weft_net.Server("127.0.0.1", port)
+    client = weft_net.Client()
     try:
         assert client.peer_count() == 0
         assert server.peer_count() == 0
         assert client.peer_rtt_ms(1) == 0  # unknown peer
 
         peer = client.connect("127.0.0.1", port)
-        wait_for(client, netlink.EventType.CONNECTED)
-        server_ev = wait_for(server, netlink.EventType.CONNECTED)
+        wait_for(client, weft_net.EventType.CONNECTED)
+        server_ev = wait_for(server, weft_net.EventType.CONNECTED)
         assert client.peer_count() == 1
         assert server.peer_count() == 1
 
         # Force a reliable round trip so an RTT sample lands.
         client.send(peer, channel=0, data=b"rtt probe",
-                    delivery=netlink.Delivery.RELIABLE_ORDERED)
-        wait_for(server, netlink.EventType.DATA)
+                    delivery=weft_net.Delivery.RELIABLE_ORDERED)
+        wait_for(server, weft_net.EventType.DATA)
         server.send(server_ev.peer, channel=0, data=b"rtt pong",
-                    delivery=netlink.Delivery.RELIABLE_ORDERED)
-        wait_for(client, netlink.EventType.DATA)
+                    delivery=weft_net.Delivery.RELIABLE_ORDERED)
+        wait_for(client, weft_net.EventType.DATA)
 
         rtt = client.peer_rtt_ms(peer)
         assert isinstance(rtt, int)
@@ -264,18 +264,18 @@ def test_peer_rtt_ms_and_peer_count():
 
 
 def test_error_string_available():
-    # NetLinkError goes through nl_error_string; force a failure path
-    # (duplicate connect -> NL_ERR_ALREADY_CONNECTED) without requiring pytest.
+    # WeftNetError goes through wn_error_string; force a failure path
+    # (duplicate connect -> WN_ERR_ALREADY_CONNECTED) without requiring pytest.
     port = next_port()
-    server = netlink.Server("127.0.0.1", port)
-    client = netlink.Client()
+    server = weft_net.Server("127.0.0.1", port)
+    client = weft_net.Client()
     try:
         client.connect("127.0.0.1", port)
         try:
             client.connect("127.0.0.1", port)
             raise AssertionError("second connect should have raised")
-        except netlink.NetLinkError as e:
-            assert e.code == -6  # NL_ERR_ALREADY_CONNECTED
+        except weft_net.WeftNetError as e:
+            assert e.code == -6  # WN_ERR_ALREADY_CONNECTED
             assert "already connected" in str(e)
     finally:
         client.close()

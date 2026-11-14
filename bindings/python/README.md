@@ -1,6 +1,6 @@
-# netlink (Python bindings)
+# weft-net (Python bindings)
 
-Python bindings for [NetLink](../../README.md), a secure, lightweight UDP
+Python bindings for [weft-net](../../README.md), a secure, lightweight UDP
 networking library. These are `ctypes` bindings over the same C library
 used by C/C++, Go, and Rust -- a Python client (or server) speaks the
 exact same wire protocol as every other language binding, including the
@@ -14,34 +14,34 @@ Build the native library first (from the repository root):
 make CRYPTO_CFLAGS="..." CRYPTO_LIBS="..."   # see the top-level README for flags on your platform
 ```
 
-This produces `build/libnetlink.so` (or `.dylib` / `.dll`). The Python
+This produces `build/libweft_net.so` (or `.dylib` / `.dll`). The Python
 bindings look for it, in order:
 
-1. the `NETLINK_LIBRARY_PATH` environment variable, if set
-2. `build/libnetlink.*` relative to the repository layout
+1. the `WEFT_NET_LIBRARY_PATH` environment variable, if set
+2. `build/libweft_net.*` relative to the repository layout
 3. the system library search path (`ctypes.util.find_library`)
 
 ## Usage
 
 ```python
-import netlink
+import weft_net
 
 # Server
-server = netlink.Server("0.0.0.0", 9000)
+server = weft_net.Server("0.0.0.0", 9000)
 
 # Client
-client = netlink.Client()
+client = weft_net.Client()
 peer = client.connect("127.0.0.1", 9000)
 
 for event in client.events(timeout=1.0):
-    if event.type == netlink.EventType.CONNECTED:
+    if event.type == weft_net.EventType.CONNECTED:
         client.send(peer, channel=0, data=b"hello",
-                    delivery=netlink.Delivery.RELIABLE_ORDERED)
-    elif event.type == netlink.EventType.DATA:
+                    delivery=weft_net.Delivery.RELIABLE_ORDERED)
+    elif event.type == weft_net.EventType.DATA:
         print("received:", event.data)
 ```
 
-Delivery modes (`netlink.Delivery`): `UNRELIABLE`,
+Delivery modes (`weft_net.Delivery`): `UNRELIABLE`,
 `UNRELIABLE_SEQUENCED`, `RELIABLE_UNORDERED`, `RELIABLE_ORDERED` -- see
 the top-level README for what each guarantees.
 
@@ -49,7 +49,7 @@ the top-level README for what each guarantees.
 
 ```sh
 cd bindings/python
-NETLINK_LIBRARY_PATH=../../build/libnetlink.so pytest tests/ -v
+WEFT_NET_LIBRARY_PATH=../../build/libweft_net.so pytest tests/ -v
 ```
 
 The test suite spins up real `Server` and `Client` endpoints over actual

@@ -89,11 +89,11 @@ static void sim_network_enqueue_one(sim_network_t *net, const uint8_t *data, uin
 
 /* Called from channel.c's emit callback: decide loss/duplication, then enqueue. */
 static void sim_network_send(sim_network_t *net, const uint8_t *data, uint16_t len, uint32_t now_tick) {
-    if (net->burst_len && len >= NL_DATA_HEADER_SIZE + sizeof(uint32_t)) {
+    if (net->burst_len && len >= WN_DATA_HEADER_SIZE + sizeof(uint32_t)) {
         /* The message body starts right after the header, which already ends
          * with its is_fragment marker -- so the u32 index is at
-         * NL_DATA_HEADER_SIZE, not +1. */
-        const uint8_t *payload = data + NL_DATA_HEADER_SIZE;
+         * WN_DATA_HEADER_SIZE, not +1. */
+        const uint8_t *payload = data + WN_DATA_HEADER_SIZE;
         uint32_t seq;
         memcpy(&seq, payload, sizeof(seq));
         if (seq >= net->burst_start && seq < net->burst_start + net->burst_len) {
@@ -114,8 +114,8 @@ static void sim_network_send(sim_network_t *net, const uint8_t *data, uint16_t l
 
 /* Deliver every packet whose time has come, in RANDOM order among those
  * ready (simulating reordering), to `receiver`. */
-static void sim_network_deliver_ready(sim_network_t *net, uint32_t now_tick, nl_channel_t *receiver,
-                                       nl_channel_deliver_fn deliver, void *deliver_ctx) {
+static void sim_network_deliver_ready(sim_network_t *net, uint32_t now_tick, wn_channel_t *receiver,
+                                       wn_channel_deliver_fn deliver, void *deliver_ctx) {
     int ready_idx[SIM_MAX_INFLIGHT];
     int ready_count = 0;
     for (int i = 0; i < net->count; i++) {
@@ -131,7 +131,7 @@ static void sim_network_deliver_ready(sim_network_t *net, uint32_t now_tick, nl_
 
         sim_packet_t *p = &net->packets[idx];
         p->active = false;
-        nl_channel_on_receive(receiver, now_tick, p->data, p->len, NL_RECV_WINDOW_DEFAULT,
+        wn_channel_on_receive(receiver, now_tick, p->data, p->len, WN_RECV_WINDOW_DEFAULT,
                               deliver, deliver_ctx, NULL, NULL, NULL, NULL, NULL, NULL);
     }
 
@@ -150,7 +150,7 @@ typedef struct {
     int count;
 } received_log_t;
 
-static void collect_deliver(void *ctx, uint8_t channel_id, nl_delivery_t delivery, const uint8_t *data, uint32_t len) {
+static void collect_deliver(void *ctx, uint8_t channel_id, wn_delivery_t delivery, const uint8_t *data, uint32_t len) {
     (void)channel_id;
     (void)delivery;
     received_log_t *log = (received_log_t *)ctx;
@@ -174,7 +174,7 @@ static void emit_to_network(void *ctx, const uint8_t *data, uint16_t len) {
 /* ---- the stress test itself ---- */
 
 /* Packets offered per tick. Large enough that in-flight routinely exceeds
- * NL_ACK_WINDOW_BITS, so the run reaches steady states a trickle can't. */
+ * WN_ACK_WINDOW_BITS, so the run reaches steady states a trickle can't. */
 #define SEND_BURST 64
 
 static void run_reliability_stress_test(const char *name, uint32_t seed, int message_count,
@@ -183,9 +183,9 @@ static void run_reliability_stress_test(const char *name, uint32_t seed, int mes
                                          uint32_t rto_ticks, uint32_t max_ticks) {
     rng_seed(seed);
 
-    nl_channel_t sender, receiver;
-    nl_channel_init(&sender);
-    nl_channel_init(&receiver);
+    wn_channel_t sender, receiver;
+    wn_channel_init(&sender);
+    wn_channel_init(&receiver);
 
     sim_network_t net;
     sim_network_init(&net, loss_percent, duplicate_percent, min_delay_ticks, max_delay_ticks);
@@ -211,14 +211,14 @@ static void run_reliability_stress_test(const char *name, uint32_t seed, int mes
         for (int b = 0; b < SEND_BURST && next_to_send < message_count; b++) {
             /* Hold in-flight at the ack window, which is exactly what
              * connection.c's congestion window does in the real stack: an
-             * ack names at most NL_ACK_WINDOW_BITS sequences back from the
+             * ack names at most WN_ACK_WINDOW_BITS sequences back from the
              * receiver's newest one, so a deeper flight would strand the
              * oldest packets unackable (which is the bug this sim exists to
              * catch -- but at this layer the invariant is the caller's
              * responsibility, since congestion control lives above).
              * Bursts still reach that window within a few ticks, which the
              * old one-per-tick pacing never did. */
-            nl_lane_t *slane = &sender.lanes[NL_RELIABLE_ORDERED];
+            wn_lane_t *slane = &sender.lanes[WN_RELIABLE_ORDERED];
             if (slane->send_ring_init) {
                 /* Gate on the SPAN from the oldest unacked sequence, not the
                  * count: an ack names sequences by position relative to the
@@ -226,15 +226,15 @@ static void run_reliability_stress_test(const char *name, uint32_t seed, int mes
                  * oldest packet sits far out of every future ack's reach.
                  * (Same reason connection.c's congestion window measures the
                  * span -- see reliable_in_flight().) */
-                uint16_t oldest = nl_send_ring_oldest_unacked(&slane->send_ring);
+                uint16_t oldest = wn_send_ring_oldest_unacked(&slane->send_ring);
                 uint16_t span = (uint16_t)(slane->send_ring.next_sequence - oldest);
-                if (span >= NL_ACK_WINDOW_BITS) break;
+                if (span >= WN_ACK_WINDOW_BITS) break;
             }
             uint32_t payload = (uint32_t)next_to_send;
-            nl_result_t r = nl_channel_send(&sender, now_tick, /*channel_id*/ 0, NL_RELIABLE_ORDERED,
+            wn_result_t r = wn_channel_send(&sender, now_tick, /*channel_id*/ 0, WN_RELIABLE_ORDERED,
                                              (const uint8_t *)&payload, sizeof(payload),
-                                             NL_RECV_WINDOW_DEFAULT, emit_to_network, &ectx);
-            if (r != NL_OK) break;
+                                             WN_RECV_WINDOW_DEFAULT, emit_to_network, &ectx);
+            if (r != WN_OK) break;
             next_to_send++;
         }
 
@@ -248,21 +248,21 @@ static void run_reliability_stress_test(const char *name, uint32_t seed, int mes
          * retransmit sets ack_dirty again (even for duplicates) and a
          * later batch is cumulative, so nothing is permanently stranded.
          */
-        nl_lane_t *rlane = &receiver.lanes[NL_RELIABLE_ORDERED];
+        wn_lane_t *rlane = &receiver.lanes[WN_RELIABLE_ORDERED];
         if (rlane->ack_dirty && rlane->recv_dedupe_init) {
             if (!rng_chance(net.loss_percent)) {
                 uint16_t ack;
-                nl_ack_bits_t ack_bits;
-                nl_recv_dedupe_build_ack(&rlane->recv_dedupe, &ack, &ack_bits);
-                nl_channel_apply_ack(&sender, now_tick, 0, NL_RELIABLE_ORDERED,
-                                     /*ack_valid*/ true, ack, ack_bits, NL_RECV_WINDOW_DEFAULT,
+                wn_ack_bits_t ack_bits;
+                wn_recv_dedupe_build_ack(&rlane->recv_dedupe, &ack, &ack_bits);
+                wn_channel_apply_ack(&sender, now_tick, 0, WN_RELIABLE_ORDERED,
+                                     /*ack_valid*/ true, ack, ack_bits, WN_RECV_WINDOW_DEFAULT,
                                      emit_to_network, &ectx, NULL, NULL, NULL);
             }
             rlane->ack_dirty = false;
         }
 
         /* Retransmission scan, using a fixed small RTO in virtual ticks.
-         * max_retries is the REAL production bound (NL_MAX_RETRIES, 15)
+         * max_retries is the REAL production bound (WN_MAX_RETRIES, 15)
          * rather than an inflated one: this test asserts give_up never
          * happens, and with a 1000-retry budget that assertion was close to
          * vacuous -- it could not have caught a connection torn down by
@@ -271,8 +271,8 @@ static void run_reliability_stress_test(const char *name, uint32_t seed, int mes
          * surviving enormous loss, so 15 is plenty for 20% loss with a
          * 4-20x backoff. */
         bool give_up = false;
-        nl_channel_tick(&sender, /*channel_id*/ 0, now_tick, rto_ticks, /*max_retries*/ 15,
-                        NL_RECV_WINDOW_DEFAULT, emit_to_network, &ectx, &give_up);
+        wn_channel_tick(&sender, /*channel_id*/ 0, now_tick, rto_ticks, /*max_retries*/ 15,
+                        WN_RECV_WINDOW_DEFAULT, emit_to_network, &ectx, &give_up);
         if (give_up) {
             printf("    [%s] sender gave up at tick %u (sent %d/%d delivered %d)\n",
                    name, tick, next_to_send, message_count, log.count);
@@ -300,8 +300,8 @@ static void run_reliability_stress_test(const char *name, uint32_t seed, int mes
         ASSERT_EQ(log.received[i], (uint32_t)i);
     }
 
-    nl_channel_free(&sender);
-    nl_channel_free(&receiver);
+    wn_channel_free(&sender);
+    wn_channel_free(&receiver);
 }
 
 TEST(test_network_sim_moderate_loss_and_reorder) {
@@ -337,9 +337,9 @@ TEST(test_network_sim_heavy_reorder_and_duplication) {
 TEST(test_network_sim_sustained_burst_loss_at_full_window) {
     rng_seed(777);
 
-    nl_channel_t sender, receiver;
-    nl_channel_init(&sender);
-    nl_channel_init(&receiver);
+    wn_channel_t sender, receiver;
+    wn_channel_init(&sender);
+    wn_channel_init(&receiver);
 
     sim_network_t net;
     /* 1% background loss so the run isn't sterile, plus the scripted burst. */
@@ -364,45 +364,45 @@ TEST(test_network_sim_sustained_burst_loss_at_full_window) {
         now_tick = tick;
 
         for (int b = 0; b < SEND_BURST && next_to_send < total; b++) {
-            nl_lane_t *slane = &sender.lanes[NL_RELIABLE_ORDERED];
+            wn_lane_t *slane = &sender.lanes[WN_RELIABLE_ORDERED];
             if (slane->send_ring_init) {
-                uint16_t oldest = nl_send_ring_oldest_unacked(&slane->send_ring);
+                uint16_t oldest = wn_send_ring_oldest_unacked(&slane->send_ring);
                 uint16_t span = (uint16_t)(slane->send_ring.next_sequence - oldest);
-                if (span >= NL_ACK_WINDOW_BITS) break;
+                if (span >= WN_ACK_WINDOW_BITS) break;
             }
             uint32_t payload = (uint32_t)next_to_send;
-            nl_result_t r = nl_channel_send(&sender, now_tick, 0, NL_RELIABLE_ORDERED,
+            wn_result_t r = wn_channel_send(&sender, now_tick, 0, WN_RELIABLE_ORDERED,
                                              (const uint8_t *)&payload, sizeof(payload),
-                                             NL_RECV_WINDOW_DEFAULT, emit_to_network, &ectx);
-            if (r != NL_OK) break;
+                                             WN_RECV_WINDOW_DEFAULT, emit_to_network, &ectx);
+            if (r != WN_OK) break;
             next_to_send++;
             /* Track the deepest flight reached, so the test can assert the
              * burst really happened at a full window (measured during the
              * run -- at the end everything is acked and the span is 0). */
             uint16_t sp = (uint16_t)(slane->send_ring.next_sequence -
-                                     nl_send_ring_oldest_unacked(&slane->send_ring));
+                                     wn_send_ring_oldest_unacked(&slane->send_ring));
             if (sp > peak_span) peak_span = sp;
         }
 
         sim_network_deliver_ready(&net, now_tick, &receiver, collect_deliver, &log);
 
         /* Reverse-path acks, same stand-in as the stress test. */
-        nl_lane_t *rlane = &receiver.lanes[NL_RELIABLE_ORDERED];
+        wn_lane_t *rlane = &receiver.lanes[WN_RELIABLE_ORDERED];
         if (rlane->ack_dirty && rlane->recv_dedupe_init) {
             if (!rng_chance(net.loss_percent)) {
                 uint16_t ack;
-                nl_ack_bits_t ack_bits;
-                nl_recv_dedupe_build_ack(&rlane->recv_dedupe, &ack, &ack_bits);
-                nl_channel_apply_ack(&sender, now_tick, 0, NL_RELIABLE_ORDERED,
-                                     /*ack_valid*/ true, ack, ack_bits, NL_RECV_WINDOW_DEFAULT,
+                wn_ack_bits_t ack_bits;
+                wn_recv_dedupe_build_ack(&rlane->recv_dedupe, &ack, &ack_bits);
+                wn_channel_apply_ack(&sender, now_tick, 0, WN_RELIABLE_ORDERED,
+                                     /*ack_valid*/ true, ack, ack_bits, WN_RECV_WINDOW_DEFAULT,
                                      emit_to_network, &ectx, NULL, NULL, NULL);
             }
             rlane->ack_dirty = false;
         }
 
         bool give_up = false;
-        nl_channel_tick(&sender, 0, now_tick, /*rto_ticks*/ 8, /*max_retries*/ 15,
-                        NL_RECV_WINDOW_DEFAULT, emit_to_network, &ectx, &give_up);
+        wn_channel_tick(&sender, 0, now_tick, /*rto_ticks*/ 8, /*max_retries*/ 15,
+                        WN_RECV_WINDOW_DEFAULT, emit_to_network, &ectx, &give_up);
         ASSERT_FALSE(give_up);
 
         if (next_to_send >= total && log.count >= total) break;
@@ -410,19 +410,19 @@ TEST(test_network_sim_sustained_burst_loss_at_full_window) {
 
     ASSERT_EQ(log.count, total);
     /* Nothing permanently lost. */
-    ASSERT_EQ(sender.lanes[NL_RELIABLE_ORDERED].send_ring.unacked_count, 0);
+    ASSERT_EQ(sender.lanes[WN_RELIABLE_ORDERED].send_ring.unacked_count, 0);
     for (int i = 0; i < total; i++) ASSERT_EQ(log.received[i], (uint32_t)i);
 
     /* The burst really happened, at a genuinely deep flight -- otherwise
      * this test would prove nothing about a full window. */
-    printf("    peak in-flight span %u (ack window %d)\n", peak_span, NL_ACK_WINDOW_BITS);
-    CHECK_TRUE(peak_span >= NL_ACK_WINDOW_BITS);
+    printf("    peak in-flight span %u (ack window %d)\n", peak_span, WN_ACK_WINDOW_BITS);
+    CHECK_TRUE(peak_span >= WN_ACK_WINDOW_BITS);
 
     /* Every scripted-burst sequence was actually dropped once. */
     for (uint32_t i = 0; i < burst_len; i++) ASSERT_EQ(net.burst_drops[i], 1u);
 
-    nl_channel_free(&sender);
-    nl_channel_free(&receiver);
+    wn_channel_free(&sender);
+    wn_channel_free(&receiver);
 }
 
 TEST(test_network_sim_different_seed_reproducible) {
